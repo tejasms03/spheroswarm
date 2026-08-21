@@ -135,12 +135,40 @@ one `set_heading`), takes the library's own `__updating` lock so it cannot
 interleave with the keepalive thread, and paces writes to the measured round
 trip rather than queueing behind them.
 
-### What is not done
+### The ack bypass — built, unverified
 
-Bypassing the ack. That means building packets with `SOP2 = 0xFE` and
-enqueueing without waiting — roughly, going to `toy.drive_control.roll_start`
-or below rather than through `SpheroEduAPI`. It is the largest remaining win
-and it is a protocol change, not a tuning change.
+`fleet/sphero_fast.py` builds v1.2 packets with the answer bit clear and puts
+them straight on the toy's write queue. **Off by default** — set
+`SPHERO_FAST_WRITES=1` or pass `fast_writes=True`. No physical ball has
+received one.
+
+The framing is pinned byte-for-byte against spherov2's own builder on the
+acked case. That is the only evidence available without hardware, and it is
+worth being clear about its limit: it shows the packet is well formed, not
+that the robot obeys it. **From this side of the radio, "the ball obeys
+instantly" and "the ball ignores us entirely" look identical** — both return
+in microseconds. Only the camera can tell them apart.
+
+Two hazards found in the wiring, both of which would have been blamed on the
+controller:
+
+- **spherov2's keepalive re-sends `roll_start(__heading, __speed)` every
+  0.8s** whenever the speed is non-zero. Bypassing `set_heading` never updates
+  that cache, so the library would have re-aimed the ball at a *stale heading*
+  about once a second. The fast path keeps both values in sync, which turns
+  the keepalive into a safety net: a fast path that silently stops being
+  delivered degrades to driving correctly at 1.25Hz rather than to a ball that
+  ignores us.
+- **Pacing was derived from the measured round trip**, which now measures an
+  enqueue. Without a floor the loop queues commands faster than the library's
+  writer thread drains them — a backlog of stale intent, which latest-wins
+  upstream cannot help once the packets are already queued. The ack was
+  standing in for `cmd_safe_interval`, so the ceiling moves to **~16Hz, not
+  infinity**. The 60ms writer pause remains and is now the binding constraint.
+
+`sensors.compare_write_paths(api)` runs the A/B over one link. **Run it first
+in the next hardware session**, before the battery: every gain derived on the
+acked protocol would have to be derived again afterwards.
 
 ---
 
@@ -286,9 +314,13 @@ right, nothing is measuring anything.
    following, so a pass means the numbers are real. Gains derive themselves.
 4. **Then** judge the controller. Not before — three of the five numbers on the
    gains panel were fiction, and tuning on top of that is tuning noise.
-5. **The ack bypass** (section 3) is the largest remaining engineering win.
-   Halving or eliminating 230 ms of command latency helps every controller
-   equally and needs no tuning.
+5. ~~The ack bypass~~ — **built, and moved to step 0.** It is written and
+   tested but unproven, and it changes the very numbers `run full` measures,
+   so it has to be settled *before* the battery rather than after. Open the
+   session with `compare_write_paths`, switch it on, and drive the ball across
+   the arena while watching it: obedience is the thing to confirm, and the
+   camera is the only instrument that can. If it misbehaves, unset the flag
+   and carry on down this list unchanged.
 6. Wire the heading estimator's live correction into `SpheroRobot.set_velocity`
    properly, and decide `follow(mode="orbit")` — both carried over from
    `HANDOFF.md` section 14.
