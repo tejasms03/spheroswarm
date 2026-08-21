@@ -1,0 +1,139 @@
+# Named model presets. Switching models is a preset change and nothing else.
+#
+# thinking_style says *how* to toggle reasoning for this endpoint:
+#   chat_template   -> chat_template_kwargs.enable_thinking   (Qwen under Ollama)
+#   ollama_think    -> think: true|false                      (newer Ollama)
+#   reasoning_effort-> reasoning_effort: medium|none          (OpenAI-style)
+#   none            -> do not send anything
+#
+# num_ctx is sent as options.num_ctx. VERIFIED 2026-08-11 against Ollama 0.32.9:
+# the OpenAI-compatible /v1 endpoint IGNORES it — requesting 8192 while the
+# server env said 16384 still loaded a 16384 slot. The value is still sent so a
+# server that does honour it gets it, but the control that actually works is the
+# environment `ollama serve` runs in:
+#
+#   OLLAMA_KEEP_ALIVE=30m OLLAMA_CONTEXT_LENGTH=16384 \
+#   OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve
+#
+# KEEP_ALIVE matters as much as the rest: at the 5m default the model is evicted
+# between sessions and the next command pays ~24s to page 6.6GB back in.
+#
+# Without it Ollama picks a VRAM-based default (4096 on an 11.8GiB M1 Pro),
+# which will silently truncate the prompt once tool schemas and history grow.
+
+models:
+  qwen3.5:9b:
+    model: qwen3.5:9b
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    num_ctx: 16384
+    # VERIFIED: enable_thinking IS honoured here — 1448 vs 316 completion
+    # tokens for the same answer. On an M1 Pro at ~15-20 tok/s that is the
+    # difference between a 90s reply and a 20s one, so interactive presets
+    # default it off. Turn it back on when measuring best-case quality.
+    thinking: false
+    thinking_style: chat_template
+    temperature: 0.3
+    timeout: 120
+    # Same latency, very different feel: output appears in ~1s instead of the
+    # window sitting frozen for twenty.
+    stream: true
+    notes: primary local model on an M1 Pro / 16GB
+
+  qwen3.5:4b:
+    model: qwen3.5:4b
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    num_ctx: 16384
+    thinking: false
+    thinking_style: chat_template
+    temperature: 0.3
+    timeout: 120
+    notes: faster, weaker; the floor for whether this task needs a 9B
+
+  qwen3:8b:
+    model: qwen3:8b
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    num_ctx: 16384
+    thinking: true
+    thinking_style: chat_template
+    temperature: 0.3
+    timeout: 120
+    notes: previous generation, for measuring what the 3.5 series bought
+
+  glm-4.7-flash:
+    model: glm-4.7-flash
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    num_ctx: 16384
+    thinking: true
+    thinking_style: ollama_think
+    temperature: 0.3
+    timeout: 120
+    notes: alternative local architecture
+
+  # -- hosted, through the NYU Portkey gateway -----------------------------
+  #
+  # VERIFIED 2026-08-17 by `python -m llm.smoke`: the gateway passes all 22
+  # tool schemas through and returns native `tool_calls`, not text — the
+  # recovery layer never fires. ~1.5s per call against ~109s for local qwen.
+  #
+  # backend: openai_compatible is what stops num_ctx and the thinking toggle
+  # being sent. `temperature: null` is not laziness — Claude via Vertex answers
+  # 400 "`temperature` is deprecated for this model" if it is sent at all.
+  #
+  # The key comes from the environment and is never written here:
+  #   source ~/.spheroswarm.env        # or: export PORTKEY_API_KEY='...'
+  #
+  # Model strings are exact, including the @date suffixes. Ask the gateway what
+  # it exposes with: python -m llm.smoke --list
+
+  sonnet5:
+    backend: openai_compatible
+    model: "@vertexai/anthropic.claude-sonnet-5"
+    base_url: https://ai-gateway.apps.cloud.rt.nyu.edu/v1
+    api_key_env: PORTKEY_API_KEY
+    max_tokens: 1024
+    temperature: null
+    thinking_style: none
+    timeout: 120
+    notes: hosted ceiling baseline; the model to beat
+
+  haiku4.5:
+    backend: openai_compatible
+    model: "@vertexai/anthropic.claude-haiku-4-5@20251001"
+    base_url: https://ai-gateway.apps.cloud.rt.nyu.edu/v1
+    api_key_env: PORTKEY_API_KEY
+    max_tokens: 1024
+    temperature: null
+    thinking_style: none
+    timeout: 120
+    notes: cheap/fast hosted tier — is a small hosted model enough for this task?
+
+  gemini-flash:
+    backend: openai_compatible
+    model: "@vertexai/gemini-3.5-flash"
+    base_url: https://ai-gateway.apps.cloud.rt.nyu.edu/v1
+    api_key_env: PORTKEY_API_KEY
+    max_tokens: 1024
+    temperature: 0.3
+    thinking_style: none
+    timeout: 120
+    notes: >
+      Different vendor entirely, so a different tool-calling implementation —
+      worth having in the comparison for exactly that reason. Gemini accepts
+      temperature; the Anthropic routes do not.
+
+  frontier:
+    model: ${FRONTIER_MODEL:-claude-sonnet-5}
+    base_url: ${FRONTIER_BASE_URL:-https://api.anthropic.com/v1}
+    api_key: ${FRONTIER_API_KEY}
+    num_ctx: 0
+    thinking: true
+    thinking_style: none
+    temperature: 0.3
+    timeout: 120
+    notes: >
+      Ceiling baseline. Set FRONTIER_BASE_URL / FRONTIER_MODEL / FRONTIER_API_KEY.
+      num_ctx 0 omits the Ollama-only options block.

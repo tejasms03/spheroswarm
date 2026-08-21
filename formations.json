@@ -1,0 +1,290 @@
+{
+  "boomerang": {
+    "points": [
+      [
+        -0.22343,
+        -0.22834
+      ],
+      [
+        0.57879,
+        -0.22834
+      ],
+      [
+        -0.62454,
+        0.19951
+      ],
+      [
+        0.17768,
+        -0.37095
+      ],
+      [
+        0.97989,
+        0.19951
+      ],
+      [
+        -0.88838,
+        0.42859
+      ]
+    ],
+    "robot_count": 6,
+    "slots": [
+      "SSMK",
+      "CRXS",
+      "SYRX",
+      "VHGR",
+      "MLYS",
+      "SNFR"
+    ],
+    "description": "",
+    "created": "2026-08-11 23:38:15",
+    "saved_radius_cm": 112.2,
+    "saved_center_cm": [
+      100.1,
+      131.6
+    ]
+  },
+  "dock": {
+    "points": [
+      [
+        0.84177,
+        0.00521
+      ],
+      [
+        0.80561,
+        -0.56865
+      ],
+      [
+        -0.81934,
+        -0.5733
+      ],
+      [
+        -0.78492,
+        0.54891
+      ],
+      [
+        -0.85164,
+        0.00521
+      ],
+      [
+        0.80853,
+        0.58262
+      ]
+    ],
+    "robot_count": 6,
+    "slots": [
+      "SSMK",
+      "CRXS",
+      "SYRX",
+      "VHGR",
+      "MLYS",
+      "SNFR"
+    ],
+    "description": "",
+    "created": "2026-08-11 23:56:01",
+    "saved_radius_cm": 127.0,
+    "saved_center_cm": [
+      120.6,
+      89.3
+    ]
+  },
+  "start": {
+    "points": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.951,
+        -0.309
+      ],
+      [
+        0.0,
+        -1.0
+      ],
+      [
+        -0.58771,
+        0.809
+      ],
+      [
+        -0.951,
+        -0.309
+      ],
+      [
+        0.58771,
+        0.809
+      ]
+    ],
+    "robot_count": 6,
+    "slots": [
+      "SSMK",
+      "CRXS",
+      "SYRX",
+      "VHGR",
+      "MLYS",
+      "SNFR"
+    ],
+    "description": "",
+    "created": "2026-08-17 14:37:51",
+    "saved_radius_cm": 70.0,
+    "saved_center_cm": [
+      120.0,
+      90.0
+    ]
+  },
+  "wp": {
+    "points": [
+      [
+        -0.47978,
+        0.57797
+      ],
+      [
+        0.47915,
+        0.22163
+      ],
+      [
+        0.62482,
+        -0.26772
+      ],
+      [
+        -0.99175,
+        -0.1282
+      ],
+      [
+        0.0515,
+        -0.94766
+      ],
+      [
+        0.31607,
+        0.54398
+      ]
+    ],
+    "robot_count": 6,
+    "slots": [
+      "SSMK",
+      "CRXS",
+      "SYRX",
+      "VHGR",
+      "MLYS",
+      "SNFR"
+    ],
+    "description": "Whirlpool orbit formation, radius 35cm around center",
+    "created": "2026-08-17 16:06:24",
+    "saved_radius_cm": 50.1,
+    "saved_center_cm": [
+      127.7,
+      98.5
+    ]
+  },
+  "spinna": {
+    "points": [
+      [
+        0.56991,
+        0.07079
+      ],
+      [
+        0.55543,
+        0.34493
+      ],
+      [
+        -0.99513,
+        -0.09859
+      ],
+      [
+        0.48624,
+        0.49948
+      ],
+      [
+        -0.18953,
+        -0.3905
+      ],
+      [
+        -0.42692,
+        -0.4261
+      ]
+    ],
+    "robot_count": 6,
+    "slots": [
+      "SSMK",
+      "CRXS",
+      "SYRX",
+      "VHGR",
+      "MLYS",
+      "SNFR"
+    ],
+    "description": "",
+    "created": "2026-08-19 18:01:26",
+    "saved_radius_cm": 122.0,
+    "saved_center_cm": [
+      143.5,
+      68.4
+    ],
+    "motion": {
+      "SSMK": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ],
+      "CRXS": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ],
+      "SYRX": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ],
+      "VHGR": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ],
+      "MLYS": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ],
+      "SNFR": [
+        {
+          "name": "flow",
+          "kind": "flow",
+          "weight": 0.6,
+          "params": {
+            "expr": "vx = -(y-90)*0.2\\nvy = (x-120)*0.2",
+            "entity": null
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,66 @@
+[
+ {
+  "text": "form a circle and save it as ring",
+  "tools": [
+   "compute_points",
+   "save_formation"
+  ],
+  "summary": "Saved.",
+  "when": "2026-08-21 18:58",
+  "uses": 72
+ },
+ {
+  "text": "form a circle",
+  "tools": [
+   "compute_points"
+  ],
+  "summary": "Formed a circle.",
+  "when": "2026-08-21 18:58",
+  "uses": 72
+ },
+ {
+  "text": "orbit the center",
+  "tools": [
+   "set_flow"
+  ],
+  "summary": "The robots are now set to orbit around the arena center (x=120, y=90).",
+  "when": "2026-08-19 21:20",
+  "uses": 2
+ },
+ {
+  "text": "save as spinna",
+  "tools": [
+   "save_formation"
+  ],
+  "summary": "Formation saved as spinna.",
+  "when": "2026-08-19 18:01",
+  "uses": 1
+ },
+ {
+  "text": "recall_formation spinna",
+  "tools": [
+   "recall_formation"
+  ],
+  "summary": "Formation \"spinna\" has been recalled. One robot adjusted its position slightly as it moved within arena bounda",
+  "when": "2026-08-19 18:02",
+  "uses": 1
+ },
+ {
+  "text": "follow the wanderer with all bots",
+  "tools": [
+   "follow"
+  ],
+  "summary": "All six dragons will trail the wandering entity at full speed for two minutes.",
+  "when": "2026-08-19 18:31",
+  "uses": 1
+ },
+ {
+  "text": "make a circle",
+  "tools": [
+   "compute_points"
+  ],
+  "summary": "Done.",
+  "when": "2026-08-19 21:18",
+  "uses": 1
+ }
+]

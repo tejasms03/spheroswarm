@@ -1,0 +1,110 @@
+[
+  {
+    "name": "Seasmoke",
+    "code": "SSMK",
+    "kind": "sim",
+    "color": "blue",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 17.513667711146326
+  },
+  {
+    "name": "Caraxes",
+    "code": "CRXS",
+    "kind": "sim",
+    "color": "red",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 272.9873631822668
+  },
+  {
+    "name": "Syrax",
+    "code": "SYRX",
+    "kind": "sim",
+    "color": "yellow",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 17.830010413348532
+  },
+  {
+    "name": "Vhagar",
+    "code": "VHGR",
+    "kind": "sim",
+    "color": "green",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 22.678920248966364
+  },
+  {
+    "name": "Meleys",
+    "code": "MLYS",
+    "kind": "sim",
+    "color": "magenta",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 2.4991525595106907
+  },
+  {
+    "name": "Sunfyre",
+    "code": "SNFR",
+    "kind": "sim",
+    "color": "cyan",
+    "ble_name": null,
+    "enabled": true,
+    "heading_offset": 24.49010980039003
+  },
+  {
+    "name": "Dreamfyre",
+    "code": "DRMF",
+    "kind": "sim",
+    "color": "cyan",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  },
+  {
+    "name": "Vermithor",
+    "code": "VRMT",
+    "kind": "sim",
+    "color": "red",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  },
+  {
+    "name": "Silverwing",
+    "code": "SLVW",
+    "kind": "sim",
+    "color": "yellow",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  },
+  {
+    "name": "Moondancer",
+    "code": "MNDC",
+    "kind": "sim",
+    "color": "green",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  },
+  {
+    "name": "Tessarion",
+    "code": "TSSR",
+    "kind": "sim",
+    "color": "magenta",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  },
+  {
+    "name": "Arrax",
+    "code": "ARRX",
+    "kind": "sim",
+    "color": "blue",
+    "ble_name": null,
+    "enabled": false,
+    "heading_offset": 0.0
+  }
+]

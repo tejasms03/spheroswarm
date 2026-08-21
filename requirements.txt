@@ -1,0 +1,7 @@
+numpy>=1.24
+torch>=2.0
+pygame>=2.5
+opencv-python>=4.8
+scipy>=1.10
+spherov2>=0.12
+pytest>=7.0

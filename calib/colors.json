@@ -1,0 +1,42 @@
+{
+  "red": {
+    "hue": 0,
+    "tol": 17,
+    "s_min": 30,
+    "v_min": 182,
+    "min_area": 152,
+    "max_area": 53298,
+    "led_value": 226
+  },
+  "yellow": {
+    "hue": 60,
+    "tol": 9,
+    "s_min": 30,
+    "v_min": 204
+  },
+  "green": {
+    "hue": 85,
+    "tol": 5,
+    "s_min": 30,
+    "v_min": 204,
+    "min_area": 648,
+    "max_area": 123534,
+    "led_value": 224
+  },
+  "cyan": {
+    "hue": 62,
+    "tol": 10
+  },
+  "blue": {
+    "hue": 107,
+    "tol": 8,
+    "s_min": 204,
+    "v_min": 149,
+    "min_area": 669,
+    "led_value": 136
+  },
+  "magenta": {
+    "hue": 133,
+    "tol": 10
+  }
+}

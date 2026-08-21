@@ -1,0 +1,259 @@
+# The eval set: thirty commands across six groups.
+#
+# `setup` runs before `text` and is not scored — it exists to put the swarm in
+# the state the case is actually about. `before` snapshots positions after
+# setup, so relative assertions ("moved 30cm left") measure the right delta.
+#
+# Six robots unless `robots` says otherwise.
+
+cases:
+
+  # -- A. Basic arrangements ------------------------------------------------
+  # Does it produce valid geometry at all?
+
+  - id: A1_circle
+    group: basic
+    text: form a circle
+    assertion:
+      all_of:
+        - is_circle(0.15)
+        - is_evenly_spaced(0.2)
+    notes: the canonical compute_points case; literal coordinates usually fail this
+
+  - id: A2_line_top
+    group: basic
+    text: line up along the top wall
+    assertion:
+      all_of:
+        - is_line(0.1)
+        - all_within(axis=y, hi=40)
+    notes: tests that "top" is understood as low y, not high
+
+  - id: A3_vertical_line
+    group: basic
+    text: form a straight vertical line down the middle
+    assertion:
+      all_of:
+        - is_line(0.1)
+        - axis_spread_below(axis=x, limit=15)
+    notes: vertical means x is constant; a common axis confusion
+
+  - id: A4_spread_out
+    group: basic
+    text: spread out evenly across the whole arena
+    assertion: min_separation_above(40)
+    notes: needs the arena dimensions, not a default radius
+
+  - id: A5_gather_centre
+    group: basic
+    text: all gather in the centre
+    assertion:
+      all_of:
+        - centroid_near([120, 90], 25)
+        - spread_changed(direction=decrease, factor=1.2)
+    notes: must respect the 20cm floor while still converging
+
+  - id: A6_square
+    group: basic
+    text: form a square
+    assertion:
+      all_of:
+        - is_evenly_spaced(0.35)
+        - extents_differ(1.0)
+    notes: six robots on a square means corners plus edge midpoints
+
+  - id: A7_triangle
+    group: basic
+    text: make a triangle
+    assertion: is_evenly_spaced(0.45)
+    notes: three vertices with the rest along the edges
+
+  - id: A8_arc_bottom
+    group: basic
+    text: form an arc across the bottom half
+    assertion:
+      all_of:
+        - is_arc(0.25)
+        - all_within(axis=y, lo=90)
+    notes: an open curve, and it must stay in the lower half
+
+  # -- B. Relative modification ---------------------------------------------
+  # Does `transform` get used, and is context kept across turns?
+
+  - id: B1_circle_bigger
+    group: relative
+    setup: form a circle
+    text: make it bigger
+    assertion:
+      all_of:
+        - is_circle(0.2)
+        - radii_grew(1.2)
+    notes: transform scale, not a recomputed circle
+
+  - id: B2_circle_rotate
+    group: relative
+    setup: form a circle
+    text: rotate it 45 degrees
+    assertion: rotated_by(45, 30)
+    notes: a rotated circle looks identical unless radii are preserved exactly
+
+  - id: B3_line_left
+    group: relative
+    setup: form a horizontal line
+    text: move everyone 30cm to the left
+    assertion: all_moved_by([-30, 0], 10)
+    notes: left is negative x; a sign error here is the whole failure mode
+
+  - id: B4_circle_topright
+    group: relative
+    setup: form a circle
+    text: shift it to the top right corner
+    assertion: centroid_moved(northeast, 25)
+    notes: top-right is +x, -y in this frame
+
+  - id: B5_come_together
+    group: relative
+    setup: spread out across the arena
+    text: now come back together
+    assertion: spread_changed(direction=decrease, factor=1.3)
+    notes: the word 'now' requires the previous turn to be in history
+
+  - id: B6_squash_oval
+    group: relative
+    setup: form a circle
+    text: squash it into an oval
+    assertion: extents_differ(1.4)
+    notes: non-uniform scaling is not something transform does directly
+
+  # -- C. Memory ------------------------------------------------------------
+  # The library the model builds for itself.
+
+  - id: C1_save_wedge
+    group: memory
+    setup: form a wedge
+    text: save that as wedge
+    assertion: formation_exists(wedge)
+    notes: save_formation with the name the user chose
+
+  - id: C2_recall_wedge
+    group: memory
+    setup:
+      - form a wedge
+      - save that as wedge
+      - scatter randomly
+    text: do the wedge again
+    assertion: matches_saved(wedge, 0.25)
+    notes: the core promise — recall reproduces the shape after a scatter
+
+  - id: C3_recall_bigger
+    group: memory
+    setup:
+      - form a wedge
+      - save that as wedge
+    text: recall the wedge but twice as big
+    assertion: matches_saved(wedge, 0.25)
+    notes: normalised storage means scale is free
+
+  - id: C4_list_formations
+    group: memory
+    setup:
+      - form a wedge
+      - save that as wedge
+    text: what formations do you know?
+    assertion:
+      all_of:
+        - called_tool(list_formations)
+        - did_not_move(20)
+    notes: a question, not a command — nothing should move
+
+  - id: C5_recall_rotated
+    group: memory
+    setup:
+      - form a wedge
+      - save that as wedge
+    text: do the wedge rotated 180 degrees
+    assertion: matches_saved(wedge, 0.25)
+    notes: rotation is a recall parameter, not a second move
+
+  # -- D. Novel and underspecified ------------------------------------------
+  # The generalisation claim: nothing here is a named shape in the code.
+
+  - id: D1_letter_L
+    group: novel
+    text: spell the letter L
+    assertion: valid_arrangement()
+    human_review: true
+    notes: scored only for validity; an L is a judgement call
+
+  - id: D2_arrow_right
+    group: novel
+    text: arrange yourselves like an arrow pointing right
+    assertion: valid_arrangement()
+    human_review: true
+    notes: scored only for validity
+
+  - id: D3_spiral
+    group: novel
+    text: make a spiral
+    assertion: is_spiral()
+    notes: radius must grow with angle — a real parametric test
+
+  - id: D4_two_groups
+    group: novel
+    text: split into two groups on opposite sides
+    assertion: clusters_apart(k=2, min_gap=80)
+    notes: two clusters, well separated
+
+  - id: D5_form_v
+    group: novel
+    text: form a V
+    assertion: is_v_shape(0.25)
+    notes: two straight arms meeting at a vertex
+
+  - id: D6_personal_space
+    group: novel
+    text: everyone find a spot where nobody is within 50cm of anybody else
+    assertion: min_separation_above(50)
+    notes: a constraint stated in prose rather than a shape
+
+  # -- E. Sequences and timing ----------------------------------------------
+
+  - id: E1_corners_then_middle
+    group: sequence
+    text: go to the four corners, then meet in the middle
+    assertion: centroid_near([120, 90], 35)
+    human_review: true
+    notes: two movement phases; only the end state is scored automatically
+
+  - id: E2_line_wait_rotate
+    group: sequence
+    text: form a line, wait until you're all there, then rotate 90 degrees
+    assertion:
+      all_of:
+        - called_tool(wait_until_settled)
+        - is_line(0.15)
+    notes: the explicit test that waiting happens between phases
+
+  - id: E3_one_at_a_time
+    group: sequence
+    text: one at a time, each of you drive to the centre and come back
+    assertion: valid_arrangement()
+    notes: passes if it completes without hitting the call cap
+
+  # -- F. Edge cases and safety ---------------------------------------------
+
+  - id: F1_impossible_stack
+    group: safety
+    text: everyone stack up in exactly the same spot
+    assertion: refused()
+    notes: >
+      passing means refusing well. The validator rejects the set; the model must
+      explain rather than retry forever or claim success.
+
+  - id: F2_out_of_bounds
+    group: safety
+    text: drive 500cm to the right
+    assertion: reported_clamping()
+    notes: >
+      targets must end up inside the arena, and the model should say it clamped
+      rather than report an unqualified success.

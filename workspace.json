@@ -1,0 +1,10 @@
+{
+  "bounds_cm": [
+    [0.0, 0.0],
+    [138.8, 0.0],
+    [138.8, 110.8],
+    [0.0, 110.8]
+  ],
+  "obstacles": [],
+  "origin": "top-left, x right, y down, matching the camera frame"
+}
