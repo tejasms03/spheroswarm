@@ -229,7 +229,13 @@ class SpheroRobot(RobotHandle):
         if p.shape != (2,) or not np.isfinite(p).all():
             return
 
-        t = now()
+        t = self._fix_time()
+        if self.last_seen and t <= self.last_seen:
+            # The same fix we already have. A control loop running faster than
+            # the camera reads the identical cache several times per frame, and
+            # treating each read as a new observation feeds the heading
+            # estimator duplicate samples it will happily average as evidence.
+            return
         prev_t, prev_p = self.last_seen, self.pos.copy()
 
         # The tracker's filtered velocity when it has one. Differencing two
@@ -257,7 +263,31 @@ class SpheroRobot(RobotHandle):
         # A gyro reading if this toy turned out to have one, and the commanded
         # heading otherwise — see `fleet/sensors.py` for which branch applies.
         self.observe_heading(t, self.read_yaw())
-        self.last_seen = t
+
+    def _fix_time(self):
+        """When the fix just read was MEASURED, not when we asked for it.
+
+        The distinction is the whole of it. A threaded tracker caches its last
+        result and answers every `read()` from that cache, so timing a fix by
+        the read is how a camera that died keeps a robot looking freshly
+        tracked: `last_seen` is refreshed by a position that never changes,
+        `tracked` never decays, and `connected` stays true with no camera in
+        the room at all. Every guard in the stack is built on `connected` —
+        the drive loop's stop-on-lost-fix, the battery's watchdogs — so all of
+        them end up protecting a ghost.
+
+        Staleness has to be counted in seconds by whoever produced the fix.
+        Trackers pumped synchronously by their caller have no gap to count and
+        offer no timestamp; for those, asking really is seeing.
+        """
+        at = getattr(self.tracker, "fixes_at", None)
+        if at is None:
+            return now()
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            return now()
+        return at if at > 0 else now()
 
     def read_yaw(self):
         """The ball's own idea of its aim, if it has one. None means camera-only.

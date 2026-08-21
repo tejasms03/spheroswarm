@@ -270,11 +270,31 @@ class FleetEnv(SwarmEnv):
         return out
 
     def apply(self, actions, max_speed=None):
-        """Send controller output (n, 2) in [-1, 1] to the fleet as cm/s."""
+        """Send controller output (n, 2) in [-1, 1] to the fleet as cm/s.
+
+        A robot the camera has lost is STOPPED, not skipped. Those are
+        different instructions to a Sphero: it holds its last speed command
+        until it is given another one, so declining to update a robot leaves it
+        driving on whatever it was last told, for as long as the fix stays
+        lost. Skipping is how a point-to-point move ends with the ball circling
+        the room.
+
+        Commanding one from a position that stopped updating is the worse
+        failure of the two, because the controller is then steering confidently
+        by a number that is no longer a measurement. `connected` is exactly the
+        question "do we know where this robot is", and it is answerable here.
+
+        Simulated robots are always connected, so this changes nothing for
+        them — the branch exists for balls on a floor.
+        """
         from .handle import MAX_SPEED
         scale = max_speed or MAX_SPEED
         a = np.clip(np.asarray(actions, dtype=float), -1.0, 1.0)
         for i, c in enumerate(self.codes):
             h = self.fleet.handles.get(c)
-            if h is not None:
+            if h is None:
+                continue
+            if h.connected:
                 h.set_velocity(a[i] * scale)
+            else:
+                h.stop()
