@@ -15,11 +15,13 @@ by a radio that decided to take 400ms.
 """
 
 import logging
+import os
 import threading
 import time
 
 import numpy as np
 
+from . import sphero_fast
 from .handle import MAX_SPEED, RobotHandle, now, velocity_to_command
 
 log = logging.getLogger("fleet.real")
@@ -27,6 +29,15 @@ log = logging.getLogger("fleet.real")
 STALE_AFTER = 0.5           # s without a tracker fix before we stop trusting the position
 HEADING_DEADBAND = 8.0      # degrees
 SPEED_DEADBAND = 10         # speed byte
+FAST_WRITES = os.environ.get("SPHERO_FAST_WRITES", "") not in ("", "0", "false")
+"""Send drive commands without waiting for an acknowledgement.
+
+Off by default, and it should stay off until a physical ball has confirmed
+it. The change is sound on paper — see `fleet/sphero_fast` — but "the robot
+ignores our packets" and "the robot obeys instantly" look identical from
+here, and only a camera watching a ball can tell them apart.
+"""
+
 CONNECT_STAGGER = 1.5       # s between connect attempts, fleet-wide
 BACKOFF_START = 2.0
 BACKOFF_MAX = 30.0
@@ -71,7 +82,8 @@ class SpheroRobot(RobotHandle):
     HEADING_SIGN = -1.0
 
     def __init__(self, name, code, color, ble_name, workspace=None, tracker=None,
-                 connector=None, autostart=True, heading_offset=0.0):
+                 connector=None, autostart=True, heading_offset=0.0,
+                 fast_writes=None):
         super().__init__(name, code, color, workspace)
         self.ble_name = ble_name
         self.heading_offset = float(heading_offset or 0.0) % 360.0
@@ -94,7 +106,19 @@ class SpheroRobot(RobotHandle):
         self._yaw_source = None
 
         self._force_write = False       # set by drive_raw; skips the deadband once
-        self.rtt = None                 # seconds, last BLE round trip
+
+        # Fire-and-forget drive packets. `_fast` is the writer once a link is
+        # up and None whenever it is not, so one attribute answers both "is it
+        # switched on" and "did it actually attach" — which are different
+        # questions, and conflating them would report a speed-up that silently
+        # fell back.
+        self.fast_writes = FAST_WRITES if fast_writes is None else bool(fast_writes)
+        self._fast = None
+
+        # Seconds. With fast writes this is the enqueue, not a round trip, and
+        # it collapses to microseconds — which is honest, and is why the pacing
+        # in `_run` cannot be derived from it alone.
+        self.rtt = None
         self.rtt_mean = None
         self.attempts = 0
         self.last_error = None
@@ -122,6 +146,7 @@ class SpheroRobot(RobotHandle):
     def state(self):
         d = super().state()
         d.update(link_up=self._link_up, tracked=self.tracked,
+                 fast_writes=self._fast is not None,
                  rtt_ms=None if self.rtt is None else round(self.rtt * 1000, 1))
         return d
 
@@ -261,6 +286,7 @@ class SpheroRobot(RobotHandle):
 
     def _teardown(self):
         api, self._api = self._api, None
+        self._fast = None
         self._link_up = False
         if api is None:
             return
@@ -280,6 +306,7 @@ class SpheroRobot(RobotHandle):
             try:
                 self._api = self._connector(self.ble_name)
                 self._link_up = True
+                self._fast = sphero_fast.attach(self._api) if self.fast_writes else None
                 self.last_error = None
                 self.max_connections_hit = False
                 log.info("%s connected as %s", self.code, self.ble_name)
@@ -318,6 +345,14 @@ class SpheroRobot(RobotHandle):
         t0 = now()
         heading = int(round(heading)) % 360
         byte = int(byte)
+
+        if self._fast is not None:
+            self._write_fast(heading, byte)
+            dt = now() - t0
+            self.rtt = dt
+            self.rtt_mean = dt if self.rtt_mean is None else 0.8 * self.rtt_mean + 0.2 * dt
+            return
+
         lock = getattr(self._api, "_SpheroEduAPI__updating", None)
         try:
             if lock is not None:
@@ -346,6 +381,59 @@ class SpheroRobot(RobotHandle):
         dt = now() - t0
         self.rtt = dt
         self.rtt_mean = dt if self.rtt_mean is None else 0.8 * self.rtt_mean + 0.2 * dt
+
+    def _write_fast(self, heading, byte):
+        """One unacknowledged roll packet, plus the bookkeeping that makes it safe.
+
+        The library keeps its own idea of the current heading and speed, and a
+        background thread re-sends them every 0.8s whenever the speed is
+        non-zero. Bypassing `set_heading` never updates that cache, so without
+        the two assignments below the keepalive would re-aim the ball at a
+        stale heading roughly once a second — a slow twitch back toward an old
+        direction, which is exactly the kind of fault that gets blamed on the
+        controller.
+
+        Kept in sync, the keepalive becomes useful instead: it restates the
+        current intent on the acked path, so a fast path that silently stopped
+        being delivered degrades to driving correctly at 1.25Hz rather than to
+        a ball that ignores us. A keepalive packet can catch the pair
+        half-updated and carry one stale value for one cycle; the next command
+        overrides it well inside 0.8s.
+
+        Deliberately WITHOUT the library's `__updating` lock, which the acked
+        path above must take. That lock is held across an acked `roll_start` —
+        230ms — so taking it here would reintroduce, about a third of the time,
+        precisely the stall this path exists to remove. It was never needed for
+        mutual exclusion on the radio: the hazard it guards is two callers each
+        blocking on a reply and one timing out, and this path never waits for
+        one. The queue underneath is a `SimpleQueue` and is thread-safe.
+        """
+        api = self._api
+        try:
+            setattr(api, "_SpheroEduAPI__speed", byte)
+            setattr(api, "_SpheroEduAPI__heading", heading)
+        except Exception:
+            pass                        # the keepalive is a bonus, not a requirement
+        self._fast.roll(byte, heading)
+
+    def _pace_gap(self):
+        """The minimum interval between writes, in seconds.
+
+        On the acked path the round trip is its own pacing: a command issued
+        while the last one is still in flight is not a faster loop, it is a
+        queue.
+
+        Fast writes remove the ack, so `rtt_mean` stops measuring the link and
+        starts measuring an enqueue — microseconds — and pacing off it alone
+        would queue commands far faster than the library's writer thread drains
+        them. That is not a faster robot either; it is a growing backlog of
+        stale intent, and latest-wins upstream cannot help once the packets are
+        already on the queue. What the ack was standing in for is
+        `cmd_safe_interval`, the writer's own pause between packets, so that
+        becomes the floor.
+        """
+        floor = sphero_fast.MIN_WRITE_GAP if self._fast is not None else 0.0
+        return max(floor, (self.rtt_mean or 0.0) * 1.1)
 
     def _should_write(self, cmd):
         """Deadband. Radio airtime is the scarce resource with six robots on one adapter."""
@@ -380,8 +468,9 @@ class SpheroRobot(RobotHandle):
             # loop, it is a queue — and the library's own keepalive thread is
             # sharing the same radio. Latest-wins means nothing is lost by
             # waiting: the newest intent is the one that goes.
-            if self.rtt_mean:
-                gap = (self.rtt_mean * 1.1) - (now() - self._last_write_at)
+            pace = self._pace_gap()
+            if pace:
+                gap = pace - (now() - self._last_write_at)
                 if gap > 0 and self._stop_flag.wait(min(gap, 0.5)):
                     break
             if self._stop_flag.is_set():

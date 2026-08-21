@@ -128,6 +128,75 @@ def probe_drive_cost(api, samples=DRIVE_SAMPLES):
             "ms_max": round(max(times) * 1000, 1)}
 
 
+def probe_fast_writes(api, samples=DRIVE_SAMPLES):
+    """The same measurement again, with the acknowledgement turned off.
+
+    `probe_drive_cost` calls the library's setters, so it always measures the
+    acked path however `real_handle` happens to be configured. This is the
+    other half of the A/B, taken over the same link in the same session,
+    because the only comparison worth anything is one where the room, the
+    battery and the radio are held still between the two numbers.
+
+    A word on what this can and cannot show. It times the *enqueue*, and a
+    fire-and-forget write is expected to come back in microseconds — so a
+    dramatic number here is not evidence the robot did anything. It says the
+    ack is gone. Whether the ball still obeys is a question only the camera can
+    answer, by watching it drive.
+    """
+    from . import sphero_fast
+
+    writer = sphero_fast.attach(api)
+    if writer is None:
+        return {"error": "fast writes could not attach to this link"}
+
+    times = []
+    for i in range(samples):
+        heading = (i * 37) % 360
+        t0 = clock()
+        try:
+            writer.roll(0, heading)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        times.append(clock() - t0)
+    return {"writes": len(times),
+            "ms_mean": round(statistics.mean(times) * 1000, 3),
+            "ms_p90": round(sorted(times)[int(len(times) * 0.9)] * 1000, 3),
+            "ms_max": round(max(times) * 1000, 3)}
+
+
+def compare_write_paths(api, samples=DRIVE_SAMPLES):
+    """Acked versus fire-and-forget, back to back on one link.
+
+    This is the number that decides whether `SPHERO_FAST_WRITES` is worth
+    switching on, and it is deliberately the *first* thing a hardware session
+    should run — every controller gain derived before it would have to be
+    derived again afterwards.
+    """
+    acked = probe_drive_cost(api, samples=samples)
+    fast = probe_fast_writes(api, samples=samples)
+    out = {"acked": acked, "fast": fast}
+
+    a, f = acked.get("ms_mean"), fast.get("ms_mean")
+    # `is not None`, not truthiness: a fire-and-forget write is *supposed* to
+    # measure near zero, and a guard that reads that as "no measurement" would
+    # drop the result precisely when the change worked best.
+    if a is not None and f is not None:
+        out["speedup"] = round(a / f, 1) if f > 0 else None
+        out["saved_ms"] = round(a - f, 1)
+        # The ack is not the only cost. The library's writer thread still
+        # pauses `cmd_safe_interval` between packets, so this is the ceiling
+        # the command rate moves TOWARD, not one it reaches.
+        out["ceiling_hz"] = round(1.0 / sphero_fast_gap(), 1)
+        out["note"] = ("enqueue time, not proof of obedience — confirm with the "
+                       "camera that the ball still drives before trusting it")
+    return out
+
+
+def sphero_fast_gap():
+    from . import sphero_fast
+    return sphero_fast.MIN_WRITE_GAP
+
+
 def set_streaming(api, hz):
     """Turn sensor streaming on at a rate, or off with hz=0. Never raises."""
     toy = getattr(api, "_SpheroEduAPI__toy", None) or getattr(api, "toy", None)
@@ -161,6 +230,7 @@ def probe(api, rates=(0, 10, 20), samples=SAMPLES, sleep=0.02,
         report["streaming"][str(hz)] = entry
     set_streaming(api, 0)
 
+    report["write_paths"] = compare_write_paths(api, samples=drive_samples)
     report["verdict"] = verdict(report)
     return report
 
