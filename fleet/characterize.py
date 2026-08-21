@@ -1111,10 +1111,18 @@ class BrakeTest(Stage):
             # and it is what converts a chosen arrival tolerance into a speed
             # limit. Forced through the origin: a ball at rest coasts nowhere.
             k = float((v * d).sum() / max((v * v).sum(), 1e-9))
+            spread = float((v.max() - v.min()) / max(v.max(), 1e-9))
             out.update(
                 coast_s_per_cm_s=round(k, 4),
                 coast_at_45_cm=round(k * 45.0, 1),
                 r2=round(float(1 - np.var(d - k * v) / max(np.var(d), 1e-9)), 4),
+                entry_speed_spread=round(spread, 3),
+                # Everything that limits speed descends from this one number —
+                # the arrival tolerance, and the ceiling `fleet/safety.py`
+                # enforces on every robot. An untrustworthy one does not
+                # produce a single bad figure, it produces a bad calibration.
+                coast_trusted=bool(len(rows) >= BRAKE_MIN_ROWS
+                                   and spread >= BRAKE_MIN_SPREAD),
             )
         return out
 
@@ -1501,6 +1509,20 @@ class Recenter(Stage):
 ARRIVE_TOL_CM = 6.0         # mirrors swarm.navigate.ARRIVE_TOL
 DAMPING_TARGET = 0.40       # gain * (tau + delay); above ~0.5 it rings
 
+# What the brake fit needs before it is allowed to stand behind its own slope.
+# The same discipline `max_speed_trusted` applies to the speed map, which was
+# added after one unbounded extrapolation poisoned an entire calibration: a
+# slope is only worth publishing if it was measured across a range worth
+# calling a range. Two points 14% apart, fitted through the origin, is one
+# point and an assumption.
+BRAKE_MIN_ROWS = 3
+BRAKE_MIN_SPREAD = 0.35     # (max - min) / max of the entry speeds
+
+# A slow radius past this fraction of the arena's short side means the robot is
+# easing in almost everywhere it can stand, which is a recommendation the room
+# cannot honour however correct its arithmetic.
+SLOW_RADIUS_ARENA_FRACTION = 0.5
+
 
 class Characterization:
     """The whole battery, start to finish, on one robot.
@@ -1746,6 +1768,38 @@ class Characterization:
         if delay is not None and dead is not None:
             out["delay_agreement_s"] = round(abs(delay - dead), 3)
 
+        # A stage that recorded an error does not get to shape a
+        # recommendation. Its partial data stays in the report above, where a
+        # person can look at it and judge; what it must not do is descend
+        # silently into a gain, because a number derived from a stage that
+        # could not finish is indistinguishable, downstream, from one that was
+        # measured properly. The speed map already worked this way for its own
+        # top speed; this applies the same rule to every input.
+        withheld = {}
+
+        def usable(name, result, value):
+            err = (result or {}).get("error")
+            if value is None or not err:
+                return value
+            withheld[name] = err
+            return None
+
+        coast_k = usable("brake", brake, coast_k)
+        if coast_k is not None and not _brake_trusted(brake):
+            n, spread = _brake_range(brake)
+            withheld["brake"] = (
+                f"the coast constant came from {n} usable "
+                f"{'stop' if n == 1 else 'stops'} spanning {spread:.0%} of "
+                "their own top speed — too narrow a range to fit a slope "
+                "through, so it is not being used")
+            coast_k = None
+        tau = usable("step_response", step, tau)
+        dead = usable("step_response", step, dead)
+        delay = usable("latency", lat, delay)
+        v_max = usable("speed_map", speed, v_max)
+
+        total_delay = delay if delay is not None else dead
+
         rec = {}
         if coast_k is not None:
             # The brake test already measures the whole round trip, and this is
@@ -1776,7 +1830,7 @@ class Characterization:
                 "fleet/handle.py MAX_SPEED is the cm/s-to-byte calibration; set "
                 "it to this and the byte a controller asks for finally means "
                 "what it says")
-        if speed.get("min_moving_byte") is not None:
+        if speed.get("min_moving_byte") is not None and not speed.get("error"):
             # In BYTES, which is measured, and in cm/s only when there is a
             # trustworthy speed to convert with. Converting through a bogus
             # ceiling manufactures a deadband out of nothing: a 288cm/s ceiling
@@ -1790,12 +1844,17 @@ class Characterization:
                     "below this the ball is commanded and does not move, so a "
                     "controller easing to a stop stalls short of its target")
 
-        if cruise_cm_s and coast_k is not None:
+        if cruise_cm_s and coast_k is not None and tau is not None and total_delay is not None:
             # Easing in over SLOW_RADIUS is proportional control with gain
             # cruise/radius. It stays damped while gain times the total lag is
             # small, and the radius must also be comfortably longer than the
             # stopping distance or the ease-in starts too late to matter.
-            lag = (tau or 0.0) + (total_delay or 0.0)
+            #
+            # Both halves of the lag are required rather than defaulted to
+            # zero. A missing time constant treated as zero does not produce a
+            # cautious radius, it produces a confidently small one — the exact
+            # direction that rings.
+            lag = tau + total_delay
             by_damping = cruise_cm_s * lag / DAMPING_TARGET
             by_stopping = cruise_cm_s * coast_k * 1.6
             rec["cruise_cm_s"] = cruise_cm_s
@@ -1811,6 +1870,30 @@ class Characterization:
             rec["sim_latency_steps"] = max(1, int(round(total_delay * 30.0)))
         if v_max:
             rec["sim_gain"] = round(v_max / 60.0, 3)
+
+        # Arithmetically correct and physically impossible are not the same
+        # thing, and only one of them is visible in the numbers. A slow radius
+        # near the size of the room means the robot is inside its own arrival
+        # zone nearly everywhere, which no amount of correct algebra fixes. The
+        # arena is already recorded a few lines above, so the check is
+        # available and was simply never made.
+        arena = out.get("arena_cm")
+        radius = rec.get("slow_radius_cm")
+        if arena and radius:
+            short = min(arena)
+            if radius > short * SLOW_RADIUS_ARENA_FRACTION:
+                rec["arena_warning"] = (
+                    f"a slow radius of {radius:.0f}cm in an arena {short:.0f}cm "
+                    f"across leaves the robot easing in almost everywhere — "
+                    f"lower the cruise speed or re-measure, because the lag "
+                    f"this was derived from implies a robot this room cannot "
+                    f"hold")
+
+        if withheld:
+            rec["withheld"] = withheld
+            rec["note_withheld"] = (
+                "some stages did not finish, so what they measured is reported "
+                "but not used — the numbers above are the ones that stand up")
         out["recommend"] = rec
         return out
 
@@ -1837,6 +1920,31 @@ class Characterization:
         except Exception as e:
             return None, f"could not write {path}: {e}"
         return fitted, None
+
+
+def _brake_range(brake):
+    """(usable stops, fractional spread of their entry speeds)."""
+    rows = [r for r in (brake or {}).get("rows") or []
+            if (r.get("entry_cm_s") or 0) > STOP_SPEED]
+    if not rows:
+        return 0, 0.0
+    v = [float(r["entry_cm_s"]) for r in rows]
+    return len(rows), (max(v) - min(v)) / max(max(v), 1e-9)
+
+
+def _brake_trusted(brake):
+    """Is this coast constant worth standing behind?
+
+    The stage records its own verdict, but a calibration written before that
+    verdict existed has none — and defaulting a missing verdict to "trusted" is
+    how a file gets grandfathered past the check that was added because of it.
+    The rows are right there, so the answer is recomputed rather than assumed.
+    """
+    verdict = (brake or {}).get("coast_trusted")
+    if verdict is not None:
+        return bool(verdict)
+    n, spread = _brake_range(brake)
+    return n >= BRAKE_MIN_ROWS and spread >= BRAKE_MIN_SPREAD
 
 
 def load_motion(code=None, path=None):

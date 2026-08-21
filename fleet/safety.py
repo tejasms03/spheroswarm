@@ -29,14 +29,37 @@ HARD_STOP_CM = 6.0      # this close to a wall, nothing outward is allowed
 
 
 def stopping_seconds(fit=None):
-    """`stop_s` for one robot, measured if it has been."""
-    rec = ((fit or {}).get("recommend") or {})
+    """`stop_s` for one robot, measured if it has been.
+
+    The evidence is checked here, not just the conclusion. This is the one
+    consumer of a calibration that nobody reads: the gains panel puts its
+    numbers in front of a person who can doubt them, while this quietly decides
+    how fast every robot is allowed to move. A calibration written before the
+    brake fit learned to distrust itself carries a published constant with no
+    verdict attached, and taking that on faith is how a run that failed goes on
+    governing the arena weeks later.
+
+    Falling back is cheap and safe: `DEFAULT_STOP_S` is the conservative end of
+    what the sim models, so an unmeasured robot is limited more than it needs
+    to be rather than less.
+    """
+    fit = fit or {}
+    rec = fit.get("recommend") or {}
     k = rec.get("stopping_distance_s_per_cm_s")
     try:
         k = float(k)
     except (TypeError, ValueError):
         return DEFAULT_STOP_S
-    return k if k > 0.05 else DEFAULT_STOP_S
+    if k <= 0.05:
+        return DEFAULT_STOP_S
+
+    # Imported here rather than at module scope: `characterize` imports this
+    # module for its own limiting, so the pair would not load.
+    from .characterize import _brake_trusted
+    brake = fit.get("brake")
+    if brake and not _brake_trusted(brake):
+        return DEFAULT_STOP_S
+    return k
 
 
 def clearance(ws, pos):
