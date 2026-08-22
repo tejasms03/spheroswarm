@@ -136,13 +136,45 @@ def limit(ws, pos, heading_deg, byte, stop_s=DEFAULT_STOP_S, max_speed=60.0,
     return heading_deg, int(np.clip(allowed / max_speed * 255.0, 0, 255)), True
 
 
+PROBE_CM = 3.0          # step used to find which way the floor opens up
+
+
 def _inward(ws, pos):
-    """A unit vector pointing away from the nearest edge, or None."""
+    """A unit vector pointing where there is more room, or None.
+
+    Uphill on clearance, found by probing four directions. The obvious cheaper
+    answer — the direction of the arena's centre — agrees with this one for a
+    robot against a wall and disagrees for a robot against an obstacle in open
+    floor, which is exactly the case the caller is about to wave through at
+    full speed. `clearance` already accounts for obstacles; the centre of a
+    bounding box does not know they exist.
+
+    Falls back to the centre when the probe is flat, which happens when the
+    robot is nowhere near anything and the answer does not matter.
+    """
+    p = np.asarray(pos, dtype=float)
+    here = clearance(ws, p)
+    if here is None:
+        return None
+
+    grad = np.zeros(2)
+    for axis in (0, 1):
+        step = np.zeros(2)
+        step[axis] = PROBE_CM
+        plus = clearance(ws, p + step)
+        minus = clearance(ws, p - step)
+        if plus is None or minus is None:
+            continue
+        grad[axis] = plus - minus
+
+    n = float(np.linalg.norm(grad))
+    if n > 1e-6:
+        return grad / n
+
     try:
         x0, x1, y0, y1 = ws.bbox
     except Exception:
         return None
-    p = np.asarray(pos, dtype=float)
     to = np.array([(x0 + x1) / 2.0, (y0 + y1) / 2.0]) - p
     n = float(np.linalg.norm(to))
     return None if n < 1e-6 else to / n

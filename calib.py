@@ -237,6 +237,10 @@ class CalibApp:
         self._said_lost = False
         self.pd = None                  # PDController while driving
         self.path = None                # Point / Line / Circle
+        # Set when a drive starts circling and the bench stops to re-measure
+        # the aim frame. See `start_recovery`.
+        self.recover = None             # an ActiveCalibration, mid-drive
+        self.recovered = 0              # corrections applied to THIS drive
         self.shape = "point"            # what a click builds
         self.pending = []               # clicks collected toward a shape
         # Driving and measuring want different speeds and get separate ones.
@@ -1229,6 +1233,8 @@ class CalibApp:
                                predict_s=g["predict_s"])
         self.path = path
         self.trail = []
+        self.recover = None
+        self.recovered = 0
         self._said_orbit = False
         self._said_arrival = False
         self._lost_for = 0.0
@@ -1282,6 +1288,95 @@ class CalibApp:
         if deg >= 25:
             self.say("warn", "run the heading calibration (MOTION tab) — it will "
                              "straighten this out")
+
+    MAX_RECOVERIES = 2          # per drive; past this the fault is not the aim frame
+
+    def start_recovery(self, h):
+        """Circling means the aim frame is wrong. Stop and measure it.
+
+        Why the bench has to intervene rather than letting the live estimator
+        handle it: `HeadingEstimator` rejects any sample spanning more than
+        `max_turn` degrees of yaw, because travel direction measured across a
+        turn is meaningless. A robot going in circles is turning constantly, so
+        every sample is rejected and the estimator never becomes ready — it is
+        structurally blind in exactly the failure it exists to correct. Fed a
+        20-second circle it rejects 581 samples and reports no offset at all.
+
+        Breaking the circle is what makes the measurement possible. A
+        calibration leg holds ONE heading and never re-aims, so it travels in a
+        straight line however wrong the frame is — it simply goes the wrong
+        way, and that wrongness is the number we need. Two legs rather than one
+        so that disagreement between them is visible: legs that disagree mean
+        slipping, or a tracker following the wrong ball, and neither is fixed
+        by rotating a frame.
+        """
+        from fleet.heading import ActiveCalibration
+
+        self.recovered += 1
+        self.recover = ActiveCalibration(headings=(0.0, 90.0),
+                                         workspace=self.ws)
+        h.stop()
+        self.say("warn", f"{h.code} is circling, so the aim frame is wrong. "
+                         f"Stopping to re-measure it "
+                         f"({self.recovered}/{self.MAX_RECOVERIES}) — two short "
+                         "legs, then the drive continues on its own.")
+
+    def step_recovery(self, dt):
+        """Drive the recovery calibration. Returns True while it owns the robot."""
+        if self.recover is None:
+            return False
+        h = self.handle
+        if h is None:
+            self.recover = None
+            return False
+        if not h.connected:
+            h.stop()
+            return True                 # wait for the fix; the drive is paused
+
+        v = self.recover.step(h.pos, dt)
+        if v is not None and not self.recover.done:
+            h.set_velocity(v)
+            return True
+
+        h.stop()
+        cal, self.recover = self.recover, None
+
+        if cal.error or cal.offset is None:
+            self.stop_path(f"{h.code}: could not re-measure the aim frame — "
+                           f"{cal.error or 'no usable legs'}")
+            return True
+
+        # The measured value is the ERROR between commanded and achieved, so it
+        # is subtracted from what is already in force rather than assigned over
+        # it. Assigning it doubles the fault instead of cancelling it, which is
+        # a mistake this codebase has made once already.
+        before = h.heading_offset
+        h.heading_offset = (h.heading_offset - float(cal.offset)) % 360.0
+        e = self.roster.by_code(h.code)
+        if e is not None:
+            e.heading_offset = h.heading_offset
+            for x in self.roster.save():
+                self.say("error", x)
+
+        self.say("ok", f"{h.code} aim frame {before:.0f}deg -> "
+                       f"{h.heading_offset:.0f}deg (measured error "
+                       f"{cal.offset:.0f}deg, legs agree within "
+                       f"{cal.spread:.0f}deg) — saved, resuming the drive")
+        if cal.spread is not None and cal.spread > 25.0:
+            self.say("warn", f"the two legs disagreed by {cal.spread:.0f}deg. "
+                             "That is not a rotated frame — it is slipping, "
+                             "being pushed, or the tracker following a "
+                             "different ball. Check the blob count.")
+        # The orbit detector has been watching a drive that was doomed by the
+        # frame rather than by the gains. Clear its history so it judges the
+        # corrected drive on its own evidence.
+        if self.pd is not None:
+            self.pd._orbit_t = 0.0
+            self.pd._orbit_dist = []
+            self.pd.orbiting = False
+        self._said_orbit = False
+        self.trail = []
+        return True
 
     def stop_path(self, note="drive stopped"):
         if self.path is None:
@@ -1337,6 +1432,10 @@ class CalibApp:
         h = self.handle
         if h is None:
             return
+        # A recovery owns the robot until it is finished, and the drive it
+        # interrupted resumes from wherever the calibration legs left the ball.
+        if self.step_recovery(dt):
+            return
         if not h.connected:
             # STOP, not return. A Sphero holds its last speed command until it
             # is given another one, so a loop that merely stops updating leaves
@@ -1377,10 +1476,21 @@ class CalibApp:
                 self.report_approach(h)
         if self.pd.orbiting and not self._said_orbit:
             self._said_orbit = True
-            self.say("error", f"{h.code} is circling the target rather than "
-                              "closing on it — that is the aim frame being "
-                              "wrong, not the tolerance. Run the heading "
-                              "calibration (MOTION tab) before driving.")
+            # Circling is the aim frame, not the tolerance — and it is
+            # measurable right here rather than being somebody else's errand.
+            # Telling a trainer to go and run the MOTION battery is a poor
+            # answer when the bench is already holding the robot, already has
+            # the camera, and needs two short legs to find the number.
+            if self.recovered < self.MAX_RECOVERIES:
+                self.start_recovery(h)
+            else:
+                self.stop_path(
+                    f"{h.code} is still circling after "
+                    f"{self.MAX_RECOVERIES} aim-frame corrections, so the aim "
+                    "frame is not what is wrong. Check that BLOBS equals the "
+                    "number of connected robots — a tracker following a "
+                    "different ball produces exactly this, and no correction "
+                    "to this robot's frame can fix it.")
 
     # -- the battery -----------------------------------------------------
 

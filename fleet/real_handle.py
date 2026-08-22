@@ -29,6 +29,7 @@ log = logging.getLogger("fleet.real")
 STALE_AFTER = 0.5           # s without a tracker fix before we stop trusting the position
 HEADING_DEADBAND = 8.0      # degrees
 SPEED_DEADBAND = 10         # speed byte
+YAW_POLL_S = 0.25           # at most this often, and only on the worker thread
 FAST_WRITES = os.environ.get("SPHERO_FAST_WRITES", "") not in ("", "0", "false")
 """Send drive commands without waiting for an acknowledgement.
 
@@ -104,6 +105,8 @@ class SpheroRobot(RobotHandle):
         # Set by the bench once the sensor probe says which call answers on
         # this toy. Until then the estimator runs camera-only, which works.
         self._yaw_source = None
+        self._yaw = None                # last value read, or None
+        self._yaw_at = 0.0
 
         self._force_write = False       # set by drive_raw; skips the deadband once
 
@@ -262,7 +265,7 @@ class SpheroRobot(RobotHandle):
         self.last_seen = t
         # A gyro reading if this toy turned out to have one, and the commanded
         # heading otherwise — see `fleet/sensors.py` for which branch applies.
-        self.observe_heading(t, self.read_yaw())
+        self.observe_heading(t, self._yaw)
 
     def _fix_time(self):
         """When the fix just read was MEASURED, not when we asked for it.
@@ -292,10 +295,21 @@ class SpheroRobot(RobotHandle):
     def read_yaw(self):
         """The ball's own idea of its aim, if it has one. None means camera-only.
 
-        Deliberately not called on the worker thread: a blocking sensor read in
-        the same loop that writes drive commands would spend the airtime the
-        deadband exists to protect. `probe_sensors` in the bench measures what
-        that would cost before anything switches it on.
+        A blocking radio read, so it belongs on the worker thread and nowhere
+        else. It used to be called from `step()`, which runs on whichever
+        thread ticks the controller — in the app, the one that also draws the
+        window. Keeping it off the BLE worker was deliberate, to protect the
+        airtime the deadband exists to save; the cost was a radio stall in the
+        render loop instead, which is the worse of the two.
+
+        Rate-limited rather than banished, so the airtime it spends is bounded
+        and known: at most one read per `YAW_POLL_S`, taken after the drive
+        command has already gone out. `step()` reads the cached value, which is
+        at worst a quarter-second old — far fresher than the 25cm baseline the
+        estimator needs before it will use anything.
+
+        Dormant while `_yaw_source` is None, which is what the sensor probe
+        concluded for this hardware.
         """
         if not self._yaw_source:
             return None
@@ -304,6 +318,15 @@ class SpheroRobot(RobotHandle):
         except Exception:
             self._yaw_source = None        # stop asking; the fallback is fine
             return None
+
+    def _poll_yaw(self):
+        """Worker-side refresh of the cached yaw. Never raises."""
+        if not self._yaw_source:
+            return
+        if now() - self._yaw_at < YAW_POLL_S:
+            return
+        self._yaw_at = now()
+        self._yaw = self.read_yaw()
 
     def close(self):
         self._stop_flag.set()
@@ -518,6 +541,10 @@ class SpheroRobot(RobotHandle):
                     self._write(*cmd)
                     self._last_sent = cmd
                     self._last_write_at = now()
+                # After the command, never before it: driving is what the loop
+                # is for, and a sensor read that delays it buys a heading
+                # estimate at the cost of the thing being estimated.
+                self._poll_yaw()
             except Exception as e:
                 self.last_error = str(e)
                 if is_max_connections_error(e):

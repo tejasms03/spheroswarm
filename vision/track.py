@@ -78,6 +78,15 @@ class Tracker:
     """
 
     GATE_CM = 60.0        # reject detections this far from the prediction
+    # A track still building confidence has an unformed velocity estimate, so
+    # its prediction can be further out than a settled one's. It gets a wider
+    # gate, NOT no gate: a new track is initialised at its own first detection,
+    # so its position is good immediately, and a robot crossing the arena in
+    # one frame is not a thing that happens. A track that rejects everything
+    # ages out through `missing` in half a second and is rebuilt where the
+    # robot actually is, so being wrong here self-heals; adopting a phantom
+    # does not.
+    YOUNG_GATE_MULTIPLE = 2.0
 
     def __init__(self, assignment=None, homography=None, detector=None):
         self.assignment = assignment or {c: c for c in config.COLORS}
@@ -117,7 +126,8 @@ class Tracker:
             if t is None:
                 self.tracks[name] = Track(name, color, p)
                 continue
-            if np.linalg.norm(p - t.kf.pos) > self.GATE_CM and t.confident:
+            gate = self.GATE_CM * (1.0 if t.confident else self.YOUNG_GATE_MULTIPLE)
+            if np.linalg.norm(p - t.kf.pos) > gate:
                 continue                        # outlier, keep coasting
             t.kf.update(p)
             t.missing = 0
