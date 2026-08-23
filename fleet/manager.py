@@ -18,10 +18,25 @@ from .sim_handle import SimRobot
 
 
 class Fleet:
-    def __init__(self, workspace=None, tracker=None, connector=None, seed=None):
+    def __init__(self, workspace=None, tracker=None, connector=None, seed=None,
+                 motion_path=None):
+        """`motion_path` is where measured plant constants come from.
+
+        None means none: simulated robots keep their guessed dynamics. An app
+        that wants a characterised sim to behave like the ball it was measured
+        from passes `characterize.MOTION_PATH` explicitly.
+
+        Opt-in rather than opt-out, because `calib/motion.json` is live state.
+        Loading it by default would make every test's dynamics depend on
+        whatever the last hardware session left on disk, and the fixtures here
+        use the real robot codes — so a fleet built in a test would quietly
+        inherit CRXS's measured 0.52s of command latency and start failing for
+        reasons nobody would connect to a calibration run.
+        """
         self.ws = workspace or Workspace.load()
         self.tracker = tracker
         self.connector = connector
+        self.motion_path = motion_path
         self.rng = np.random.default_rng(seed)
         self.handles = {}                 # code -> RobotHandle, insertion ordered
         self.errors = []
@@ -31,9 +46,10 @@ class Fleet:
 
     @classmethod
     def from_roster(cls, roster=None, workspace=None, tracker=None, connector=None,
-                    seed=None):
+                    seed=None, motion_path=None):
         roster = roster if roster is not None else Roster.load()
-        f = cls(workspace=workspace, tracker=tracker, connector=connector, seed=seed)
+        f = cls(workspace=workspace, tracker=tracker, connector=connector,
+                seed=seed, motion_path=motion_path)
         if roster.errors:
             f.errors = list(roster.errors)
             return f
@@ -47,8 +63,26 @@ class Fleet:
                                heading_offset=getattr(entry, "heading_offset", 0.0),
                                workspace=self.ws, tracker=self.tracker,
                                connector=self.connector)
+        # A simulated robot that has been characterised should behave like the
+        # ball it was measured from. The battery already computes these and,
+        # until now, only printed them for somebody to copy by hand — so the
+        # sim ran a robot several times more responsive than the hardware, and
+        # a controller tuned against it was tuned against fiction.
         return SimRobot(entry.name, entry.code, entry.color, workspace=self.ws,
-                        pos=pos, seed=int(self.rng.integers(1 << 31)))
+                        pos=pos, seed=int(self.rng.integers(1 << 31)),
+                        motion=self._motion_for(entry.code))
+
+    def _motion_for(self, code):
+        """Measured constants for one robot, or {} — never raising, never
+        letting a malformed calibration stop a fleet from being built."""
+        if not self.motion_path:
+            return {}
+        try:
+            from .characterize import load_motion
+            from .sim_handle import from_motion
+            return from_motion(load_motion(code, path=self.motion_path))
+        except Exception:
+            return {}
 
     # -- membership ------------------------------------------------------
 

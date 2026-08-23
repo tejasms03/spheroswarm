@@ -11,13 +11,43 @@ import numpy as np
 
 from .handle import MAX_SPEED, RobotHandle, now
 
-# Guesses, not measurements. A real ball has not been characterised yet — see
-# `tools/measure_drift.py` for how to replace these with numbers off hardware.
+# Guesses, used only for a robot nothing has measured. Pass `motion=` and the
+# measured numbers take over — see `from_motion`.
 DRIFT_DEG_PER_MIN = 8.0     # random-walk scale on the heading bias
 DRIFT_LIMIT = 0.6           # rad, ~34 deg; a bounded walk, never a runaway
 SLIP_MAX = 0.06             # fraction of a command that can be lost
 
 BATTERY_DRAIN_PER_S = 1.0 / (90 * 60)     # a notional 90-minute run
+
+# The command queue holds whole ticks, so a delay in seconds only becomes a
+# number of slots once a tick rate is chosen. The battery converts its measured
+# delay at 30Hz, and this is the same 30Hz — kept as a named constant so the
+# assumption is visible rather than buried in a rounding.
+SIM_TICK_HZ = 30.0
+
+
+def from_motion(fit):
+    """Measured plant constants out of a `calib/motion.json` entry, or {}.
+
+    Only what the fit actually stood behind. A run whose stages errored has
+    those numbers withheld from `recommend` by `fleet/characterize`, so an
+    unmeasured constant simply is not here and the robot keeps its guess —
+    which is the honest outcome, and better than a sim confidently wrong.
+    """
+    rec = (fit or {}).get("recommend") or {}
+    out = {}
+    if rec.get("sim_tau_s"):
+        out["tau"] = float(rec["sim_tau_s"])
+    if rec.get("sim_latency_steps"):
+        # Back to seconds. The battery converted its measured delay at 30Hz,
+        # and a queue counted in ticks means whatever the caller's dt happens
+        # to be — 16 slots is 0.53s at 30Hz and 1.6s at 10Hz. Storing the
+        # duration and sizing the queue per dt is what makes the number mean
+        # the same thing at any tick rate.
+        out["latency_s"] = max(1, int(rec["sim_latency_steps"])) / SIM_TICK_HZ
+    if rec.get("sim_gain"):
+        out["gain"] = float(rec["sim_gain"])
+    return out
 
 
 class SimRobot(RobotHandle):
@@ -29,7 +59,15 @@ class SimRobot(RobotHandle):
     HEADING_SIGN = 1.0
 
     def __init__(self, name, code, color, workspace=None, pos=None, seed=None,
-                 randomize=True):
+                 randomize=True, motion=None):
+        """`motion` is measured plant constants from `from_motion`, or None.
+
+        Passed in rather than loaded here on purpose. `calib/motion.json` is
+        live state, and a handle that read it at construction would make every
+        test's behaviour depend on whatever the last hardware session left on
+        disk — which is exactly how twelve tests broke the day the real arena
+        was measured. The caller that knows which robot this is loads it.
+        """
         super().__init__(name, code, color, workspace)
         rng = np.random.default_rng(seed)
         self.rng = rng
@@ -50,9 +88,22 @@ class SimRobot(RobotHandle):
             self.latency, self.tau, self.gain, self.bias = 2, 0.35, 1.0, 0.0
             self.drift_rate = 0.0
             self.slip = 0.0
+
+        # Measurement beats a guess, per constant rather than all-or-nothing:
+        # a run that established the motor lag but not the top speed should
+        # hand over the lag and leave the gain alone.
+        self.measured = sorted(motion or ())
+        for k, v in (motion or {}).items():
+            setattr(self, k, v)
+
         self._drift = 0.0
         self._rng = rng
 
+        # A guessed latency has no units attached, so it stays a slot count and
+        # behaves exactly as it always has. A MEASURED one is a real duration
+        # and is held as one; `_resize_queue` turns it into slots against the
+        # dt actually being stepped.
+        self.latency_s = getattr(self, "latency_s", None)
         self.queue = deque([np.zeros(2)] * self.latency, maxlen=self.latency)
         self.battery = 1.0
         self.last_seen = now()
@@ -96,7 +147,26 @@ class SimRobot(RobotHandle):
         self._desired = np.zeros(2)
         self.queue.append(np.zeros(2))
 
+    def _resize_queue(self, dt):
+        """Hold a measured latency to its DURATION, whatever dt is being used.
+
+        Only for a measured one. A guessed latency is a slot count with no
+        seconds behind it, and reinterpreting it would change the dynamics of
+        every uncharacterised robot in the suite for no gain.
+        """
+        if not self.latency_s:
+            return
+        want = max(1, int(round(self.latency_s / max(dt, 1e-6))))
+        if want == self.queue.maxlen:
+            return
+        held = list(self.queue)[-want:]
+        self.queue = deque(held, maxlen=want)
+        while len(self.queue) < want:
+            self.queue.appendleft(np.zeros(2))
+        self.latency = want
+
     def step(self, dt):
+        self._resize_queue(dt)
         # Heading drift: a bounded random walk, in radians. Bounded because an
         # unbounded walk eventually points a robot backwards, which teaches a
         # controller nothing except that the world is broken.

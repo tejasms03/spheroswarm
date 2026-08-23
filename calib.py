@@ -36,6 +36,7 @@ import numpy as np
 import pygame
 
 from fleet import safety
+import fleet.characterize as characterize
 from fleet.characterize import (Characterization, DriftWatch, Recenter,
                                 load_motion)
 from swarm.pd import (Circle, Line, PDController, Point, gains_from_motion,
@@ -219,7 +220,11 @@ class CalibApp:
 
         # An empty fleet: robots join it when the trainer connects them, so
         # nothing is driven that the trainer did not ask for.
-        self.fleet = Fleet(workspace=self.ws, tracker=self.tracker)
+        # Same reasoning as app.py: a robot the battery has measured should
+        # simulate like that robot, so a `--dry` rehearsal is a rehearsal of
+        # the hardware rather than of a livelier machine that does not exist.
+        self.fleet = Fleet(workspace=self.ws, tracker=self.tracker,
+                           motion_path=characterize.MOTION_PATH)
         self.selected = self.roster.entries[0].code if self.roster.entries else None
 
         self.tab = "colour"

@@ -278,8 +278,13 @@ class App:
             self.tracker.start()
 
         self.homography = None
+        # A characterised robot simulates as the ball it was measured from.
+        # Without this the sim runs a plant several times more responsive than
+        # the hardware, and anything tuned against it is tuned against fiction.
+        from fleet.characterize import MOTION_PATH
         self.fleet = Fleet.from_roster(self.roster, workspace=self.ws,
-                                       tracker=self.tracker)
+                                       tracker=self.tracker,
+                                       motion_path=MOTION_PATH)
         self.ctx = SwarmContext(fleet=self.fleet, workspace=self.ws,
                                 controller=Navigate(), max_speed=speed)
         self.ctx.realtime = True        # a person is watching; pace the sim
