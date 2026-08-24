@@ -548,3 +548,62 @@ def test_the_estimate_is_monotonic():
     got = [implied_heading_error(r) or 0.0
            for r in (1.0, 1.05, 1.2, 1.5, 2.5, 4.0)]
     assert got == sorted(got), got
+
+
+# -- integral action, and the guards that make it safe -----------------------
+
+def test_integral_is_off_by_default():
+    """It must change nothing until somebody asks for it."""
+    from swarm.pd import PDController
+
+    c = PDController(1.0, 0.3, 60.0, 7.0, tol=6.0)
+    assert c.ki == 0.0
+    assert np.allclose(c._integrate(np.array([4.0, 0.0]), 4.0), np.zeros(2))
+
+
+def test_it_stores_nothing_on_a_long_approach():
+    """Unguarded, an integrator winds up all the way in and flings the ball
+    past the target. Nothing stored is nothing to fling."""
+    from swarm.pd import PDController
+
+    c = PDController(1.0, 0.3, 60.0, 7.0, tol=6.0, ki=1.0)
+    for _ in range(200):
+        c._integrate(np.array([80.0, 0.0]), 80.0)
+    assert np.allclose(c._integral, np.zeros(2))
+
+
+def test_leaving_the_near_zone_discards_what_was_stored():
+    """A robot picked up and carried across the room must not come back with
+    an integral it earned somewhere else."""
+    from swarm.pd import PDController
+
+    c = PDController(1.0, 0.3, 60.0, 7.0, tol=6.0, ki=1.0)
+    for _ in range(60):
+        c._integrate(np.array([5.0, 0.0]), 5.0)
+    assert np.linalg.norm(c._integral) > 0
+    c._integrate(np.array([90.0, 0.0]), 90.0)
+    assert np.allclose(c._integral, np.zeros(2))
+
+
+def test_its_authority_is_capped_in_cm_per_second():
+    """Capped as a CONTRIBUTION rather than as a raw sum of error-seconds —
+    the same guard in the units that decide what the robot does."""
+    from swarm.pd import PDController
+
+    c = PDController(1.0, 0.3, 60.0, 7.0, tol=6.0, ki=1.0)
+    for _ in range(2000):
+        out = c._integrate(np.array([10.0, 0.0]), 10.0)
+    ceiling = max(c.INTEGRAL_HEADROOM * c.deadband, 4.0)
+    assert float(np.linalg.norm(out)) <= ceiling + 1e-6
+
+
+def test_the_store_is_wound_back_when_the_output_saturates():
+    """Otherwise it keeps growing behind a capped command and the cap buys
+    nothing — the classic windup, one level down."""
+    from swarm.pd import PDController
+
+    c = PDController(1.0, 0.3, 60.0, 7.0, tol=6.0, ki=1.0)
+    for _ in range(2000):
+        c._integrate(np.array([10.0, 0.0]), 10.0)
+    ceiling = max(c.INTEGRAL_HEADROOM * c.deadband, 4.0)
+    assert float(np.linalg.norm(c._integral)) <= ceiling / c.ki + 1e-6

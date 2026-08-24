@@ -1582,3 +1582,66 @@ def test_a_probe_that_raises_is_reported_not_swallowed(bench, monkeypatch):
         time.sleep(0.01)
     assert bench.probe is None
     assert any("radio gone" in t for _, t in bench.log), [t for _, t in bench.log]
+
+
+# -- driving it yourself ------------------------------------------------------
+
+def test_teaching_takes_manual_control_and_records(bench):
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    h = bench.fleet.handles["ONE"]
+    h.pos = np.array([60.0, 55.0])
+
+    bench.toggle_teach()
+    assert bench.teaching is True
+    assert h.heading_tracking is False, (
+        "the frame must be measured as it is, not as a live estimator is "
+        "busy correcting it")
+
+    bench.keys_held.add(pygame.K_w)
+    for _ in range(40):
+        bench.step_teach(1 / 30)
+        h.step(1 / 30)
+    assert len(bench.teach_track) > 10
+
+
+def test_teaching_sets_the_area_the_battery_may_use(bench):
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    h = bench.fleet.handles["ONE"]
+
+    bench.toggle_teach()
+    # a loop big enough to work in
+    for corner in ((30, 30), (140, 30), (140, 120), (30, 120), (30, 30)):
+        h.pos = np.array(corner, dtype=float)
+        for _ in range(20):
+            bench.teach_track.append((h.pos.copy(), np.array([10.0, 0.0])))
+    bench.finish_teach()
+
+    assert bench.calib_bounds is not None
+    x0, y0, x1, y1 = bench.calib_bounds
+    assert x1 - x0 > 40 and y1 - y0 > 40
+    ws = bench.calib_workspace()
+    assert ws is not bench.ws, "the battery must plan in the driven box"
+    a, b, c, d = ws.bbox
+    assert (b - a) < 200.0
+
+
+def test_no_boundary_means_the_whole_arena(bench):
+    assert bench.calib_bounds is None
+    assert bench.calib_workspace() is bench.ws
+
+
+def test_teaching_gives_the_robot_back(bench):
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    h = bench.fleet.handles["ONE"]
+
+    bench.toggle_teach()
+    bench.finish_teach()
+    assert bench.teaching is False
+    assert h.heading_tracking is True
+    assert bench.keys_held == set()

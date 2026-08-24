@@ -15,23 +15,23 @@
     "color": "red",
     "ble_name": null,
     "enabled": true,
-    "heading_offset": 350.37175484791186
+    "heading_offset": 154.38564212414116
   },
   {
     "name": "Syrax",
     "code": "SYRX",
-    "kind": "real",
+    "kind": "sim",
     "color": "cyan",
-    "ble_name": "SK-67D7",
+    "ble_name": null,
     "enabled": true,
     "heading_offset": 235.98233689305994
   },
   {
     "name": "Vhagar",
     "code": "VHGR",
-    "kind": "real",
+    "kind": "sim",
     "color": "green",
-    "ble_name": "SK-5640",
+    "ble_name": null,
     "enabled": true,
     "heading_offset": 22.678920248966364
   },

@@ -274,6 +274,12 @@ class CalibApp:
         self.found = []
         self.autotune = None
         self.probe = None               # a SensorProbe on its own thread
+        # Driving it yourself: WASD while `teaching`, and what that taught.
+        self.teaching = False
+        self.keys_held = set()
+        self.manual_heading = 0.0
+        self.teach_track = []           # (pos_cm, commanded_velocity)
+        self.calib_bounds = None        # (x0, y0, x1, y1) the battery must stay in
         self.run = None                 # a Characterization in progress
         self.run_code = None
         self.run_t = 0.0
@@ -300,6 +306,17 @@ class CalibApp:
         # touching a slider pins it, so a number a person chose is never
         # silently overwritten by the next calibration.
         self.tune_kp = self.tune_kd = self.tune_predict = None
+        # Integral, off by default. In simulation it changes nothing, and the
+        # reason is worth carrying: the controller already lifts sub-deadband
+        # commands to the deadband rather than asking politely for a speed the
+        # motors ignore, and inside the arrival circle it commands nothing at
+        # all. Both of those remove the steady-state error an integrator exists
+        # to remove — SO LONG AS the sim is the whole story. A real floor has a
+        # slope, real motors sag with the battery and a real ball slips, none of
+        # which are modelled, and all of which are constant disturbances that
+        # proportional control leaves a standing error on. That case can only be
+        # made or refuted on the floor, so the knob is here and starts at zero.
+        self.tune_ki = 0.0
         self._tune_seeded = False
         # Found by hand at the ball, and they are not arbitrary: 450ms is about
         # two command round trips on this radio, so the controller stops
@@ -570,6 +587,127 @@ class CalibApp:
         return e.color if e else "red"
 
     # -- membership ------------------------------------------------------
+
+    MANUAL_SPEED = 14.0         # cm/s at full stick
+    MANUAL_TURN = 150.0         # deg/s on A and D
+
+    def toggle_teach(self):
+        """Drive it yourself, and let the bench watch.
+
+        Every automatic method here has to drive the robot to find out which
+        way driving sends it, which is why they end up at walls. A person with
+        a hand on the keys does not have that problem: they can see the ball,
+        steer round the furniture, and stop when it looks wrong. Ten seconds of
+        that answers both questions the battery keeps guessing at — which way
+        the frame is out, and which patch of floor is actually safe.
+        """
+        h = self.handle
+        if h is None:
+            self.say("error", "connect a robot first")
+            return
+        if self.teaching:
+            self.finish_teach()
+            return
+        self.stop_path("drive stopped — taking manual control")
+        self.teaching = True
+        self.keys_held.clear()
+        self.teach_track = []
+        self.manual_heading = 0.0
+        h.heading_tracking = False      # measure the frame as it is
+        self.say("info", "you drive: W forward, S back, A/D turn. Go round the "
+                         "edge of the floor you are happy to calibrate in, "
+                         "turning a few times. Press `teach` again when done.")
+        self._build()
+
+    def step_teach(self, dt):
+        if not self.teaching:
+            return
+        h = self.handle
+        if h is None:
+            self.finish_teach()
+            return
+        held = {pygame.key.name(k) for k in self.keys_held}
+        turn = (1.0 if "d" in held else 0.0) - (1.0 if "a" in held else 0.0)
+        drive = (1.0 if "w" in held else 0.0) - (1.0 if "s" in held else 0.0)
+        self.manual_heading = (self.manual_heading
+                               + turn * self.MANUAL_TURN * dt) % 360.0
+        if drive == 0.0:
+            h.set_velocity(np.zeros(2))
+            return
+        rad = np.radians(self.manual_heading)
+        # y is down, so a positive angle reads clockwise on screen and `d`
+        # turns right, which is what a hand on WASD expects.
+        commanded = np.array([np.sin(rad), np.cos(rad)]) * self.MANUAL_SPEED * drive
+        h.set_velocity(commanded)
+        if h.connected:
+            self.teach_track.append((np.asarray(h.pos, dtype=float).copy(),
+                                     commanded.copy()))
+        del self.teach_track[:-4000]
+
+    def finish_teach(self):
+        from fleet import teach
+
+        self.teaching = False
+        self.keys_held.clear()
+        h = self.handle
+        if h is not None:
+            h.stop()
+            h.heading_tracking = True
+
+        track = list(self.teach_track)
+        bounds = teach.driven_bounds(track)
+        if bounds is not None:
+            self.calib_bounds = bounds
+            x0, y0, x1, y1 = bounds
+            self.say("ok", f"calibration area set to {x1 - x0:.0f}x{y1 - y0:.0f}cm "
+                           f"from ({x0:.0f},{y0:.0f}) — the battery will plan "
+                           "inside this and nowhere else")
+        else:
+            self.say("warn", "not enough ground covered to set a calibration "
+                             "area — drive a bigger loop, or the whole arena "
+                             "gets used")
+
+        if h is None:
+            self._build()
+            return
+        res = teach.estimate(track, offset_now=h.heading_offset)
+        for leg in res["legs"]:
+            self.say("info", f"  told {leg['told_deg']:.0f}deg, drove "
+                             f"{leg['cm']:.0f}cm at {leg['went_deg']:.0f}deg "
+                             f"({leg['error_deg']:+.0f})")
+        if not res["ok"]:
+            self.say("error" if res.get("mirrored") else "warn", res["why"])
+            self._build()
+            return
+
+        h.heading_offset = res["new_offset_deg"]
+        e = self.roster.by_code(h.code)
+        if e is not None:
+            e.heading_offset = h.heading_offset
+            for x in self.roster.save():
+                self.say("error", x)
+        note = ("" if res.get("confident") else
+                " — but only one direction was driven, so this cannot tell a "
+                "rotated frame from a mirrored one. Drive a loop to be sure.")
+        self.say("ok", f"{h.code} aim frame {res['offset_deg']:+.0f}deg out over "
+                       f"{len(res['legs'])} leg(s); offset now "
+                       f"{h.heading_offset:.0f}deg, saved{note}")
+        self._build()
+
+    def calib_workspace(self):
+        """The floor the battery is allowed to use.
+
+        The arena is where the robot CAN go. Where it SHOULD go during a
+        calibration is smaller and depends on the furniture, the cable and
+        where somebody is standing — none of which the bench can see. Driving
+        it states it exactly.
+        """
+        if self.calib_bounds is None:
+            return self.ws
+        x0, y0, x1, y1 = self.calib_bounds
+        from workspace.space import Workspace
+        return Workspace(bounds_cm=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                         obstacles=list(getattr(self.ws, "obstacles", []) or []))
 
     def blob_count(self):
         """(blobs the camera sees, robots the camera has a fix on).
@@ -1457,6 +1595,7 @@ class CalibApp:
                 c.kd = float(self.tune_kd)
             if self.tune_predict is not None:
                 c.predict = float(self.tune_predict)
+            c.ki = float(self.tune_ki or 0.0)
             c.tol = float(self.arrive_cm)
 
     def start_path(self, path):
@@ -1474,7 +1613,8 @@ class CalibApp:
         else:
             self.pd = PDController(g["kp"], g["kd"], g["max_speed"],
                                    g["deadband_cm_s"], tol=float(self.arrive_cm),
-                                   predict_s=g["predict_s"])
+                                   predict_s=g["predict_s"],
+                                   ki=float(self.tune_ki or 0.0))
         if self.tune_kp is None:
             self.tune_kp, self.tune_kd = g["kp"], g["kd"]
             self.tune_predict = g["predict_s"]
@@ -1871,7 +2011,7 @@ class CalibApp:
         e = self.entry
         self.run = Characterization(
             blob_count=self.blob_count,
-            workspace=self.ws, code=h.code,
+            workspace=self.calib_workspace(), code=h.code,
             ble_name=getattr(e, "ble_name", None),
             heading_offset=getattr(h, "heading_offset", 0.0), quick=quick,
             max_byte=int(round(self.cap_cm_s / 60.0 * 255)),
@@ -2283,6 +2423,10 @@ class CalibApp:
             add((ax + 276, by, 110, 28), "STOP",
                 lambda: self.stop_run("run aborted"), tone=CORAL)
             add((ax + 396, by, 120, 28), "drift 5min", self.start_drift, tone=SUN)
+            b = add((ax + 652, by, 120, 28),
+                    "done" if self.teaching else "teach",
+                    self.toggle_teach, tone=SUN if self.teaching else MINT)
+            b.on = self.teaching
             add((ax + 524, by, 120, 28),
                 "probing..." if self.probe is not None else "sensors",
                 self.probe_sensors,
@@ -2370,13 +2514,17 @@ class CalibApp:
                                            lambda: int(self.tune_or_measured("kd") * 100),
                                            lambda v: self.set_tune("kd", v / 100.0)))
                 self.sliders.append(Slider((sx, ty + 56, 280, 16),
+                                           "ki x100", 0, 300,
+                                           lambda: int((self.tune_ki or 0.0) * 100),
+                                           lambda v: self.set_tune("ki", v / 100.0)))
+                self.sliders.append(Slider((sx, ty + 84, 280, 16),
                                            "predict ms", 0, 700,
                                            lambda: int(self.tune_or_measured("predict") * 1000),
                                            lambda v: self.set_tune("predict",
                                                                    v / 1000.0)))
             # The readout starts below whatever the sliders came to, so adding
             # or removing one can never draw the gains through them again.
-            self.drive_gains_top = ty + 56 + 16 + GAP + 8
+            self.drive_gains_top = ty + 84 + 16 + GAP + 8
 
     # -- drawing ---------------------------------------------------------
 
@@ -2999,7 +3147,17 @@ class CalibApp:
                 and self.arena_rect.collidepoint(pos):
             self.click_arena(self.to_cm(pos))
 
+    def key_up(self, e):
+        self.keys_held.discard(e.key)
+
     def key(self, e):
+        if self.teaching and e.key in (pygame.K_w, pygame.K_a, pygame.K_s,
+                                       pygame.K_d):
+            self.keys_held.add(e.key)
+            return
+        if self.teaching and e.key == pygame.K_ESCAPE:
+            self.finish_teach()
+            return
         if e.key == pygame.K_BACKSPACE and self.corner_mode:
             self.undo_corner()
         elif e.key == pygame.K_ESCAPE:
@@ -3030,6 +3188,7 @@ class CalibApp:
     def step(self, dt):
         self.drain_scan()
         self.drain_probe()
+        self.step_teach(dt)
         for h in list(self.fleet.handles.values()):
             try:
                 h.step(dt)
@@ -3059,6 +3218,8 @@ class CalibApp:
                     self.dragging_slider = None
                 elif e.type == pygame.KEYDOWN:
                     self.key(e)
+                elif e.type == pygame.KEYUP:
+                    self.key_up(e)
                 elif e.type == pygame.VIDEORESIZE:
                     self.apply_size(e.w, e.h)
                 elif e.type == pygame.MOUSEWHEEL:

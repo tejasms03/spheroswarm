@@ -135,7 +135,7 @@ class PDController:
     PREDICT_FRACTION = 0.5
 
     def __init__(self, kp=1.0, kd=0.35, max_speed=60.0, deadband_cm_s=0.0,
-                 tol=3.0, predict_s=0.0, release=1.7):
+                 tol=3.0, predict_s=0.0, release=1.7, ki=0.0):
         self.kp = float(kp)
         self.kd = float(kd)
         self.max_speed = float(max_speed)
@@ -160,6 +160,42 @@ class PDController:
         self._orbit_t = 0.0
         self._orbit_dist = []
         self.orbiting = False
+
+        # Integral action, off unless asked for. Its job here is not the
+        # textbook one: the deadband is already handled by lifting small
+        # commands up to it rather than asking for a speed the motors ignore.
+        # What is NOT handled is a constant disturbance — a floor with a slope,
+        # a ball that slips, motors sagging with the battery — and none of
+        # those are in the simulator, so the case for this can only be made on
+        # a real floor. Hence a knob that starts at zero.
+        #
+        # Two guards, because unguarded it is dangerous: it only accumulates
+        # near the target, so a long approach and a robot being carried across
+        # the room store nothing to fling on arrival; and its CONTRIBUTION is
+        # capped in cm/s rather than the raw sum being capped in error-seconds,
+        # which is the same guard in the units that matter.
+        self.ki = float(ki)
+        self._integral = np.zeros(2)
+
+    INTEGRAL_WITHIN = 4.0       # x tol; further out it stores nothing
+    INTEGRAL_HEADROOM = 2.0     # x deadband; the most authority it may have
+
+    def _integrate(self, err, d, dt=1.0 / 30.0):
+        if self.ki <= 0.0:
+            return np.zeros(2)
+        if d > max(self.INTEGRAL_WITHIN * self.tol, 1e-6):
+            self._integral = np.zeros(2)
+            return np.zeros(2)
+        self._integral = self._integral + np.asarray(err, dtype=float) * dt
+        out = self.ki * self._integral
+        ceiling = max(self.INTEGRAL_HEADROOM * self.deadband, 4.0)
+        n = float(np.linalg.norm(out))
+        if n > ceiling:
+            # Wind the store back to match the capped output, or it keeps
+            # growing behind a saturated command and the cap buys nothing.
+            out = out / n * ceiling
+            self._integral = out / self.ki
+        return out
 
     def step(self, pos, vel, setpoint, feedforward=None):
         pos = np.asarray(pos, dtype=float)
@@ -189,7 +225,7 @@ class PDController:
         # instead would be identical for a still target and violently noisy for
         # a moving one, because the setpoint's own motion would differentiate
         # into the output.
-        v = self.kp * err - self.kd * vel
+        v = self.kp * err - self.kd * vel + self._integrate(err, d)
         if feedforward is not None:
             # Following a path, the setpoint is moving. Without this the
             # controller is permanently behind by however far the target
