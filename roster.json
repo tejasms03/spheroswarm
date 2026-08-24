@@ -15,16 +15,16 @@
     "color": "red",
     "ble_name": "SK-4C2C",
     "enabled": true,
-    "heading_offset": 130.65369322707414
+    "heading_offset": 240.49059552756808
   },
   {
     "name": "Syrax",
     "code": "SYRX",
-    "kind": "sim",
-    "color": "yellow",
-    "ble_name": null,
+    "kind": "real",
+    "color": "cyan",
+    "ble_name": "SK-67D7",
     "enabled": true,
-    "heading_offset": 17.830010413348532
+    "heading_offset": 56.509075079871224
   },
   {
     "name": "Vhagar",
@@ -48,7 +48,7 @@
     "name": "Sunfyre",
     "code": "SNFR",
     "kind": "sim",
-    "color": "cyan",
+    "color": "yellow",
     "ble_name": null,
     "enabled": true,
     "heading_offset": 24.49010980039003

@@ -157,5 +157,258 @@
       "sim_tau_s": 0.32,
       "sim_latency_steps": 16
     }
+  },
+  "SYRX": {
+    "robot": "SYRX",
+    "ble_name": "SK-67D7",
+    "measured_at": "2026-08-24T13:36:55",
+    "arena_cm": [
+      138.8,
+      110.8
+    ],
+    "position_noise": {
+      "frames": 600,
+      "seconds": 20.0,
+      "sigma_x_cm": 0.392,
+      "sigma_y_cm": 0.338,
+      "sigma_cm": 0.344,
+      "p95_cm": 1.091,
+      "drift_cm": 0.25,
+      "fps": 30.1
+    },
+    "heading": {
+      "done": true,
+      "offset_deg": 24.1,
+      "spread_deg": 4.9,
+      "legs": 4,
+      "error": null
+    },
+    "speed_map": {
+      "rows": [
+        {
+          "byte": 18,
+          "cm_s": 17.8,
+          "course_deg": 32.7,
+          "requested_deg": 60.0
+        },
+        {
+          "byte": 24,
+          "cm_s": 24.93,
+          "course_deg": 182.2,
+          "requested_deg": 210.0
+        },
+        {
+          "byte": 31,
+          "cm_s": 25.85,
+          "course_deg": 273.0,
+          "requested_deg": 300.0
+        },
+        {
+          "byte": 37,
+          "cm_s": 25.15,
+          "course_deg": 32.4,
+          "requested_deg": 60.0
+        },
+        {
+          "byte": 44,
+          "cm_s": 28.4,
+          "course_deg": 122.3,
+          "requested_deg": 150.0
+        },
+        {
+          "byte": 50,
+          "cm_s": 25.85,
+          "course_deg": 242.0,
+          "requested_deg": 270.0
+        },
+        {
+          "byte": 57,
+          "cm_s": 24.76,
+          "course_deg": 0.7,
+          "requested_deg": 30.0
+        },
+        {
+          "byte": 63,
+          "cm_s": 28.15,
+          "course_deg": 180.0,
+          "requested_deg": 210.0
+        },
+        {
+          "byte": 70,
+          "cm_s": 22.39,
+          "course_deg": 0.9,
+          "requested_deg": 30.0
+        },
+        {
+          "byte": 76,
+          "cm_s": 28.27,
+          "course_deg": 179.2,
+          "requested_deg": 210.0
+        }
+      ],
+      "moving_points": 10,
+      "skipped_bytes": [],
+      "cm_s_per_byte": 0.0779,
+      "intercept_cm_s": 21.49,
+      "deadband_byte": 0,
+      "highest_measured_byte": 76,
+      "max_speed_measured": false,
+      "max_speed_trusted": false,
+      "max_speed_cm_s": 41.4,
+      "r2": 0.2288,
+      "stalled_bytes": [],
+      "min_moving_byte": 18
+    },
+    "step_response": {
+      "runs": [
+        {
+          "dead_s": 0.433,
+          "tau_s": 0.84,
+          "v_ss_cm_s": 27.72,
+          "rms_cm": 2.29
+        },
+        {
+          "dead_s": 0.433,
+          "tau_s": 0.32,
+          "v_ss_cm_s": 25.91,
+          "rms_cm": 2.18
+        },
+        {
+          "dead_s": 0.433,
+          "tau_s": 0.84,
+          "v_ss_cm_s": 28.44,
+          "rms_cm": 2.53
+        },
+        {
+          "dead_s": 0.433,
+          "tau_s": 0.44,
+          "v_ss_cm_s": 26.17,
+          "rms_cm": 1.53
+        },
+        {
+          "dead_s": 0.433,
+          "tau_s": 0.84,
+          "v_ss_cm_s": 26.92,
+          "rms_cm": 1.33
+        }
+      ],
+      "byte": 170,
+      "dead_s": 0.433,
+      "tau_s": 0.84,
+      "v_ss_cm_s": 26.92
+    },
+    "brake": {
+      "rows": [
+        {
+          "byte": 40,
+          "entry_cm_s": 24.69,
+          "coast_cm": 8.34,
+          "stop_s": 0.867,
+          "settled": true
+        },
+        {
+          "byte": 52,
+          "entry_cm_s": 25.32,
+          "coast_cm": 15.64,
+          "stop_s": 1.1,
+          "settled": true
+        },
+        {
+          "byte": 64,
+          "entry_cm_s": 25.97,
+          "coast_cm": 11.74,
+          "stop_s": 0.933,
+          "settled": true
+        },
+        {
+          "byte": 76,
+          "entry_cm_s": 24.71,
+          "coast_cm": 13.26,
+          "stop_s": 1.033,
+          "settled": true
+        },
+        {
+          "byte": 40,
+          "entry_cm_s": 26.37,
+          "coast_cm": 12.05,
+          "stop_s": 0.9,
+          "settled": true
+        },
+        {
+          "byte": 52,
+          "entry_cm_s": 28.45,
+          "coast_cm": 16.37,
+          "stop_s": 1.533,
+          "settled": true
+        },
+        {
+          "byte": 64,
+          "entry_cm_s": 33.26,
+          "coast_cm": 17.28,
+          "stop_s": 1.233,
+          "settled": true
+        },
+        {
+          "byte": 76,
+          "entry_cm_s": 28.91,
+          "coast_cm": 16.73,
+          "stop_s": 1.033,
+          "settled": true
+        }
+      ],
+      "coast_s_per_cm_s": 0.5142,
+      "coast_at_45_cm": 23.1,
+      "r2": 0.4478,
+      "entry_speed_spread": 0.258,
+      "coast_trusted": false
+    },
+    "latency": {
+      "runs": [
+        {
+          "delay_s": 0.0,
+          "tau_s": 0.84,
+          "steady_cm_s": 23.08,
+          "wobble_cm_s": 6.38,
+          "rms_cm": 1.95
+        },
+        {
+          "delay_s": 0.0,
+          "tau_s": 0.84,
+          "steady_cm_s": 26.16,
+          "wobble_cm_s": 6.97,
+          "rms_cm": 2.75
+        },
+        {
+          "delay_s": 0.0,
+          "tau_s": 0.84,
+          "steady_cm_s": 20.41,
+          "wobble_cm_s": 6.42,
+          "rms_cm": 3.33
+        },
+        {
+          "delay_s": 0.0,
+          "tau_s": 0.84,
+          "steady_cm_s": 19.04,
+          "wobble_cm_s": 13.56,
+          "rms_cm": 3.28
+        }
+      ],
+      "loop_delay_s": 0.0,
+      "spread_s": 0.0
+    },
+    "notes": [],
+    "delay_agreement_s": 0.433,
+    "speed_map_warning": "the top speed came out at 41cm/s, extrapolated from bytes up to 76. That is either impossible or too far a reach to trust, so it is not being used \u2014 raise the speed cap and run again if you need it.",
+    "recommend": {
+      "min_moving_byte": 18,
+      "kalman_r": 0.118,
+      "sim_tau_s": 0.84,
+      "sim_latency_steps": 1,
+      "sim_gain": 0.69,
+      "withheld": {
+        "brake": "the coast constant came from 8 usable stops spanning 26% of their own top speed \u2014 too narrow a range to fit a slope through, so it is not being used"
+      },
+      "note_withheld": "some stages did not finish, so what they measured is reported but not used \u2014 the numbers above are the ones that stand up"
+    }
   }
 }

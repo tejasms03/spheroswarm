@@ -357,6 +357,7 @@ class CalibApp:
         from fleet.vision_link import CameraTracker
         if self.tracker is not None:
             self.tracker.stop()
+        self._cam_caps = None
         self.tracker = CameraTracker(source=spec)
         errs = self.tracker.start()
         for e in errs:
@@ -540,6 +541,23 @@ class CalibApp:
         return e.color if e else "red"
 
     # -- membership ------------------------------------------------------
+
+    def blob_count(self):
+        """(blobs the camera sees, robots the camera has a fix on).
+
+        Handed to the tracking check so that a ball which appears not to move
+        can be told from a tracker that is not watching it. Both look identical
+        in the nudge itself, and only one of them is worth re-tuning colours
+        over.
+        """
+        if self.tracker is None:
+            return None, None
+        try:
+            blobs = len(self.tracker.latest()[1] or {})
+        except Exception:
+            return None, None
+        live = sum(1 for x in self.fleet.handles.values() if x.connected)
+        return blobs, live
 
     def sync_tracked_colours(self):
         """Point the tracker at the colours the bench is actually wearing.
@@ -1070,6 +1088,74 @@ class CalibApp:
                        "clears it.")
 
     # -- the wheel -------------------------------------------------------
+
+    # -- the two global camera knobs -------------------------------------
+
+    def get_blur(self):
+        d = self.detector
+        return int(d.thresh.get("blur", 5)) if d is not None else 5
+
+    def set_blur(self, v):
+        """Pre-blur, in pixels, applied before the frame is thresholded.
+
+        Turn it up and a shell that speckles into a dozen fragments becomes one
+        blob the tracker can hold. Turn it up too far and it welds a robot to
+        whatever is beside it — and it destroys the two-LED heading outright,
+        because that works by separating two peaks about thirteen pixels apart
+        on this arena. The two wants pull opposite ways; there is no setting
+        that is best for both.
+
+        Forced odd because a Gaussian kernel has to be.
+        """
+        d = self.detector
+        if d is None:
+            return
+        v = max(1, int(v) | 1)
+        d.thresh["blur"] = v
+        if v >= 13:
+            self.say("warn", f"blur {v}px is wider than the gap between a "
+                             "Sphero's two LEDs at this arena scale — good for "
+                             "a solid blob, fatal for reading heading off them")
+
+    def camera_source(self):
+        t = self.tracker
+        return getattr(t, "source", None) if t is not None else None
+
+    def camera_can(self, name):
+        src = self.camera_source()
+        if src is None or not hasattr(src, "capabilities"):
+            return False
+        if getattr(self, "_cam_caps", None) is None:
+            try:
+                self._cam_caps = src.capabilities()
+            except Exception:
+                self._cam_caps = {}
+        return bool(self._cam_caps.get(name))
+
+    def camera_get(self, name):
+        src = self.camera_source()
+        try:
+            return src.get(name) if src is not None else None
+        except Exception:
+            return None
+
+    def set_focus(self, v):
+        """Ask the lens to focus, and say what actually happened.
+
+        Cameras accept a `set` and ignore it constantly, so this reports the
+        value read back rather than the one requested. A slider that moves
+        while nothing changes is worse than no slider — a person will keep
+        turning it, and conclude the ball is unfocusable.
+        """
+        src = self.camera_source()
+        if src is None or not hasattr(src, "set"):
+            return
+        got = src.set("focus", v)
+        if got is None:
+            self.say("warn", "this camera does not accept a focus setting")
+        elif abs(float(got) - float(v)) > 2.0:
+            self.say("warn", f"asked for focus {int(v)}, the camera went to "
+                             f"{float(got):.0f} — it is clamping or ignoring it")
 
     def led_for(self, name):
         """What to tell a robot to glow, derived from the hue we look for."""
@@ -1824,6 +1910,7 @@ class CalibApp:
             return
         e = self.entry
         self.run = Characterization(
+            blob_count=self.blob_count,
             workspace=self.ws, code=h.code,
             ble_name=getattr(e, "ble_name", None),
             heading_offset=getattr(h, "heading_offset", 0.0), quick=quick,
@@ -2155,7 +2242,23 @@ class CalibApp:
                     (ax, sy + i * 26, min(300, aw - 20), 16), key, lo, hi,
                     lambda k=key: self.get_sig(k, lo),
                     lambda v, k=key: self.set_slider(k, v)))
-            by = sy + len(specs) * 26 + GAP
+            # Two knobs that are NOT per-colour, and are opposed to each
+            # other. `blur` smooths the frame before thresholding, which
+            # welds a speckled shell into one solid blob — at the cost of
+            # merging anything close together. `focus` is the lens.
+            gy = sy + len(specs) * 26
+            self.sliders.append(Slider((ax, gy, min(300, aw - 20), 16),
+                                       "blur", 1, 21,
+                                       self.get_blur, self.set_blur))
+            gy += 26
+            if self.camera_can("focus"):
+                self.sliders.append(Slider((ax, gy, min(300, aw - 20), 16),
+                                           "focus", 0, 255,
+                                           lambda: int(self.camera_get("focus") or 0),
+                                           lambda v: self.set_focus(v)))
+                gy += 26
+
+            by = gy + GAP
             add((ax, by, 150, 26), "auto-tune this",
                 lambda: self.start_autotune(False), tone=CYAN)
             add((ax + 158, by, 150, 26), "auto-tune all",

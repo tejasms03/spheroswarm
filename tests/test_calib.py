@@ -1496,3 +1496,41 @@ def test_autotune_puts_the_robots_back_on_their_real_colours(bench):
 
     assert h.rgb == tuple(bench.led_for(h.color)), (
         f"left on {h.rgb}, should be {bench.led_for(h.color)}")
+
+
+def test_blur_is_forced_odd(bench):
+    """A Gaussian kernel has to be. An even value is a crash waiting for a
+    frame to arrive."""
+    _colour_tab(bench)
+    for asked in (4, 8, 12, 1, 21):
+        bench.set_blur(asked)
+        assert bench.get_blur() % 2 == 1, f"{asked} -> {bench.get_blur()}"
+        assert bench.get_blur() >= 1
+
+
+def test_blur_wide_enough_to_merge_the_two_leds_says_so(bench):
+    """Blur and the two-LED heading pull opposite ways: one wants a solid
+    blob, the other wants two peaks ~13px apart on this arena. There is no
+    setting best for both, so the one that breaks the other announces itself."""
+    _colour_tab(bench)
+    bench.set_blur(17)
+    assert any("LED" in t for _, t in bench.log), [t for _, t in bench.log]
+
+    bench.log.clear()
+    bench.set_blur(5)
+    assert not any("LED" in t for _, t in bench.log)
+
+
+def test_blur_reaches_the_detector(bench):
+    _colour_tab(bench)
+    bench.set_blur(9)
+    assert bench.detector.thresh["blur"] == 9
+
+
+def test_a_camera_with_no_focus_control_gets_no_focus_slider(bench):
+    """Better no slider than one that moves while nothing changes — a person
+    will keep turning it and conclude the ball cannot be focused."""
+    assert bench.camera_can("focus") is False, (
+        "the synthetic source has no lens")
+    labels = [getattr(s, "label", None) for s in bench.sliders]
+    assert "focus" not in labels

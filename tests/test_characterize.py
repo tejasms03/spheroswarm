@@ -803,3 +803,46 @@ def test_it_never_drives_the_arena_away():
     for err in (90.0, 135.0, 180.0, 225.0, 270.0):
         r, _, pos = _recentre_with(err)
         assert r.travelled < 200.0, f"{err}deg: drove {r.travelled:.0f}cm"
+
+
+# -- a ball that did not move, versus a camera that was not watching ---------
+
+def _stalled_check(blob_count=None):
+    """A tracking check whose two nudges both saw almost nothing."""
+    from fleet.characterize import TrackingCheck
+
+    c = TrackingCheck(blob_count=blob_count)
+    c.rows = [{"commanded_deg": 0.0, "seen_cm": 0.3, "seen_deg": None},
+              {"commanded_deg": 180.0, "seen_cm": 0.6, "seen_deg": None}]
+    return c.result()
+
+
+def test_a_motionless_nudge_names_both_causes():
+    """It used to assert the tracker was at fault. The ball not moving produces
+    identical evidence, and blaming the tracker sends someone to re-tune
+    colours that were fine while a flat battery sits on the floor."""
+    err = _stalled_check()["error"]
+    assert "did not move" in err, err
+    assert "not watching" in err, err
+    assert "WATCH THE BALL" in err, "the one-second test comes first"
+
+
+def test_extra_blobs_point_at_the_tracker():
+    err = _stalled_check(blob_count=lambda: (3, 1))["error"]
+    assert "IS a phantom" in err, err
+
+
+def test_no_extra_blobs_points_at_the_ball():
+    """Not proof — but it moves the odds a long way, and stops the trainer
+    starting with the expensive half."""
+    err = _stalled_check(blob_count=lambda: (1, 1))["error"]
+    assert "the ball is the likelier half" in err, err
+
+
+def test_a_broken_blob_counter_costs_the_hint_and_nothing_else():
+    def boom():
+        raise RuntimeError("camera gone")
+
+    err = _stalled_check(blob_count=boom)["error"]
+    assert "WATCH THE BALL" in err
+    assert "phantom to latch onto" not in err
