@@ -114,10 +114,21 @@ class AutoTune:
     SETTLE = 0.7            # s for the LED change to reach the camera
     BURST = 6               # frames per burst
 
-    def __init__(self, handle, colors, on_done):
+    def __init__(self, handle, colors, on_done, light=None):
+        """`light(name) -> rgb` says what to glow for a colour slot.
+
+        Passed in rather than looked up here, and that is the whole point. This
+        used to light the ball from a fixed nominal table while the bench lit
+        it from the hue actually being hunted — so a slot re-picked by
+        `optimise hues` was tuned against the colour it USED to be, and the
+        learned signature quietly put it back. The ball then glowed one colour
+        while being hunted as another, which is a fault this codebase has
+        already had once and did not need again.
+        """
         self.handle = handle
         self.colors = list(colors)
         self.on_done = on_done
+        self.light = light or (lambda name: LED_RGB.get(name, (255, 255, 255)))
         self.i = 0
         self.phase = "dark"
         self.t = 0.0
@@ -165,7 +176,7 @@ class AutoTune:
             if frame is not None:
                 self._grab(frame, self.off)
             if len(self.off) >= self.BURST:
-                self.handle.set_led(LED_RGB[color])
+                self.handle.set_led(self.light(color))
                 self.phase, self.t = "lit", 0.0
             return
 
@@ -182,7 +193,7 @@ class AutoTune:
                 self.i += 1
                 self.phase, self.t = "dark", 0.0
                 if self.i >= len(self.colors):
-                    self.handle.set_led(LED_RGB.get(self.colors[-1], (255, 255, 255)))
+                    self.handle.set_led(self.light(self.colors[-1]))
                     self.done = True
                     self.on_done(self.results)
             return
@@ -265,6 +276,7 @@ class CalibApp:
         # issuing headings the robot has not finished acting on. Re-aiming
         # under 10deg of drift buys nothing a 230ms link can deliver.
         self.tune_retarget, self.tune_interval, self.tune_creep = 10.0, 0.45, 0.45
+        self.aim_legs = []              # (commanded_deg, error_deg) this drive
         self.aim_from = None            # position when the current leg began
         self.aim_deg = None             # the bearing it committed to
         self.aim_fixes = 0              # frame corrections made this drive
@@ -986,6 +998,35 @@ class CalibApp:
                                "noise, and it is as good as this camera gets")
         self._build()
 
+    def flip_arena_y(self):
+        """Mirror the arena, for a camera that delivers a mirrored image.
+
+        The tell is never in the picture — a mirrored image is perfectly
+        self-consistent, so corners map cleanly and the grid sits on the floor.
+        It shows only when a robot drives: the aim error changes sign with
+        direction, which no heading offset can cancel. See `mirrored_frame`.
+        """
+        hom = getattr(self.tracker.tracker, "H", None) if self.tracker else None
+        if hom is None or not hom.ready:
+            self.say("error", "no arena calibration to flip")
+            return
+        hom.flip_y()
+        try:
+            hom.save()
+        except Exception as e:
+            self.say("error", f"could not save the flipped arena: {e}")
+            return
+        for h in self.fleet.handles.values():
+            h.heading_offset = 0.0      # measured in the old frame; worthless now
+        for x in self.roster.save():
+            self.say("error", x)
+        self.say("ok", "arena y flipped and saved. Every heading offset has "
+                       "been cleared — they were measured in the old frame. "
+                       "Drive a point and the aim frame will re-measure itself; "
+                       "if the error still changes sign, the flip was not the "
+                       "problem and you can press it again to undo.")
+        self._build()
+
     def fit_parallax(self):
         """Measure the ball-height offset from the points just checked, and
         correct for it rather than only naming it.
@@ -1262,7 +1303,8 @@ class CalibApp:
             self.say("error", "no camera")
             return
         colors = list(vconfig.COLORS) if all_colors else [self.sig_color]
-        self.autotune = AutoTune(h, colors, self.finish_autotune)
+        self.autotune = AutoTune(h, colors, self.finish_autotune,
+                                 light=self.led_for)
         self.say("info", f"auto-tuning {len(colors)} colour(s) on {h.code} — "
                          "keep the ball still and in view")
 
@@ -1280,6 +1322,11 @@ class CalibApp:
             self.say("ok", f"{name}: hue {r['hue']}±{r['tol']}  s>{r['s_min']} "
                            f"v>{r['v_min']}  area {r['area']}px")
         self.autotune = None
+        # Back onto the hues the tracker is looking for. Auto-tune leaves the
+        # ball on whichever colour it finished with, and a ball left glowing
+        # something nobody is hunting looks exactly like a ball the camera
+        # cannot find.
+        self.relight()
         if good:
             self.save_signatures()
         if good > 1:
@@ -1388,6 +1435,7 @@ class CalibApp:
         self.apply_tuning()
         self.aim_from = self.aim_deg = None
         self.aim_fixes = 0
+        self.aim_legs = []
         self.path = path
         self.trail = []
         self.recover = None
@@ -1452,6 +1500,32 @@ class CalibApp:
     AIM_TOLERANCE_DEG = 12.0    # below this, leave the frame alone
     MAX_AIM_FIXES = 3           # per drive
 
+    MIRROR_SPREAD_DEG = 70.0    # of error swing across directions before we call it
+
+    def mirrored_frame(self):
+        """Does the aim error change sign with the direction driven?
+
+        A rotated frame gives the SAME error whichever way the robot goes, and
+        one number cancels it. A mirrored frame reflects every command, so the
+        error is `2a - 2*heading` — it sweeps the whole circle as the heading
+        changes, and no single offset can cancel it. Told 178 and driving 82 is
+        -96; told 194 and driving 345 is +151. That is not noise and it is not
+        a robot that needs a bigger correction, it is an arena the wrong way
+        round.
+
+        Needs legs pointing genuinely different ways: two legs 5 degrees apart
+        cannot tell the two models apart, and calling a mirror on that evidence
+        would send a trainer to re-pick corners that were fine.
+        """
+        legs = [l for l in self.aim_legs if l[0] is not None]
+        if len(legs) < 2:
+            return False
+        spread = max(abs(wrap180(a[0] - b[0])) for a in legs for b in legs)
+        if spread < 40.0:
+            return False
+        swing = max(abs(wrap180(a[1] - b[1])) for a in legs for b in legs)
+        return swing > self.MIRROR_SPREAD_DEG
+
     def watch_aim(self, h):
         """Read the aim frame off whatever leg the robot is already driving.
 
@@ -1496,6 +1570,23 @@ class CalibApp:
         # The same arithmetic as every other correction here: what was measured
         # is the ERROR between commanded and achieved, so it is subtracted from
         # what is already in force rather than assigned over it.
+        # Before correcting: is this an error one number CAN cancel?
+        self.aim_legs.append((self.aim_deg, err))
+        if self.mirrored_frame():
+            self.aim_fixes = self.MAX_AIM_FIXES     # stop; corrections cannot help
+            self.say("error",
+                     "the aim error changes SIGN with direction, so it is a "
+                     "mirrored frame, not a rotated one. A heading offset is "
+                     "one number added to every command — it cancels a "
+                     "constant error and can never cancel one that flips. "
+                     "The camera image is probably mirrored, which no amount "
+                     "of looking at the picture can reveal. Press `flip y` on "
+                     "the COLOUR tab, or re-pick the arena with the camera "
+                     "un-mirrored.")
+            self.stop_path("stopped — correcting a mirrored frame walks the "
+                           "offset round the compass forever")
+            return
+
         self.aim_fixes += 1
         before = h.heading_offset
         h.heading_offset = (h.heading_offset - h.HEADING_SIGN * err) % 360.0
@@ -2074,6 +2165,7 @@ class CalibApp:
                 "cancel" if self.corner_mode else "set arena",
                 self.cancel_corners if self.corner_mode else self.start_corners,
                 tone=SUN if self.corner_mode else None)
+            add((ax + 730, by, 110, 26), "flip y", self.flip_arena_y, tone=SUN)
             add((ax + 592, by, 130, 26),
                 "done" if self.checking else "check pos",
                 self.finish_position_check if self.checking

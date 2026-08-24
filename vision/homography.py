@@ -88,6 +88,31 @@ class Homography:
         self.parallax = None
         return self
 
+    def flip_y(self):
+        """Mirror the arena's y axis, and say so on disk.
+
+        For a camera that delivers a mirrored image. The picture then agrees
+        with itself perfectly — corners map cleanly, the grid lines up on the
+        floor — and every heading the robot is given comes out reflected,
+        because the image is a mirror of the world and nothing in the image can
+        show that. Only driving a robot reveals it.
+
+        Composed onto the existing matrix rather than re-solved, so a
+        calibration somebody clicked carefully is not thrown away to fix its
+        handedness. Any parallax fit goes, though: it was measured in the old
+        frame and its nadir is now on the wrong side.
+        """
+        if not self.ready:
+            return self
+        F = np.array([[1.0, 0.0, 0.0],
+                      [0.0, -1.0, float(self.height)],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.M = F @ self.M
+        if self.corners:
+            self.corners = [self.corners[i] for i in (3, 2, 1, 0)]
+        self.parallax = None
+        return self
+
     def matches(self, width, height, tol=1.0):
         """Does this calibration describe the same rectangle as the workspace?"""
         return (abs(self.width - float(width)) <= tol

@@ -225,3 +225,58 @@ def test_a_mirrored_frame_cannot_be_fixed_by_an_offset():
     assert max(errors) - min(errors) > 180, (
         "a mirror must show as an error that changes with direction — "
         "if it were constant, a heading_offset would absorb it")
+
+
+def test_a_mirrored_camera_cannot_be_seen_in_the_picture():
+    """Why `flip y` has to exist even though `_orient` already runs.
+
+    `_orient` makes the arena frame agree with the IMAGE. If the camera
+    delivers a mirrored image, the image is already a reflection of the world,
+    so a frame consistent with it is inconsistent with reality — and every
+    check available inside the picture passes. Corners map cleanly, the grid
+    sits on the floor, and every heading comes out reflected.
+    """
+    import numpy as np
+
+    from vision.homography import Homography
+
+    quad = [(100, 100), (500, 110), (510, 400), (90, 390)]
+    h = Homography()
+    h.set_rect(quad, 138.8, 110.8)
+    back = h.to_cm(h.corners)
+    want = np.array([[0, 0], [138.8, 0], [138.8, 110.8], [0, 110.8]])
+    clean_before = float(np.abs(back - want).max())
+
+    h.flip_y()
+    back = h.to_cm(h.corners)
+    clean_after = float(np.abs(back - want).max())
+
+    assert clean_before < 1.0
+    assert clean_after < 1.0, (
+        "a mirrored arena maps its own corners just as cleanly — which is "
+        "exactly why nothing in the image can detect it")
+
+
+def test_flipping_twice_is_the_identity():
+    """So a trainer who guesses wrong can press it again."""
+    import numpy as np
+
+    from vision.homography import Homography
+
+    h = Homography()
+    h.set_rect([(100, 100), (500, 110), (510, 400), (90, 390)], 138.8, 110.8)
+    before = h.to_cm([[300, 250], [180, 300]])
+    h.flip_y()
+    h.flip_y()
+    assert np.allclose(before, h.to_cm([[300, 250], [180, 300]]))
+
+
+def test_flipping_discards_a_parallax_fit():
+    """Its nadir was measured on the other side of the arena."""
+    from vision.homography import Homography
+
+    h = Homography()
+    h.set_rect([(100, 100), (500, 110), (510, 400), (90, 390)], 138.8, 110.8)
+    h.parallax = {"nadir_cm": [70.0, 20.0], "scale": 1.05}
+    h.flip_y()
+    assert h.parallax is None

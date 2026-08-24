@@ -1455,3 +1455,44 @@ def test_no_control_path_leaves_a_robot_driving_blind(bench, monkeypatch):
         for _ in range(5):
             bench.step(1 / 30.0)
         assert np.allclose(h._desired, 0.0), f"{setup} left it driving"
+
+
+def test_autotune_lights_the_hue_that_is_actually_hunted(bench):
+    """Bug (h) again, in the one path that still had it.
+
+    Auto-tune used a fixed nominal table while the bench lit from the hue being
+    hunted, so a slot re-picked by `optimise hues` was tuned against the colour
+    it USED to be — and the learned signature quietly put it back. The ball
+    then glows one colour while being hunted as another.
+    """
+    lit = []
+
+    class Handle:
+        code, color, rgb = "ONE", "red", (0, 0, 0)
+
+        def set_led(self, rgb, blink=None):
+            lit.append(tuple(rgb))
+
+    bench.detector.colors["red"] = dict(bench.detector.colors["red"], hue=59)
+    tuner = calib.AutoTune(Handle(), ["red"], lambda r: None,
+                           light=bench.led_for)
+    on = [c for c in [tuner.light("red")]][0]
+
+    assert on != calib.LED_RGB["red"], (
+        "lighting the nominal colour is what undid `optimise hues`")
+    assert on == bench.led_for("red")
+
+
+def test_autotune_puts_the_robots_back_on_their_real_colours(bench):
+    """It leaves the ball on whichever colour it finished with, and a ball
+    glowing something nobody hunts looks exactly like one the camera lost."""
+    _colour_tab(bench)
+    bench.connect("ONE", "sim")
+    h = bench.fleet.handles["ONE"]
+    h.set_led((7, 7, 7))
+
+    bench.autotune = object()
+    bench.finish_autotune({})
+
+    assert h.rgb == tuple(bench.led_for(h.color)), (
+        f"left on {h.rgb}, should be {bench.led_for(h.color)}")

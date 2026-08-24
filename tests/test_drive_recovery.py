@@ -277,3 +277,56 @@ def test_a_lost_fix_pauses_the_recovery_rather_than_ruining_it(bench, monkeypatc
 
     assert cal.driven == 0, "no leg may be driven blind"
     assert app.recover is cal, "and the recovery waits rather than failing"
+
+
+# -- a mirror is not a rotation ------------------------------------------
+
+def test_an_error_that_flips_sign_is_called_a_mirror(bench):
+    """A rotated frame gives the SAME error whichever way the robot goes. Under
+    a mirror the error is `2a - 2*heading`, so it sweeps as the heading turns.
+
+    The legs have to point genuinely different ways for this to be visible at
+    all — which is the catch, because a drive toward one point produces legs
+    that all point roughly at it."""
+    app = bench
+    app.aim_legs = [(0.0, -90.0), (90.0, 90.0)]
+    assert app.mirrored_frame() is True
+
+
+def test_a_constant_error_is_not_a_mirror(bench):
+    """The case an offset fixes, which must not be misdiagnosed."""
+    app = bench
+    app.aim_legs = [(10.0, 42.0), (140.0, 39.0), (250.0, 44.0)]
+    assert app.mirrored_frame() is False
+
+
+def test_legs_pointing_the_same_way_cannot_tell_the_two_apart(bench):
+    """Two legs 5 degrees apart are no evidence either way, and calling a
+    mirror on them sends a trainer to re-pick corners that were fine."""
+    app = bench
+    app.aim_legs = [(90.0, -96.0), (95.0, 151.0)]
+    assert app.mirrored_frame() is False
+
+
+def test_one_leg_is_never_enough(bench):
+    app = bench
+    app.aim_legs = [(178.0, -96.0)]
+    assert app.mirrored_frame() is False
+
+
+def test_a_mirrored_frame_stops_the_drive_rather_than_correcting(bench):
+    """Applying offsets to a mirrored frame walks the number round the compass
+    forever, which is what the logs showed."""
+    app = bench
+    h = _drive(app)
+    app.drive_mode = "straight"
+    app.aim_legs = [(0.0, -90.0), (90.0, 90.0)]
+    app.aim_deg, app.aim_from = 200.0, np.array([40.0, 40.0])
+    h.pos = np.array([60.0, 40.0])
+    app.pd = type("P", (), {"aim": 200.0})()
+    before = h.heading_offset
+
+    app.watch_aim(h)
+
+    assert h.heading_offset == before, "a mirror must not be 'corrected'"
+    assert any("mirrored frame" in t for _, t in app.log), [t for _, t in app.log]
