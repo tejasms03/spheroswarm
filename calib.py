@@ -260,7 +260,11 @@ class CalibApp:
         # silently overwritten by the next calibration.
         self.tune_kp = self.tune_kd = self.tune_predict = None
         self._tune_seeded = False
-        self.tune_retarget, self.tune_interval, self.tune_creep = 14.0, 0.4, 0.55
+        # Found by hand at the ball, and they are not arbitrary: 450ms is about
+        # two command round trips on this radio, so the controller stops
+        # issuing headings the robot has not finished acting on. Re-aiming
+        # under 10deg of drift buys nothing a 230ms link can deliver.
+        self.tune_retarget, self.tune_interval, self.tune_creep = 10.0, 0.45, 0.45
         self.aim_from = None            # position when the current leg began
         self.aim_deg = None             # the bearing it committed to
         self.aim_fixes = 0              # frame corrections made this drive
@@ -2119,14 +2123,14 @@ class CalibApp:
             # that only takes effect on the next drive is not a tuning knob,
             # it is a settings page, and tuning by stop-edit-start loses the
             # feel of what the change did.
-            ty = self.drive_top + 132
+            ty = self.drive_top + 124
             if self.drive_mode == "straight":
                 self.sliders.append(Slider((sx, ty, 280, 16),
-                                           "re-aim over deg", 4, 45,
+                                           "re-aim deg", 4, 45,
                                            lambda: int(self.tune_retarget),
                                            lambda v: self.set_tune("retarget", v)))
                 self.sliders.append(Slider((sx, ty + 28, 280, 16),
-                                           "re-aim gap ms", 100, 1200,
+                                           "re-aim ms", 100, 1200,
                                            lambda: int(self.tune_interval * 1000),
                                            lambda v: self.set_tune("interval",
                                                                    v / 1000.0)))
@@ -2149,6 +2153,9 @@ class CalibApp:
                                            lambda: int(self.tune_or_measured("predict") * 1000),
                                            lambda v: self.set_tune("predict",
                                                                    v / 1000.0)))
+            # The readout starts below whatever the sliders came to, so adding
+            # or removing one can never draw the gains through them again.
+            self.drive_gains_top = ty + 56 + 16 + GAP + 8
 
     # -- drawing ---------------------------------------------------------
 
@@ -2689,7 +2696,7 @@ class CalibApp:
         for sl in self.sliders:
             sl.draw(s, self.f)
 
-        y = r.y + 110
+        y = getattr(self, "drive_gains_top", r.y + 110)
         y = section(s, self.fs, "gains", x, y, 300,
                     "measured" if g["measured"] else "defaults",
                     MINT if g["measured"] else SUN)

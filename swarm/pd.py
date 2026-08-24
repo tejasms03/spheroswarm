@@ -450,8 +450,8 @@ class TurnAndGo:
     which is precisely what an arrival radius is for.
     """
 
-    def __init__(self, speed=8.0, arrive_cm=6.0, retarget_deg=14.0,
-                 min_interval_s=0.4, release=1.7, creep_frac=0.55,
+    def __init__(self, speed=8.0, arrive_cm=6.0, retarget_deg=10.0,
+                 min_interval_s=0.45, release=1.7, creep_frac=0.45,
                  creep_within=2.5):
         self.speed = float(speed)
         self.tol = float(arrive_cm)
