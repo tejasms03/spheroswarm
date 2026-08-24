@@ -541,6 +541,22 @@ class CalibApp:
 
     # -- membership ------------------------------------------------------
 
+    def blob_count(self):
+        """(blobs the camera sees, robots the camera has a fix on).
+
+        Handed to the tracking check so a ball that appears not to move can be
+        told from a tracker that is not watching it. Both look identical in the
+        nudge itself, and only one of them is worth re-tuning colours over.
+        """
+        if self.tracker is None:
+            return None, None
+        try:
+            blobs = len(self.tracker.latest()[1] or {})
+        except Exception:
+            return None, None
+        live = sum(1 for x in self.fleet.handles.values() if x.connected)
+        return blobs, live
+
     def sync_tracked_colours(self):
         """Point the tracker at the colours the bench is actually wearing.
 
@@ -1824,6 +1840,7 @@ class CalibApp:
             return
         e = self.entry
         self.run = Characterization(
+            blob_count=self.blob_count,
             workspace=self.ws, code=h.code,
             ble_name=getattr(e, "ble_name", None),
             heading_offset=getattr(h, "heading_offset", 0.0), quick=quick,
