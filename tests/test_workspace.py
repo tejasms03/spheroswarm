@@ -169,3 +169,59 @@ def test_make_can_be_told_to_drop_entities(tmp_path):
                        cwd=root, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert len(Workspace.load(out).entities) == 0
+
+
+# -- arena orientation -------------------------------------------------------
+
+def test_any_click_order_gives_the_declared_frame():
+    """workspace.json declares "top-left, x right, y down". Four corners can be
+    clicked starting anywhere and going either way; three of those eight
+    readings give a rotated or MIRRORED frame.
+
+    A rotation is survivable — one heading offset cancels it. A mirror is not:
+    it turns a commanded heading into its reflection, so the error changes sign
+    with direction and no single offset can cancel it. That is the bug this
+    guards, and it cost a session of blaming the controller.
+    """
+    import cv2
+    import numpy as np
+
+    from vision.homography import Homography
+
+    quad = [(100, 100), (500, 110), (510, 400), (90, 390)]
+    orders = {
+        "top-left, clockwise": quad,
+        "bottom-left, anticlockwise": [quad[3], quad[2], quad[1], quad[0]],
+        "top-right, clockwise": [quad[1], quad[2], quad[3], quad[0]],
+        "bottom-right, clockwise": [quad[2], quad[3], quad[0], quad[1]],
+    }
+    for name, pts in orders.items():
+        h = Homography()
+        h.set_rect(pts, 138.8, 110.8)
+        inv = np.linalg.inv(h.M)
+        to_px = lambda p: cv2.perspectiveTransform(
+            np.array([[list(map(float, p))]]), inv)[0, 0]
+        o = to_px((69.4, 55.4))
+        down = to_px((69.4, 75.4))
+        assert down[1] > o[1], f"{name}: arena +y goes up the image — mirrored"
+        right = to_px((89.4, 55.4))
+        assert right[0] > o[0], f"{name}: arena +x goes left — mirrored"
+
+
+def test_a_mirrored_frame_cannot_be_fixed_by_an_offset():
+    """Why the guard above has to exist rather than being a warning."""
+    import numpy as np
+
+    from fleet.handle import velocity_to_command
+
+    errors = []
+    for deg in range(0, 360, 45):
+        r = np.radians(deg)
+        intended = np.array([np.sin(r), np.cos(r)])
+        mirrored = np.array([intended[0], -intended[1]])
+        got = velocity_to_command(mirrored)[0]
+        errors.append((got - deg + 180) % 360 - 180)
+
+    assert max(errors) - min(errors) > 180, (
+        "a mirror must show as an error that changes with direction — "
+        "if it were constant, a heading_offset would absorb it")

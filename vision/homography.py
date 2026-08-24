@@ -61,7 +61,7 @@ class Homography:
         Corners are clockwise from the origin: origin, +x, +x+y, +y.
         """
         width, height = float(width), float(height)
-        src = np.array(pts, dtype=np.float32)
+        src = np.array(_orient(pts), dtype=np.float32)
         dst = np.array([[0, 0], [width, 0], [width, height], [0, height]],
                        dtype=np.float32)
         self.M = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
@@ -83,6 +83,37 @@ class Homography:
         inv = np.linalg.inv(self.M)
         p = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 1, 2)
         return cv2.perspectiveTransform(p, inv).reshape(-1, 2)
+
+
+def _orient(pts):
+    """Put four clicked corners into the order the workspace declares.
+
+    `workspace.json` says the arena frame is "top-left, x right, y down,
+    matching the camera frame". Four corners can be clicked starting anywhere
+    and going either way round, and three of those eight readings produce a
+    frame that is rotated or MIRRORED relative to that declaration.
+
+    A rotation is survivable — a heading offset cancels it. A mirror is not,
+    and that is the whole reason this exists: a mirrored frame turns a
+    commanded heading into its reflection, so the error changes sign with
+    direction. Measured across eight compass points it swings 270 degrees. A
+    `heading_offset` is one number added to every command; it can cancel a
+    constant error and it can never cancel one that changes sign. The symptom
+    is calibration legs that disagree by tens of degrees and a robot that
+    circles whatever you correct — which is a fortnight of blaming the
+    controller for the shape of the arena.
+
+    So the clicks are re-read rather than trusted: the corner nearest the
+    image origin becomes the arena origin, and the order is forced clockwise
+    in image space, which with y-down is the orientation-preserving one.
+    """
+    pts = [(float(x), float(y)) for x, y in pts]
+    start = min(range(4), key=lambda i: pts[i][0] + pts[i][1])
+    out = [pts[(start + i) % 4] for i in range(4)]
+    (ax, ay), (bx, by), (cx, cy) = out[0], out[1], out[2]
+    if (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) < 0:
+        out = [out[0], out[3], out[2], out[1]]      # was anticlockwise
+    return out
 
 
 LABELS = ["top-left", "top-right", "bottom-right", "bottom-left"]
