@@ -641,6 +641,7 @@ def test_a_characterisation_run_and_a_drive_do_not_fight(bench):
 
 def test_an_unmeasured_robot_drives_and_says_so(bench):
     _drive_tab(bench)
+    bench.drive_mode = "pd"          # this test is about the PD gains specifically
     bench.click(bench.to_px(np.array([140.0, 140.0])))
     assert bench.pd.predict == 0.0, "no measurement means no delay compensation"
     assert any("UNMEASURED" in t for _, t in bench.log)
@@ -650,6 +651,7 @@ def test_measured_gains_are_picked_up_after_a_run(bench, monkeypatch):
     """The whole point of the bench: measuring a robot makes it drive better."""
     import fleet.characterize as characterize
     _drive_tab(bench, pos=(100.0, 100.0))
+    bench.drive_mode = "pd"          # this test is about the PD gains specifically
     monkeypatch.setattr(characterize, "load_motion", lambda code=None, path=None: {
         "step_response": {"tau_s": 0.3}, "latency": {"loop_delay_s": 0.15},
         "recommend": {"min_moving_cm_s": 7.0, "handle_max_speed_cm_s": 52.0}})

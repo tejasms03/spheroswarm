@@ -100,7 +100,11 @@ def _lose_the_camera(monkeypatch, h):
 
 
 def _drive(app, target=(120.0, 120.0)):
+    """These tests are about the PD path: circling, and what the bench does
+    about it. Straight-line mode commits to a bearing and cannot orbit, so it
+    has nothing to recover from — see `watch_aim` for how it corrects instead."""
     from swarm.pd import Point
+    app.drive_mode = "pd"
     app.connect("ONE", "sim")
     app.selected = "ONE"
     h = app.handle

@@ -287,6 +287,10 @@ class App:
                                        motion_path=MOTION_PATH)
         self.ctx = SwarmContext(fleet=self.fleet, workspace=self.ws,
                                 controller=Navigate(), max_speed=speed)
+        # Only hunt the hues something is actually wearing. Six masks are
+        # searched per frame otherwise, and the four nobody wears find room
+        # clutter rather than robots.
+        self.sync_tracked_colours()
         self.ctx.realtime = True        # a person is watching; pace the sim
         # Learned precedents. Identifiers come from the roster so that "swap
         # SSMK and CRXS" matches a remembered "swap Seasmoke and Caraxes" —
@@ -390,6 +394,20 @@ class App:
     #: falling back from one unreachable hosted preset to another behind the
     #: same gateway would just fail twice.
     FALLBACK_PRESETS = ("qwen3.5:9b", "qwen3.5:4b")
+
+
+    def sync_tracked_colours(self):
+        """Point the tracker at the colours the fleet is actually wearing.
+
+        Without it the tracker hunts every hue in the palette forever, so a
+        fleet of two produces blobs for four colours nobody wears — and a blob
+        with a position and a colour is indistinguishable from a robot to
+        everything downstream.
+        """
+        t = getattr(self, "tracker", None)
+        if t is None or not hasattr(t, "set_colors"):
+            return
+        t.set_colors({h.color for h in self.fleet.handles.values() if h.color})
 
     def check_calibration(self):
         """Warn when the camera and the planner disagree about the arena.

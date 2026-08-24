@@ -37,9 +37,11 @@ import pygame
 
 from fleet import safety
 import fleet.characterize as characterize
+from fleet.heading import wrap180
 from fleet.characterize import (Characterization, DriftWatch, Recenter,
                                 load_motion)
-from swarm.pd import (Circle, Line, PDController, Point, gains_from_motion,
+from swarm.pd import (Circle, Line, PDController, Point, TurnAndGo,
+                      gains_from_motion,
                       implied_heading_error, straightness, tracking_error)
 from fleet.manager import Fleet
 from fleet.roster import RobotEntry, Roster
@@ -246,6 +248,22 @@ class CalibApp:
         # the aim frame. See `start_recovery`.
         self.recover = None             # an ActiveCalibration, mid-drive
         self.recovered = 0              # corrections applied to THIS drive
+
+        # "straight" aims once and commits; "pd" corrects continuously. A PD
+        # loop re-aims every frame, so a rotated frame bends the path into a
+        # circle it can never close — which is what a real ball does here. A
+        # committed leg goes the WRONG WAY instead, in a straight line, and a
+        # wrong direction is a measurement. See `watch_aim`.
+        self.drive_mode = "straight"
+        # Hand-tuning values. `None` means "whatever the measurement says";
+        # touching a slider pins it, so a number a person chose is never
+        # silently overwritten by the next calibration.
+        self.tune_kp = self.tune_kd = self.tune_predict = None
+        self._tune_seeded = False
+        self.tune_retarget, self.tune_interval, self.tune_creep = 14.0, 0.4, 0.55
+        self.aim_from = None            # position when the current leg began
+        self.aim_deg = None             # the bearing it committed to
+        self.aim_fixes = 0              # frame corrections made this drive
         self.shape = "point"            # what a click builds
         self.pending = []               # clicks collected toward a shape
         # Driving and measuring want different speeds and get separate ones.
@@ -507,12 +525,26 @@ class CalibApp:
 
     # -- membership ------------------------------------------------------
 
+    def sync_tracked_colours(self):
+        """Point the tracker at the colours the bench is actually wearing.
+
+        Called whenever the fleet changes. Without it the tracker hunts all six
+        hues forever, so a bench holding two robots reports blobs for four
+        colours nobody is wearing — and each of those is something the tracker
+        can lock onto and something downstream can be driven from.
+        """
+        if self.tracker is None:
+            return
+        worn = {h.color for h in self.fleet.handles.values() if h.color}
+        self.tracker.set_colors(worn)
+
     def connect(self, code, kind):
         entry = self.roster.by_code(code)
         if entry is None:
             return
         if code in self.fleet.handles:
             self.fleet.remove(code)
+            self.sync_tracked_colours()
             self.say("info", f"{code} released")
             self._build()
             return
@@ -528,6 +560,7 @@ class CalibApp:
             return
         self.selected = code
         h = self.fleet.handles[code]
+        self.sync_tracked_colours()
         h.set_led(self.led_for(entry.color))
         self.say("ok", f"{code} joined as {kind}"
                        + (f" ({entry.ble_name})" if kind == "real" else ""))
@@ -1089,6 +1122,7 @@ class CalibApp:
             if entry is not None and h.color != entry.color:
                 h.color = entry.color
                 h.set_led(self.led_for(entry.color))
+        self.sync_tracked_colours()
         swapped = next((x.code for x in self.roster.entries
                         if x.color == was and x.code != e.code and x.enabled), None)
         self.say("ok", f"{e.code} is now {name}"
@@ -1224,6 +1258,64 @@ class CalibApp:
                              f"{self.selected}'s own measurement")
             self._build()
 
+    def toggle_drive_mode(self):
+        self.drive_mode = "pd" if self.drive_mode == "straight" else "straight"
+        self.say("info",
+                 "straight: aim once, drive a straight leg, stop. A committed "
+                 "leg goes the wrong WAY if the frame is off, instead of "
+                 "curving — and a wrong way is measurable."
+                 if self.drive_mode == "straight" else
+                 "PD loop: corrects every frame. Smoother into the target when "
+                 "the aim frame is right, and circles when it is not.")
+        if self.path is not None:
+            self.start_path(self.path)      # rebuild under the new mode
+        self._build()
+
+    def tune_or_measured(self, name):
+        """The pinned value if a person set one, else what the battery measured.
+
+        The sliders exist before any drive has started, so they cannot read a
+        value that only appears once a controller is built. Falling back to the
+        measurement means a slider shows the number actually in force rather
+        than a zero that would be a lie about what the robot is doing.
+        """
+        pinned = getattr(self, f"tune_{name}", None)
+        if pinned is not None:
+            return float(pinned)
+        g = self.gains()
+        return float({"kp": g["kp"], "kd": g["kd"],
+                      "predict": g["predict_s"]}.get(name, 0.0))
+
+    def set_tune(self, name, value):
+        """Pin one gain by hand, and apply it to the drive already running."""
+        setattr(self, f"tune_{name}", value)
+        self.apply_tuning()
+
+    def apply_tuning(self):
+        """Push the hand-set values onto the live controller.
+
+        A knob that only takes effect on the next drive is a settings page, not
+        a tuning knob: half of tuning is feeling what a change did to a robot
+        that is already moving.
+        """
+        c = self.pd
+        if c is None:
+            return
+        if self.drive_mode == "straight":
+            c.retarget = float(self.tune_retarget)
+            c.min_interval = float(self.tune_interval)
+            c.creep_frac = float(self.tune_creep)
+            c.speed = float(self.path_speed)
+            c.tol = float(self.arrive_cm)
+        else:
+            if self.tune_kp is not None:
+                c.kp = float(self.tune_kp)
+            if self.tune_kd is not None:
+                c.kd = float(self.tune_kd)
+            if self.tune_predict is not None:
+                c.predict = float(self.tune_predict)
+            c.tol = float(self.arrive_cm)
+
     def start_path(self, path):
         h = self.handle
         if h is None:
@@ -1233,9 +1325,19 @@ class CalibApp:
             self.say("error", "a characterisation run is using this robot")
             return
         g = self.gains()
-        self.pd = PDController(g["kp"], g["kd"], g["max_speed"],
-                               g["deadband_cm_s"], tol=float(self.arrive_cm),
-                               predict_s=g["predict_s"])
+        if self.drive_mode == "straight":
+            self.pd = TurnAndGo(speed=float(self.path_speed),
+                                arrive_cm=float(self.arrive_cm))
+        else:
+            self.pd = PDController(g["kp"], g["kd"], g["max_speed"],
+                                   g["deadband_cm_s"], tol=float(self.arrive_cm),
+                                   predict_s=g["predict_s"])
+        if self.tune_kp is None:
+            self.tune_kp, self.tune_kd = g["kp"], g["kd"]
+            self.tune_predict = g["predict_s"]
+        self.apply_tuning()
+        self.aim_from = self.aim_deg = None
+        self.aim_fixes = 0
         self.path = path
         self.trail = []
         self.recover = None
@@ -1295,6 +1397,72 @@ class CalibApp:
                              "straighten this out")
 
     MAX_RECOVERIES = 2          # per drive; past this the fault is not the aim frame
+
+    AIM_BASELINE_CM = 15.0      # travel before a leg's direction is worth reading
+    AIM_TOLERANCE_DEG = 12.0    # below this, leave the frame alone
+    MAX_AIM_FIXES = 3           # per drive
+
+    def watch_aim(self, h):
+        """Read the aim frame off whatever leg the robot is already driving.
+
+        This is what committing to a bearing buys. A PD loop re-aims every
+        frame, so a rotated frame shows up as a curve — and a curve tells you
+        the frame is wrong without telling you by how much, because every
+        sample was taken under a different heading. A committed leg holds ONE
+        heading, so it travels in a straight line however wrong the frame is,
+        and the gap between the bearing commanded and the bearing achieved is
+        the error, directly, from an ordinary move.
+
+        So there is no need to detect circling and then stop to measure. Every
+        leg is a calibration leg, and the correction lands within a leg or two
+        of the drive starting.
+
+        Noise sets the baseline. The error in a direction measured over `d`
+        centimetres is about sigma/d, so half a centimetre of position noise
+        over 15cm is a couple of degrees — small against the twelve this will
+        act on, and small against the eighty-five it is really looking for.
+        """
+        aim = getattr(self.pd, "aim", None)
+        if aim is None:
+            self.aim_from = self.aim_deg = None
+            return
+        if self.aim_deg is None or abs(wrap180(aim - self.aim_deg)) > 1.0:
+            self.aim_from, self.aim_deg = np.asarray(h.pos, dtype=float).copy(), aim
+            return
+        if self.aim_from is None or self.aim_fixes >= self.MAX_AIM_FIXES:
+            return
+
+        went = np.asarray(h.pos, dtype=float) - self.aim_from
+        travelled = float(np.linalg.norm(went))
+        if travelled < self.AIM_BASELINE_CM:
+            return
+
+        actual = float(np.degrees(np.arctan2(went[1], went[0])))
+        err = wrap180(actual - self.aim_deg)
+        self.aim_from = np.asarray(h.pos, dtype=float).copy()
+        if abs(err) <= self.AIM_TOLERANCE_DEG:
+            return
+
+        # The same arithmetic as every other correction here: what was measured
+        # is the ERROR between commanded and achieved, so it is subtracted from
+        # what is already in force rather than assigned over it.
+        self.aim_fixes += 1
+        before = h.heading_offset
+        h.heading_offset = (h.heading_offset - h.HEADING_SIGN * err) % 360.0
+        e = self.roster.by_code(h.code)
+        if e is not None:
+            e.heading_offset = h.heading_offset
+            for x in self.roster.save():
+                self.say("error", x)
+        told = self.aim_deg
+        self.pd.aim = None              # re-aim in the corrected frame
+        self.aim_from = self.aim_deg = None
+        self.say("ok", f"{h.code} was told {told:.0f}deg and drove "
+                       f"{travelled:.0f}cm at {actual:.0f}deg — that is "
+                       f"{err:+.0f}deg of aim-frame error. Offset {before:.0f} "
+                       f"-> {h.heading_offset:.0f}deg "
+                       f"({self.aim_fixes}/{self.MAX_AIM_FIXES})")
+
 
     def start_recovery(self, h):
         """Circling means the aim frame is wrong. Stop and measure it.
@@ -1375,7 +1543,7 @@ class CalibApp:
         # The orbit detector has been watching a drive that was doomed by the
         # frame rather than by the gains. Clear its history so it judges the
         # corrected drive on its own evidence.
-        if self.pd is not None:
+        if getattr(self.pd, "orbiting", None) is not None:
             self.pd._orbit_t = 0.0
             self.pd._orbit_dist = []
             self.pd.orbiting = False
@@ -1465,9 +1633,10 @@ class CalibApp:
         v = self.pd.step(h.pos, h.vel, setpoint, feedforward=ff)
         # The same ceiling the battery drives under. A click near a wall should
         # ease into it, not arrive at it.
+        top = getattr(self.pd, "max_speed", None) or getattr(self.pd, "speed", 60.0)
         ceiling = safety.speed_ceiling(self.ws, h.pos, self.stop_s(),
                                        safety=self.edge_margin,
-                                       cap=min(self.pd.max_speed, self.cap_cm_s))
+                                       cap=min(top, self.cap_cm_s))
         speed = float(np.linalg.norm(v))
         if speed > ceiling > 0:
             v = v / speed * ceiling
@@ -1479,7 +1648,8 @@ class CalibApp:
             if not self._said_arrival:
                 self._said_arrival = True
                 self.report_approach(h)
-        if self.pd.orbiting and not self._said_orbit:
+        self.watch_aim(h)
+        if getattr(self.pd, "orbiting", False) and not self._said_orbit:
             self._said_orbit = True
             # Circling is the aim frame, not the tolerance — and it is
             # measurable right here rather than being somebody else's errand.
@@ -1912,6 +2082,11 @@ class CalibApp:
             add((ax + 402, by, 120, 28), "auto radius", self.seed_arrive)
             add((ax + 292, by, 100, 28), "STOP",
                 lambda: self.stop_path("drive stopped"), tone=CORAL)
+            b = add((ax + 530, by, 120, 28),
+                    "straight" if self.drive_mode == "straight" else "PD loop",
+                    self.toggle_drive_mode,
+                    tone=MINT if self.drive_mode == "straight" else CYAN)
+            b.on = True
             self.drive_top = by + 28 + GAP
             # The arena, square-ish and as large as the pane allows: this is
             # the thing being clicked, so it gets the room.
@@ -1938,6 +2113,42 @@ class CalibApp:
                                        "stop within", 2, 20,
                                        lambda: self.arrive_cm,
                                        lambda v: setattr(self, "arrive_cm", v)))
+
+            # Hand tuning. Every one of these is applied to the RUNNING
+            # controller as well as the next one — see `apply_tuning`. A knob
+            # that only takes effect on the next drive is not a tuning knob,
+            # it is a settings page, and tuning by stop-edit-start loses the
+            # feel of what the change did.
+            ty = self.drive_top + 132
+            if self.drive_mode == "straight":
+                self.sliders.append(Slider((sx, ty, 280, 16),
+                                           "re-aim over deg", 4, 45,
+                                           lambda: int(self.tune_retarget),
+                                           lambda v: self.set_tune("retarget", v)))
+                self.sliders.append(Slider((sx, ty + 28, 280, 16),
+                                           "re-aim gap ms", 100, 1200,
+                                           lambda: int(self.tune_interval * 1000),
+                                           lambda v: self.set_tune("interval",
+                                                                   v / 1000.0)))
+                self.sliders.append(Slider((sx, ty + 56, 280, 16),
+                                           "creep %", 20, 100,
+                                           lambda: int(self.tune_creep * 100),
+                                           lambda v: self.set_tune("creep",
+                                                                   v / 100.0)))
+            else:
+                self.sliders.append(Slider((sx, ty, 280, 16),
+                                           "kp x100", 10, 400,
+                                           lambda: int(self.tune_or_measured("kp") * 100),
+                                           lambda v: self.set_tune("kp", v / 100.0)))
+                self.sliders.append(Slider((sx, ty + 28, 280, 16),
+                                           "kd x100", 0, 300,
+                                           lambda: int(self.tune_or_measured("kd") * 100),
+                                           lambda v: self.set_tune("kd", v / 100.0)))
+                self.sliders.append(Slider((sx, ty + 56, 280, 16),
+                                           "predict ms", 0, 700,
+                                           lambda: int(self.tune_or_measured("predict") * 1000),
+                                           lambda v: self.set_tune("predict",
+                                                                   v / 1000.0)))
 
     # -- drawing ---------------------------------------------------------
 

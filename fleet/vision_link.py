@@ -51,6 +51,44 @@ class CameraTracker:
         # uses. Consumers time freshness against THIS, not against the moment
         # they happened to call `read()`.
         self._fixed_at = 0.0
+        # Applied by the camera thread rather than by the caller: `tracks` is
+        # mutated inside `Tracker.step`, and rewriting it from another thread
+        # is how a dict changes size during iteration.
+        self._wanted = None
+        self._apply_colors = None
+
+    def set_colors(self, colors):
+        """Hunt only the colours something on the bench is actually wearing.
+
+        The palette holds six hues. A bench with two robots on it wears two,
+        and looking for the other four does not find robots — it finds whatever
+        in the room happens to sit near those hues. Every one of those is a blob
+        the tracker will happily promote to a confident track, and from there it
+        is indistinguishable from a robot: it has a position, it has a colour,
+        and something downstream will be driven from it.
+
+        Cheap as well as correct. Detection is a mask, a morphology pass and a
+        contour search PER COLOUR, so a fleet of two stops paying for six.
+        """
+        wanted = sorted({c for c in (colors or ()) if c})
+        with self._lock:
+            if wanted == self._wanted:
+                return
+            self._wanted = wanted
+            self._apply_colors = wanted
+            # Fixes for a colour nobody wears must not survive the change.
+            self._fixes = {k: v for k, v in self._fixes.items() if k in wanted}
+            self._vels = {k: v for k, v in self._vels.items() if k in wanted}
+            self._raw = {k: v for k, v in self._raw.items() if k in wanted}
+
+    @property
+    def hunting(self):
+        """Which colours are being looked for right now."""
+        with self._lock:
+            if self._wanted is not None:
+                return list(self._wanted)
+        t = self.tracker
+        return sorted(t.colors) if t is not None else []
 
     @property
     def fixes_at(self):
@@ -88,15 +126,27 @@ class CameraTracker:
 
         self.tracker = Tracker(homography=H, detector=Detector())
         if self.colors:
-            self.tracker.assignment = {c: c for c in self.colors}
+            self.set_colors(self.colors)
 
         self.running = True
         self._thread = threading.Thread(target=self._run, name="tracker", daemon=True)
         self._thread.start()
         return []
 
+    def _adopt_colors(self):
+        """Camera-thread side of `set_colors`. Runs between frames, never
+        during one, so `tracks` is never rewritten mid-iteration."""
+        with self._lock:
+            wanted, self._apply_colors = self._apply_colors, None
+        if wanted is None or self.tracker is None:
+            return
+        self.tracker.assignment = {c: c for c in wanted}
+        for name in [n for n in self.tracker.tracks if n not in wanted]:
+            del self.tracker.tracks[name]
+
     def _run(self):
         while self.running:
+            self._adopt_colors()
             try:
                 ok, frame = self.source.read()
                 if not ok:

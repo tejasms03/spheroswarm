@@ -11,9 +11,9 @@
   {
     "name": "Caraxes",
     "code": "CRXS",
-    "kind": "sim",
+    "kind": "real",
     "color": "red",
-    "ble_name": null,
+    "ble_name": "SK-914A",
     "enabled": true,
     "heading_offset": 272.9873631822668
   },
