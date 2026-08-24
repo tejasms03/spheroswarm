@@ -12,7 +12,8 @@ from . import config
 
 
 class Homography:
-    def __init__(self, matrix=None, arena=config.ARENA_CM, width=None, height=None):
+    def __init__(self, matrix=None, arena=config.ARENA_CM, width=None, height=None,
+                 parallax=None):
         self.arena = arena
         # The rectangle this calibration was built for, in cm. Stored because
         # `arena` alone cannot distinguish a square calibration from a
@@ -23,6 +24,12 @@ class Homography:
         self.width = float(width) if width else float(arena)
         self.height = float(height) if height else float(arena)
         self.M = np.array(matrix, dtype=np.float64) if matrix is not None else None
+        self.corners = None
+        # How far the ball's height pushes it outward from the camera's nadir,
+        # fitted by `check pos`. Stored HERE rather than in its own file so it
+        # goes stale together with the calibration it was measured against —
+        # re-pick the corners and this is wrong, and it should not survive.
+        self.parallax = parallax or None
 
     @property
     def ready(self):
@@ -34,11 +41,15 @@ class Homography:
         if not d:
             return cls()
         return cls(d["matrix"], d.get("arena", config.ARENA_CM),
-                   width=d.get("width"), height=d.get("height"))
+                   width=d.get("width"), height=d.get("height"),
+                   parallax=d.get("parallax"))
 
     def save(self):
-        config.save("homography", {"matrix": self.M.tolist(), "arena": self.arena,
-                                   "width": self.width, "height": self.height})
+        blob = {"matrix": self.M.tolist(), "arena": self.arena,
+                "width": self.width, "height": self.height}
+        if self.parallax:
+            blob["parallax"] = self.parallax
+        config.save("homography", blob)
 
     def set_corners(self, pts):
         """pts: 4 pixel points in order top-left, top-right, bottom-right, bottom-left."""
@@ -61,12 +72,20 @@ class Homography:
         Corners are clockwise from the origin: origin, +x, +x+y, +y.
         """
         width, height = float(width), float(height)
-        src = np.array(_orient(pts), dtype=np.float32)
+        # The order actually used, which is not necessarily the order clicked —
+        # see `_orient`. Recorded so a caller can check its own work against
+        # what was built rather than against what it asked for.
+        self.corners = _orient(pts)
+        src = np.array(self.corners, dtype=np.float32)
         dst = np.array([[0, 0], [width, 0], [width, height], [0, height]],
                        dtype=np.float32)
         self.M = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
         self.width, self.height = width, height
         self.arena = max(width, height)
+        # A parallax fit describes the OLD mapping. Keeping it across a
+        # recalibration would apply a correction measured against corners that
+        # no longer exist, which is worse than not correcting at all.
+        self.parallax = None
         return self
 
     def matches(self, width, height, tol=1.0):
@@ -77,6 +96,9 @@ class Homography:
     def to_cm(self, pts_px):
         p = np.asarray(pts_px, dtype=np.float64).reshape(-1, 1, 2)
         out = cv2.perspectiveTransform(p, self.M).reshape(-1, 2)
+        if self.parallax:
+            from . import parallax as _px
+            out = np.array([_px.correct(q, self.parallax) for q in out])
         return out
 
     def to_px(self, pts_cm):

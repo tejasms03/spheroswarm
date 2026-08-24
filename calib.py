@@ -821,7 +821,10 @@ class CalibApp:
         # Sanity: the clicked quadrilateral has to map back onto itself. A
         # degenerate pick — three points in a line, or a crossed order — still
         # produces a matrix, and it produces one that puts robots anywhere.
-        back = hom.to_cm(pts)
+        # Against the order the homography actually used. `set_rect` re-reads
+        # the four clicks so the arena is never mirrored, so checking the
+        # clicked order here would fail every time the re-reading did its job.
+        back = hom.to_cm(hom.corners or pts)
         want = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=float)
         if float(np.abs(back - want).max()) > 1.0:
             self.cancel_corners("those corners did not map cleanly — click them "
@@ -973,6 +976,7 @@ class CalibApp:
                                   "calibration is on the floor, but the balls "
                                   "ride above it. Set the arena again, clicking "
                                   "a ROBOT placed on each corner.")
+                self.fit_parallax()
             elif shifted:
                 self.say("warn", f"the error is a constant shift of "
                                  f"({mean[0]:+.1f},{mean[1]:+.1f})cm — the corners "
@@ -981,6 +985,48 @@ class CalibApp:
                 self.say("ok", "no systematic pattern — that is measurement "
                                "noise, and it is as good as this camera gets")
         self._build()
+
+    def fit_parallax(self):
+        """Measure the ball-height offset from the points just checked, and
+        correct for it rather than only naming it.
+
+        Clicking a robot on each corner is the better fix and the log says so:
+        it maps the plane the balls travel in and the parallax is gone rather
+        than corrected. But the samples to do it the other way have just been
+        taken, and a correction measured from the arena in front of you beats a
+        recalibration nobody gets round to.
+        """
+        from vision import parallax as px
+
+        hom = getattr(self.tracker.tracker, "H", None) if self.tracker else None
+        if hom is None or not hom.ready:
+            return
+        # `reported` already has any previous correction applied, so a second
+        # fit on top of the first would double it.
+        old = hom.parallax
+        hom.parallax = None
+        try:
+            fit = px.fit([(c["clicked"], c["reported"]) for c in self.checks])
+        finally:
+            if fit is None:
+                hom.parallax = old
+
+        if fit is None:
+            self.say("warn", "not enough spread in those points to measure the "
+                             "ball height — check three or more, well apart")
+            return
+        hom.parallax = fit
+        try:
+            hom.save()
+        except Exception as e:
+            self.say("error", f"could not save the parallax fit: {e}")
+            return
+        self.say("ok", f"measured it instead: everything sits {fit['scale']:.3f}x "
+                       f"out from ({fit['nadir_cm'][0]:.0f},{fit['nadir_cm'][1]:.0f})"
+                       f"cm, which is where the camera is looking straight down. "
+                       f"Correcting for it takes the error from {fit['was_cm']}cm "
+                       f"to {fit['residual_cm']}cm. Saved — re-picking the arena "
+                       "clears it.")
 
     # -- the wheel -------------------------------------------------------
 
