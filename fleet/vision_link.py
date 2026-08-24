@@ -82,6 +82,18 @@ class CameraTracker:
             self._raw = {k: v for k, v in self._raw.items() if k in wanted}
 
     @property
+    def outside_arena(self):
+        """How many blobs, per colour, were seen beyond the arena margin.
+
+        Worth surfacing rather than silently discarding: a colour that keeps
+        producing them is a hue the room wears, and that is a calibration
+        problem the trainer can fix once instead of a phantom they fight all
+        session.
+        """
+        t = self.tracker
+        return dict(getattr(t, "outside", {}) or {}) if t is not None else {}
+
+    @property
     def hunting(self):
         """Which colours are being looked for right now."""
         with self._lock:

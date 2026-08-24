@@ -88,6 +88,12 @@ class Tracker:
     BALL_MIN_CM = 3.0
     BALL_MAX_CM = 16.0
 
+    # How far outside the arena a blob may be and still be a robot. Not zero:
+    # a ball that rolls out is exactly the one you need to see, and cropping at
+    # the boundary trades a phantom you can name for a robot you cannot find.
+    # Not unbounded either, because everything else in the room is out there.
+    ARENA_MARGIN_CM = 40.0
+
     GATE_CM = 60.0        # reject detections this far from the prediction
     # A track still building confidence has an unformed velocity estimate, so
     # its prediction can be further out than a settled one's. It gets a wider
@@ -99,13 +105,19 @@ class Tracker:
     # does not.
     YOUNG_GATE_MULTIPLE = 2.0
 
-    def __init__(self, assignment=None, homography=None, detector=None):
+    def __init__(self, assignment=None, homography=None, detector=None,
+                 arena_only=True):
         self.assignment = assignment or {c: c for c in config.COLORS}
         self.H = homography or Homography.load()
         self.det = detector or Detector()
         self.tracks = {}
         self.t_last = None
         self.fps = 0.0
+        # Look for robots where robots can be. Everything a camera sees beyond
+        # the arena is furniture, and every piece of it that happens to sit in
+        # a hue window is a blob the tracker can adopt.
+        self.arena_only = bool(arena_only)
+        self.outside = {}        # colour -> blobs seen beyond the margin
 
     @property
     def colors(self):
@@ -128,6 +140,20 @@ class Tracker:
         for t in self.tracks.values():
             t.kf.predict(dt)
             t.missing += 1
+
+        self.outside = {}
+        if self.arena_only and self.H.ready:
+            kept = {}
+            for color, options in cm.items():
+                near = [o for o in options if self._in_arena(o[0])]
+                if len(near) != len(options):
+                    self.outside[color] = len(options) - len(near)
+                # Same fallback as everywhere else here: if nothing is inside,
+                # keep what there is. A robot outside the margin is still the
+                # best answer available, and losing it entirely is worse than
+                # reporting it somewhere odd.
+                kept[color] = near or options
+            cm = kept
 
         for color, options in cm.items():
             name = self.colors[color]
@@ -160,6 +186,11 @@ class Tracker:
             del self.tracks[n]
 
         return self.read(), raw
+
+    def _in_arena(self, p):
+        m = self.ARENA_MARGIN_CM
+        return (-m <= float(p[0]) <= self.H.width + m
+                and -m <= float(p[1]) <= self.H.height + m)
 
     def _to_cm(self, found):
         """{colour: [(point_cm, diameter_cm), ...]}, biggest first.

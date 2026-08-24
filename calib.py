@@ -1847,6 +1847,13 @@ class CalibApp:
                                   f"{live} connected robot(s). The extra ones "
                                   "are phantoms and the tracker can lock onto "
                                   "them. COLOUR tab -> auto-tune -> check hues.")
+            out = self.tracker.outside_arena if self.tracker else {}
+            if out:
+                names = ", ".join(f"{c} x{n}" for c, n in sorted(out.items()))
+                self.say("warn", f"also rejected {names} outside the arena — "
+                                 "something in the room wears that hue. "
+                                 "`optimise hues` picks colours the room "
+                                 "leaves free.")
             self.say("error", "nothing was saved, and nothing drove far. Fix "
                               "the tracking first.")
             return
