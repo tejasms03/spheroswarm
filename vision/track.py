@@ -5,6 +5,7 @@ the filter adds is riding through dropped frames, occlusions, and the brief
 moments when two robots overlap and one blob disappears.
 """
 
+import math
 import time
 
 import numpy as np
@@ -77,6 +78,16 @@ class Tracker:
     it tracks colours directly, which is what you want before robots exist.
     """
 
+    # A Sphero is a known physical object: SPRK+ and BOLT are both ~7.4cm
+    # across. The homography turns that into an expected size anywhere in the
+    # frame, so a blob can be judged against the ball it claims to be rather
+    # than against a hand-tuned pixel area — which half the palette does not
+    # have set at all. Generous bounds: a lit shell blooms and a partly
+    # occluded one shrinks. This is here to reject a ceiling light and a red
+    # sock, not to measure anything.
+    BALL_MIN_CM = 3.0
+    BALL_MAX_CM = 16.0
+
     GATE_CM = 60.0        # reject detections this far from the prediction
     # A track still building confidence has an unformed velocity estimate, so
     # its prediction can be further out than a settled one's. It gets a wider
@@ -107,25 +118,37 @@ class Tracker:
         self.fps = 0.9 * self.fps + 0.1 / dt if self.fps else 1 / dt
 
         wanted = list(self.colors)
-        raw = self.det.detect(frame, only=wanted)
+        found = self.det.candidates(frame, only=wanted)
+        # One blob per colour for anything that wants a picture of what the
+        # camera saw, rather than what the tracker concluded from it.
+        raw = {c: v[0] for c, v in found.items() if v}
 
-        cm = {}
-        if self.H.ready and raw:
-            pts = self.H.to_cm([[v[0], v[1]] for v in raw.values()])
-            cm = {k: p for k, p in zip(raw, pts)}
-        elif raw:
-            cm = {k: np.array([v[0], v[1]]) for k, v in raw.items()}
+        cm = self._to_cm(found)
 
         for t in self.tracks.values():
             t.kf.predict(dt)
             t.missing += 1
 
-        for color, p in cm.items():
+        for color, options in cm.items():
             name = self.colors[color]
+            # Blobs the size of a ball, if any are. Falling back to all of them
+            # rather than to none keeps a robot trackable when the sizing is
+            # wrong — a bad filter should cost precision, never the robot.
+            ball = [o for o in options
+                    if self.BALL_MIN_CM <= o[1] <= self.BALL_MAX_CM]
+            options = ball or options
+
             t = self.tracks.get(name)
             if t is None:
-                self.tracks[name] = Track(name, color, p)
+                # Nothing to prefer yet, so the biggest blob starts the track.
+                self.tracks[name] = Track(name, color, options[0][0])
                 continue
+            # The candidate where this robot actually was, not the one that
+            # happens to be largest this frame. Two blobs of similar size trade
+            # places whenever their areas cross, and a tracker handed only the
+            # larger one follows the trade instead of the robot.
+            p, _ = min(options,
+                       key=lambda o: float(np.linalg.norm(o[0] - t.kf.pos)))
             gate = self.GATE_CM * (1.0 if t.confident else self.YOUNG_GATE_MULTIPLE)
             if np.linalg.norm(p - t.kf.pos) > gate:
                 continue                        # outlier, keep coasting
@@ -137,6 +160,40 @@ class Tracker:
             del self.tracks[n]
 
         return self.read(), raw
+
+    def _to_cm(self, found):
+        """{colour: [(point_cm, diameter_cm), ...]}, biggest first.
+
+        One transform for every blob rather than one per blob: `to_cm` is a
+        cv2 call and its per-call cost dwarfs the arithmetic inside it. The
+        diameter comes from stepping one pixel sideways from each blob and
+        measuring how far that moved in centimetres, so the local scale is
+        used — which matters near the edges of a tilted frame, where a
+        single frame-wide scale factor is wrong by tens of percent.
+        """
+        if not found:
+            return {}
+        flat, index, areas = [], [], []
+        for color, blobs in found.items():
+            for b in blobs:
+                flat.append([b[0], b[1]])
+                index.append(color)
+                areas.append(float(b[2]))
+
+        if self.H.ready:
+            pts = self.H.to_cm(flat)
+            edge = self.H.to_cm([[x + 1.0, y] for x, y in flat])
+        else:
+            pts = np.array(flat, dtype=float)
+            edge = pts + np.array([1.0, 0.0])
+
+        out = {}
+        for color, p, q, a in zip(index, pts, edge, areas):
+            p = np.asarray(p, dtype=float)
+            cm_per_px = float(np.linalg.norm(np.asarray(q, dtype=float) - p))
+            dia_px = 2.0 * math.sqrt(max(a, 1e-9) / math.pi)
+            out.setdefault(color, []).append((p, dia_px * cm_per_px))
+        return out
 
     def read(self):
         """The interface deploy.py expects."""

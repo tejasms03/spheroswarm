@@ -53,6 +53,41 @@ class Detector:
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
         return m
 
+    def candidates(self, frame, only=None):
+        """Every blob passing a colour's thresholds, not just the biggest.
+
+        `detect` answers with one blob per colour, which throws away the only
+        information that can resolve an ambiguity. Two red-ish blobs of similar
+        size — a ball and its reflection, or a ball and something red on the
+        floor — swap places in that answer whenever their apparent areas cross,
+        and the position jumps between them frame to frame. A tracker handed
+        one point can only accept it or reject it; handed the alternatives it
+        can pick the one where the robot actually was a frame ago, which is the
+        whole job of a tracker.
+
+        Sorted largest first, so a caller wanting the old behaviour takes [0].
+        """
+        b = self.thresh["blur"]
+        blur = cv2.GaussianBlur(frame, (b | 1, b | 1), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+
+        out = {}
+        for name in (only or self.colors):
+            m = self.mask_for(hsv, name)
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            lim = self.limits(name)
+            found = []
+            for c in cnts:
+                a = cv2.contourArea(c)
+                if a < lim["min_area"] or a > lim["max_area"]:
+                    continue
+                mm = cv2.moments(c)
+                if mm["m00"] > 0:
+                    found.append((mm["m10"] / mm["m00"], mm["m01"] / mm["m00"], a))
+            if found:
+                out[name] = sorted(found, key=lambda t: -t[2])
+        return out
+
     def detect(self, frame, only=None):
         """Return {color_name: (x_px, y_px, area)} for the best blob per colour."""
         b = self.thresh["blur"]
