@@ -74,6 +74,17 @@ class SyntheticSource:
 
 
 class CameraSource:
+    # What a lit Sphero needs from a camera, and why. Autofocus hunts on a
+    # scene that is mostly dark floor, and every hunt is a frame or two of
+    # blur — which turns two LEDs a few pixels apart into one smear. Auto
+    # exposure is worse: it meters the whole frame, sees mostly black, and
+    # opens up until the ball's shell blows out to white, which has no hue for
+    # the detector to key on and no separable peaks for a heading.
+    WANTED = {
+        "autofocus": (cv2.CAP_PROP_AUTOFOCUS, 0),
+        "auto_exposure": (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25),
+    }
+
     def __init__(self, index=0, size=(1280, 720)):
         self.cap = cv2.VideoCapture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
@@ -82,6 +93,74 @@ class CameraSource:
             raise RuntimeError(
                 f"camera {index} would not open. On macOS, grant camera access "
                 "to your terminal in System Settings > Privacy & Security.")
+        self.notes = []
+
+    # -- manual control --------------------------------------------------
+
+    PROPS = {
+        "focus": cv2.CAP_PROP_FOCUS,
+        "exposure": cv2.CAP_PROP_EXPOSURE,
+        "gain": cv2.CAP_PROP_GAIN,
+        "brightness": cv2.CAP_PROP_BRIGHTNESS,
+        "autofocus": cv2.CAP_PROP_AUTOFOCUS,
+        "auto_exposure": cv2.CAP_PROP_AUTO_EXPOSURE,
+    }
+
+    def get(self, name):
+        prop = self.PROPS.get(name)
+        if prop is None:
+            return None
+        try:
+            v = float(self.cap.get(prop))
+        except Exception:
+            return None
+        return None if v in (-1.0,) else v
+
+    def set(self, name, value):
+        """Ask for a setting and report what actually took.
+
+        Cameras accept a `set` and ignore it constantly — the macOS
+        AVFoundation backend in particular reports success for properties it
+        does not implement. Reading the value back is the only way to know, and
+        a control that silently does nothing is worse than one that is absent,
+        because a person will keep turning it.
+        """
+        prop = self.PROPS.get(name)
+        if prop is None:
+            return None
+        try:
+            self.cap.set(prop, float(value))
+        except Exception:
+            return None
+        got = self.get(name)
+        return got
+
+    def manual(self):
+        """Turn off the automatics that blur and blow out a lit ball."""
+        out = {}
+        for name, (prop, value) in self.WANTED.items():
+            try:
+                self.cap.set(prop, value)
+            except Exception:
+                pass
+            out[name] = self.get(name)
+        return out
+
+    def capabilities(self):
+        """Which controls this camera actually honours. Probed, not assumed."""
+        out = {}
+        for name in self.PROPS:
+            before = self.get(name)
+            if before is None:
+                out[name] = False
+                continue
+            probe = before + (1.0 if before < 100 else -1.0)
+            after = self.set(name, probe)
+            works = after is not None and abs(after - before) > 1e-6
+            if works:
+                self.set(name, before)
+            out[name] = bool(works)
+        return out
 
     def read(self):
         return self.cap.read()
