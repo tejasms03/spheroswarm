@@ -327,15 +327,10 @@ class TrackingCheck(Stage):
     MIN_SEEN_CM = 3.0           # of movement, before we believe it at all
     MAX_ANGLE_ERR = 70.0        # degrees between commanded and observed
 
-    def __init__(self, byte=55, workspace=None, aim=None, timeout=40.0,
-                 blob_count=None):
+    def __init__(self, byte=55, workspace=None, aim=None, timeout=40.0):
         super().__init__(timeout=timeout)
         self.byte = int(byte)
         self.ws, self.aim = workspace, aim or (lambda c: c)
-        # A callable returning (blobs, connected robots), when the caller has
-        # one. It is what separates the two explanations for a ball that did
-        # not appear to move — see `result`.
-        self.blob_count = blob_count
         self.leg = 0
         self.phase, self.phase_t = "aim", 0.0
         self.course = None
@@ -395,29 +390,6 @@ class TrackingCheck(Stage):
                 self.done = True
         return None
 
-    def _blob_hint(self):
-        """Lean on the blob count when the caller supplied one.
-
-        More blobs than robots means there is something for the tracker to have
-        latched onto, and the same number means there is not — which does not
-        prove the ball moved, but it does move the odds a long way and stops
-        the trainer starting with the expensive half.
-        """
-        if self.blob_count is None:
-            return ""
-        try:
-            blobs, live = self.blob_count()
-        except Exception:
-            return ""
-        if blobs is None or live is None:
-            return ""
-        if blobs > live:
-            return (f" The camera is finding {blobs} blobs for {live} robot(s), "
-                    "so there IS a phantom to latch onto — start there.")
-        return (f" The camera is finding {blobs} blob(s) for {live} robot(s), "
-                "so there is nothing extra to latch onto — the ball is the "
-                "likelier half.")
-
     def result(self):
         out = {"nudges": self.rows}
         if len(self.rows) < 2:
@@ -426,28 +398,11 @@ class TrackingCheck(Stage):
 
         moved = [r["seen_cm"] for r in self.rows]
         if min(moved) < self.MIN_SEEN_CM:
-            # Two explanations, and this used to assert the second one.
-            #
-            #   the ball did not move        battery flat, wedged, picked up,
-            #                                or the link is up and the motors
-            #                                are not responding
-            #   the camera is not watching   a phantom blob of the same colour,
-            #                                stationary, being tracked instead
-            #
-            # Both produce exactly this evidence. Naming only the tracker sends
-            # someone to re-tune colours that were fine while a dead ball sits
-            # on the floor, which is a whole afternoon.
-            #
-            # The blob count separates them when we have it, and the trainer's
-            # own eyes separate them in one second when we do not — so that is
-            # the test to put first.
             out["error"] = (
                 f"nudged the robot twice and the camera saw it move "
-                f"{min(moved):.1f}cm. Either the ball did not move, or the "
-                "camera is not watching it. WATCH THE BALL and nudge again: if "
-                "it sits still, the fault is the robot — flat battery, wedged, "
-                "or the motors are not answering. If it moves, the camera is "
-                "on something else." + self._blob_hint())
+                f"{min(moved):.1f}cm. It is not following this robot — most "
+                "likely a phantom blob of the same colour. Check that the blob "
+                "count matches the robot count and re-tune the colour.")
             return out
 
         # Movement of the right SIZE in the wrong DIRECTION is a different
@@ -1628,7 +1583,7 @@ class Characterization:
 
     def __init__(self, workspace=None, code=None, ble_name=None,
                  heading_offset=0.0, quick=False, max_byte=255,
-                 plan_safety=PLAN_SAFETY, blob_count=None):
+                 plan_safety=PLAN_SAFETY):
         self.ws = workspace
         self.code = code
         self.ble_name = ble_name
@@ -1648,8 +1603,7 @@ class Characterization:
         cx, cy = self._centre()
         recentre = lambda: Recenter((cx, cy), aim=self.aim)
         if quick:
-            self.stages = [TrackingCheck(workspace=workspace, aim=self.aim,
-                                         blob_count=blob_count),
+            self.stages = [TrackingCheck(workspace=workspace, aim=self.aim),
                            NoiseProbe(frames=90, timeout=12.0),
                            HeadingStage(workspace=workspace),
                            recentre(),
@@ -1671,8 +1625,7 @@ class Characterization:
             # the square root of them, and nothing about a slow ball makes a
             # repeat harder. The whole run is longer than it was and every
             # number in it is worth more.
-            self.stages = [TrackingCheck(workspace=workspace, aim=self.aim,
-                                         blob_count=blob_count),
+            self.stages = [TrackingCheck(workspace=workspace, aim=self.aim),
                            NoiseProbe(frames=600),
                            HeadingStage(workspace=workspace),
                            recentre(),
