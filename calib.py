@@ -206,6 +206,35 @@ class AutoTune:
             self.results[color] = {"ok": False, "error": str(e)}
 
 
+class SensorProbe(threading.Thread):
+    """Ask the ball what it can report, without freezing the window.
+
+    The probe is 150 blocking radio reads plus sixty drive writes across three
+    streaming rates. Every one of those waits on an acknowledgement that takes
+    about 230ms, so the whole thing is tens of seconds — and run on the render
+    thread that is tens of seconds of a dead window, which reads as a crash and
+    gets the app force-quit halfway through.
+
+    Same shape as `BleScan`: do it here, pick the result up in the loop.
+    """
+
+    def __init__(self, api):
+        super().__init__(daemon=True, name="sensor-probe")
+        self.api = api
+        self.report = None
+        self.error = None
+        self.finished = False
+
+    def run(self):
+        try:
+            from fleet.sensors import probe
+            self.report = probe(self.api)
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            self.finished = True
+
+
 class CalibApp:
     CAM_W = 460                 # camera panel width, source pixels scaled to it
 
@@ -244,6 +273,7 @@ class CalibApp:
         self.scan = None
         self.found = []
         self.autotune = None
+        self.probe = None               # a SensorProbe on its own thread
         self.run = None                 # a Characterization in progress
         self.run_code = None
         self.run_t = 0.0
@@ -1898,19 +1928,39 @@ class CalibApp:
                              "recalibrate between sessions, or estimate it live")
 
     def probe_sensors(self):
-        """What this ball actually reports, and what asking costs in airtime."""
+        """What this ball actually reports, and what asking costs in airtime.
+
+        Started on a thread and collected in `drain_probe`. Doing it inline
+        froze the window for the whole probe — tens of seconds of blocking
+        radio reads — which is indistinguishable from a hang.
+        """
+        if self.probe is not None:
+            self.say("warn", "a sensor probe is already running")
+            return
         h = self.handle
         api = getattr(h, "_api", None) if h is not None else None
         if api is None:
             self.say("error", "the sensor probe needs a real robot with its "
                               "radio up — connect one as `real` first")
             return
-        from fleet.sensors import probe
-        try:
-            report = probe(api)
-        except Exception as e:
-            self.say("error", f"probe failed: {e}")
+        self.probe = SensorProbe(api)
+        self.probe.start()
+        self.say("info", f"probing {h.code}'s sensors — about half a minute, "
+                         "and the ball will twitch. The window stays live.")
+        self._build()
+
+    def drain_probe(self):
+        if self.probe is None or not self.probe.finished:
             return
+        report, err = self.probe.report, self.probe.error
+        self.probe = None
+        self._build()
+        if err or report is None:
+            self.say("error", f"probe failed: {err or 'no report'}")
+            return
+        self.report_sensors(report)
+
+    def report_sensors(self, report):
         for name, r in report["reads"].items():
             if not r.get("available"):
                 self.say("warn", f"{name}: {r.get('error', 'no')}")
@@ -1925,8 +1975,14 @@ class CalibApp:
             if d.get("ms_mean") and base:
                 self.say("info", f"drive write at {hz}Hz streaming: "
                                  f"{d['ms_mean']}ms ({d['ms_mean'] / base:.1f}x)")
-        v = report["verdict"]
-        self.say("ok", f"design branch: {v['branch']} — {v['why']}")
+        # Reached from the render loop now, so a probe that came back without
+        # a verdict must cost a line of output rather than the window.
+        v = report.get("verdict") or {}
+        if v.get("branch"):
+            self.say("ok", f"design branch: {v['branch']} — {v.get('why', '')}")
+        else:
+            self.say("warn", "the probe returned no verdict — nothing answered "
+                             "well enough to choose a design branch")
         self.last_probe = report
         return report
 
@@ -2227,7 +2283,10 @@ class CalibApp:
             add((ax + 276, by, 110, 28), "STOP",
                 lambda: self.stop_run("run aborted"), tone=CORAL)
             add((ax + 396, by, 120, 28), "drift 5min", self.start_drift, tone=SUN)
-            add((ax + 524, by, 120, 28), "sensors", self.probe_sensors)
+            add((ax + 524, by, 120, 28),
+                "probing..." if self.probe is not None else "sensors",
+                self.probe_sensors,
+                tone=CYAN if self.probe is not None else None)
             sy = by + 28 + GAP
             self.sliders.append(Slider((ax, sy, 300, 16), "top speed", 6,
                                        SPEED_CAP_CM_S,
@@ -2970,6 +3029,7 @@ class CalibApp:
 
     def step(self, dt):
         self.drain_scan()
+        self.drain_probe()
         for h in list(self.fleet.handles.values()):
             try:
                 h.step(dt)

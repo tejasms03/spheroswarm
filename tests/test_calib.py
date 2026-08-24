@@ -7,6 +7,7 @@ synthetic and cannot be checked at all when it is a photograph.
 """
 
 import json
+import time
 import pathlib
 
 import cv2
@@ -1496,3 +1497,88 @@ def test_autotune_puts_the_robots_back_on_their_real_colours(bench):
 
     assert h.rgb == tuple(bench.led_for(h.color)), (
         f"left on {h.rgb}, should be {bench.led_for(h.color)}")
+
+
+# -- the sensor probe must not freeze the window ------------------------------
+
+def test_the_sensor_probe_does_not_run_on_the_render_thread(bench, monkeypatch):
+    """It is 150 blocking radio reads plus sixty drive writes, every one
+    waiting ~230ms on an acknowledgement. Run inline that is tens of seconds
+    of dead window, which is indistinguishable from a hang and gets the app
+    force-quit halfway through."""
+    import threading
+    import fleet.sensors as sensors
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(api, **kw):
+        started.set()
+        release.wait(5.0)
+        return {"reads": {}, "streaming": {}, "verdict": {}}
+
+    monkeypatch.setattr(sensors, "probe", slow)
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.fleet.handles["ONE"]._api = object()
+
+    bench.probe_sensors()
+    assert started.wait(2.0), "the probe never started"
+    # The window is still being driven while it runs.
+    for _ in range(5):
+        bench.step(1 / 30)
+        render(bench)
+    assert bench.probe is not None, "still running, and the loop kept turning"
+
+    release.set()
+    # Across real time, not 200 iterations in microseconds: the worker has to
+    # actually be scheduled, and a tight loop samples one instant.
+    for _ in range(200):
+        bench.step(1 / 30)
+        if bench.probe is None:
+            break
+        time.sleep(0.01)
+    assert bench.probe is None, "the result was never collected"
+
+
+def test_a_second_probe_is_refused_while_one_runs(bench, monkeypatch):
+    import threading
+    import fleet.sensors as sensors
+
+    release = threading.Event()
+    monkeypatch.setattr(sensors, "probe",
+                        lambda api, **kw: (release.wait(5.0),
+                                           {"reads": {}, "streaming": {}})[1])
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.fleet.handles["ONE"]._api = object()
+
+    bench.probe_sensors()
+    bench.log.clear()
+    bench.probe_sensors()
+    assert any("already running" in t for _, t in bench.log)
+    release.set()
+
+
+def test_a_probe_that_raises_is_reported_not_swallowed(bench, monkeypatch):
+    import fleet.sensors as sensors
+
+    def boom(api, **kw):
+        raise RuntimeError("radio gone")
+
+    monkeypatch.setattr(sensors, "probe", boom)
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.fleet.handles["ONE"]._api = object()
+
+    bench.probe_sensors()
+    for _ in range(200):
+        bench.step(1 / 30)
+        if bench.probe is None:
+            break
+        time.sleep(0.01)
+    assert bench.probe is None
+    assert any("radio gone" in t for _, t in bench.log), [t for _, t in bench.log]

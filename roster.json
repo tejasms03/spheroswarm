@@ -11,9 +11,9 @@
   {
     "name": "Caraxes",
     "code": "CRXS",
-    "kind": "real",
+    "kind": "sim",
     "color": "red",
-    "ble_name": "SK-4C2C",
+    "ble_name": null,
     "enabled": true,
     "heading_offset": 350.37175484791186
   },
@@ -24,14 +24,14 @@
     "color": "cyan",
     "ble_name": "SK-67D7",
     "enabled": true,
-    "heading_offset": 51.39578515839935
+    "heading_offset": 235.98233689305994
   },
   {
     "name": "Vhagar",
     "code": "VHGR",
-    "kind": "sim",
+    "kind": "real",
     "color": "green",
-    "ble_name": null,
+    "ble_name": "SK-5640",
     "enabled": true,
     "heading_offset": 22.678920248966364
   },
