@@ -128,3 +128,31 @@ def test_a_parallax_too_small_to_matter_is_refused():
     # ...and one comfortably above it is taken, so the guard is a threshold
     # rather than a blanket refusal.
     assert parallax.fit(_samples(parallax.MIN_SCALE * 4, noise=0.0)) is not None
+
+
+def test_to_px_is_the_exact_inverse_of_to_cm():
+    """Or every overlay drawn from a tracked position lands where the blob is
+    not — displaced by exactly the correction, which reads as a tracking fault
+    and is not one."""
+    from vision.homography import Homography
+
+    h = Homography()
+    h.set_rect([(100, 100), (500, 110), (510, 400), (90, 390)], 138.8, 110.8)
+    px = [[300.0, 250.0], [180.0, 300.0], [420.0, 200.0]]
+
+    assert np.allclose(h.to_px(h.to_cm(px)), px, atol=1e-6), "no parallax"
+
+    h.parallax = {"nadir_cm": [69.4, 55.4], "scale": 1.08}
+    assert np.allclose(h.to_px(h.to_cm(px)), px, atol=1e-6), "with parallax"
+
+
+def test_uncorrect_undoes_correct():
+    p = np.array([30.0, 90.0])
+    fit = {"nadir_cm": [69.4, 55.4], "scale": 1.06}
+    assert np.allclose(parallax.uncorrect(parallax.correct(p, fit), fit), p)
+
+
+def test_uncorrect_is_a_no_op_without_a_fit():
+    p = np.array([30.0, 40.0])
+    assert np.allclose(parallax.uncorrect(p, None), p)
+    assert np.allclose(parallax.uncorrect(p, {"scale": 1.0, "nadir_cm": [0, 0]}), p)

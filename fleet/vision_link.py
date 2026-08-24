@@ -8,6 +8,7 @@ camera thread so neither the UI nor the fleet has to.
 import threading
 import time
 
+from vision import config
 from vision.detect import Detector
 from vision.homography import Homography
 from vision.synthetic import open_source
@@ -71,6 +72,16 @@ class CameraTracker:
         contour search PER COLOUR, so a fleet of two stops paying for six.
         """
         wanted = sorted({c for c in (colors or ()) if c})
+        if not wanted:
+            # Nothing on the bench means hunt EVERYTHING, not nothing. An empty
+            # fleet is precisely when a person needs to see blobs — tuning a
+            # colour happens before a robot is connected, and a camera view
+            # that goes blank the moment the last robot is released looks
+            # broken. There is also nothing to confuse: with no robots there is
+            # no wrong ball to lock onto.
+            t = self.tracker
+            det = getattr(t, "det", None) if t is not None else None
+            wanted = sorted(getattr(det, "colors", None) or config.COLORS)
         with self._lock:
             if wanted == self._wanted:
                 return

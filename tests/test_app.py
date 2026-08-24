@@ -1109,10 +1109,34 @@ def _wait_for_frame(a, timeout=5.0):
 
 
 def test_the_tracker_hands_over_the_latest_frame(ui_cam):
+    """The plumbing: frames arrive and blobs come out of them.
+
+    Hunting is widened to the whole palette first, because the app now narrows
+    it to the colours its fleet is wearing — which is the point, and which
+    would make this a test of whether one sim robot's hue happens to be one the
+    synthetic source draws."""
+    ui_cam.tracker.set_colors(None)
     frame, raw = _wait_for_frame(ui_cam)
     assert frame is not None, "no frame arrived from the synthetic source"
     assert frame.ndim == 3 and frame.shape[2] == 3
     assert raw, "the synthetic source should produce detectable blobs"
+
+
+def test_the_app_hunts_only_the_colours_its_fleet_wears(ui_cam):
+    """Six masks are searched per frame otherwise, and the ones nobody wears
+    find room clutter rather than robots."""
+    _wait_for_frame(ui_cam)
+    worn = {h.color for h in ui_cam.fleet.handles.values() if h.color}
+    if worn:
+        assert set(ui_cam.tracker.hunting) == worn
+
+
+def test_an_empty_fleet_hunts_everything_rather_than_nothing(ui_cam):
+    """Tuning a colour happens before a robot is connected, so a camera view
+    that blanks when the last robot is released looks broken — and with no
+    robots there is no wrong ball to lock onto anyway."""
+    ui_cam.tracker.set_colors(set())
+    assert len(ui_cam.tracker.hunting) >= 6
 
 
 def test_the_camera_panel_renders_and_caches(ui_cam):

@@ -1,42 +1,53 @@
 {
   "red": {
-    "hue": 18,
-    "tol": 21,
-    "s_min": 82,
-    "v_min": 39,
-    "min_area": 180,
-    "max_area": 10149,
+    "hue": 174,
+    "tol": 5,
+    "s_min": 55,
+    "v_min": 100,
+    "min_area": 147,
+    "max_area": 2217,
     "led_value": 168
   },
   "yellow": {
-    "hue": 41,
-    "tol": 9,
-    "s_min": 30,
-    "v_min": 204
+    "hue": 75,
+    "tol": 7,
+    "s_min": 42,
+    "v_min": 105,
+    "min_area": 388,
+    "max_area": 5823
   },
   "green": {
-    "hue": 133,
-    "tol": 5,
-    "s_min": 30,
-    "v_min": 204,
-    "min_area": 648,
-    "max_area": 123534,
+    "hue": 112,
+    "tol": 11,
+    "s_min": 110,
+    "v_min": 102,
+    "min_area": 673,
+    "max_area": 10107,
     "led_value": 224
   },
   "cyan": {
-    "hue": 64,
-    "tol": 10
+    "hue": 82,
+    "tol": 7,
+    "s_min": 52,
+    "v_min": 104,
+    "min_area": 404,
+    "max_area": 6066
   },
   "blue": {
-    "hue": 94,
-    "tol": 8,
-    "s_min": 68,
-    "v_min": 30,
-    "min_area": 669,
+    "hue": 99,
+    "tol": 11,
+    "s_min": 63,
+    "v_min": 104,
+    "min_area": 304,
+    "max_area": 4566,
     "led_value": 136
   },
   "magenta": {
-    "hue": 156,
-    "tol": 10
+    "hue": 175,
+    "tol": 5,
+    "s_min": 53,
+    "v_min": 100,
+    "min_area": 141,
+    "max_area": 2127
   }
 }

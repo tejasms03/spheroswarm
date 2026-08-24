@@ -104,6 +104,25 @@ def correct(p, fitted):
     return n + (np.asarray(p, dtype=float) - n) / s
 
 
+def uncorrect(p, fitted):
+    """Push a corrected position back out to where the camera would see it.
+
+    The exact inverse of `correct`, and it exists so `Homography.to_px` can be
+    the exact inverse of `to_cm`. A one-way correction displaces every overlay
+    drawn from a tracked position, which reads as a tracking fault.
+    """
+    if not fitted:
+        return p
+    try:
+        n = np.asarray(fitted["nadir_cm"], dtype=float)
+        s = float(fitted["scale"])
+    except (KeyError, TypeError, ValueError):
+        return p
+    if not np.isfinite(n).all() or s <= MIN_SCALE:
+        return p
+    return n + (np.asarray(p, dtype=float) - n) * s
+
+
 def ball_height_cm(fitted, camera_height_cm):
     """What the fitted scale implies the ball's centre height is.
 

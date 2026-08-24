@@ -11,11 +11,11 @@
   {
     "name": "Caraxes",
     "code": "CRXS",
-    "kind": "sim",
+    "kind": "real",
     "color": "red",
-    "ble_name": null,
+    "ble_name": "SK-67D7",
     "enabled": true,
-    "heading_offset": 154.38564212414116
+    "heading_offset": 167.3090001551887
   },
   {
     "name": "Syrax",

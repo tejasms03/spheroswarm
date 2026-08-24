@@ -127,9 +127,22 @@ class Homography:
         return out
 
     def to_px(self, pts_cm):
+        """The exact inverse of `to_cm`, parallax included.
+
+        It has to be, or every overlay drawn from a tracked position lands
+        somewhere the blob is not: `to_cm` pulls a detection in toward the
+        camera's nadir to account for the ball's height, so `to_px` has to push
+        it back out before projecting. Inverting only the matrix would displace
+        every drawn robot by exactly the correction, which looks like a
+        tracking fault and is not one.
+        """
+        pts = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 2)
+        if self.parallax:
+            from . import parallax as _px
+            pts = np.array([_px.uncorrect(q, self.parallax) for q in pts])
         inv = np.linalg.inv(self.M)
-        p = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 1, 2)
-        return cv2.perspectiveTransform(p, inv).reshape(-1, 2)
+        return cv2.perspectiveTransform(
+            pts.reshape(-1, 1, 2), inv).reshape(-1, 2)
 
 
 def _orient(pts):
