@@ -1476,12 +1476,26 @@ class Recenter(Stage):
     label = "recentre"
     detail = "driving back to open floor"
 
+    WRONG_WAY_CM = 12.0     # further from the target than the closest approach
+    # ...and the other way a wrong frame fails. At 90 degrees out the ball
+    # drives TANGENTIALLY: it orbits the target at roughly constant distance,
+    # never gets further away, and so never trips the check above. What it does
+    # do is cover ground without arriving. A working closed loop travels a bit
+    # more than the straight-line distance; one that is orbiting travels
+    # without limit.
+    WANDER_FACTOR = 2.0
+    WANDER_SLACK_CM = 25.0
+
     def __init__(self, target, tol=14.0, speed_byte=110, timeout=30.0, aim=None):
         super().__init__(timeout=timeout)
         self.target = np.asarray(target, dtype=float)
         self.tol = float(tol)
         self.byte = int(speed_byte)
         self.aim = aim or (lambda c: c)
+        self.closest = None
+        self.travelled = 0.0
+        self.start_d = None
+        self._last = None
 
     @property
     def progress(self):
@@ -1493,6 +1507,39 @@ class Recenter(Stage):
         to = self.target - pos
         d = float(np.linalg.norm(to))
         if d <= self.tol:
+            self.done = True
+            return None
+
+        # Closed loop on position, OPEN loop on aim. With a wrong aim frame
+        # this drives away from the middle rather than toward it, and the only
+        # thing that ever noticed was the thirty-second timeout — by which time
+        # the ball has driven several metres and is against a wall or outside
+        # the arena, leaving every stage after this one without room.
+        #
+        # Getting FURTHER from the target is the symptom, it shows within a
+        # second, and it is unambiguous: no amount of camera noise makes a
+        # working closed loop retreat 12cm from where it got to.
+        if self._last is not None:
+            self.travelled += float(np.linalg.norm(pos - self._last))
+        self._last = np.asarray(pos, dtype=float).copy()
+        if self.start_d is None:
+            self.start_d = d
+        budget = self.WANDER_FACTOR * self.start_d + self.WANDER_SLACK_CM
+        if self.travelled > budget:
+            self.error = (f"drove {self.travelled:.0f}cm to cover "
+                          f"{self.start_d:.0f}cm and still has not arrived — "
+                          "it is going round the middle rather than to it, "
+                          "which is the aim frame. Calibrate the heading "
+                          "before running the battery.")
+            self.done = True
+            return None
+
+        self.closest = d if self.closest is None else min(self.closest, d)
+        if d > self.closest + self.WRONG_WAY_CM:
+            self.error = (f"drove {d - self.closest:.0f}cm AWAY from the middle "
+                          "— that is the aim frame being wrong, not the drive. "
+                          "It is heading for a wall. Calibrate the heading "
+                          "before running the battery.")
             self.done = True
             return None
         course = float(math.degrees(math.atan2(to[0], to[1])) % 360.0)
@@ -1548,6 +1595,10 @@ class Characterization:
         self.course_offset = float(heading_offset or 0.0)
         self.offset_samples = 0
         self.last_aim_error = None
+        # Backing off the arena edge, and getting back to what we were doing.
+        self.rescuing = None            # a Recenter that has taken over
+        self._rescues = {}              # stage index -> how many times
+        self._rescue_t = 0.0
 
         cx, cy = self._centre()
         recentre = lambda: Recenter((cx, cy), aim=self.aim)
@@ -1658,6 +1709,74 @@ class Characterization:
             return "done"
         return f"{self.i + 1}/{len(self.stages)}  {s.label} {s.progress}".strip()
 
+    # Deliberately small, and measured rather than chosen. A HEALTHY battery
+    # comes within 9-21cm of a wall on purpose -- the brake test coasts toward
+    # one to measure the coast -- so a threshold anywhere near that fires on
+    # good runs and repeats legs that were fine. This is the boundary itself:
+    # a ball at 10cm is where the planner meant it to be, and a ball at 2cm is
+    # somewhere nothing planned.
+    RESCUE_CM = 3.0
+    MAX_RESCUES = 2         # per stage, before the stage is called impossible
+
+    def _should_rescue(self, s, pos):
+        """Is the ball close enough to the edge to stop what we are doing?
+
+        The obvious alternative was clamping the speed near the wall, and it is
+        wrong: stages plan their own legs against `plan_safety`, so a limiter
+        anywhere near that margin bites on healthy legs and quietly slows the
+        measurements it is meant to protect. A leg that was slowed is worse
+        than a leg that never ran, because nobody knows its numbers are wrong.
+        Backing off and carrying on costs a few seconds and corrupts nothing.
+        """
+        if self.ws is None or s is None or s.done:
+            return False
+        if isinstance(s, Recenter):
+            return False                # it IS the recovery
+        if self._rescues.get(self.i, 0) >= self.MAX_RESCUES:
+            return False
+        try:
+            inside = self.ws.is_valid_point(np.asarray(pos, dtype=float))
+            d = safety.clearance(self.ws, pos)
+        except Exception:
+            return False
+        # Outside is unambiguous and is the thing being complained about; a
+        # hair inside is the frame about to put it outside.
+        return (not inside) or (d is not None and d < self.RESCUE_CM)
+
+    def _begin_rescue(self, s):
+        n = self._rescues.get(self.i, 0) + 1
+        self._rescues[self.i] = n
+        cx, cy = self._centre()
+        self.rescuing = Recenter((cx, cy), aim=self.aim)
+        self._rescue_t = 0.0
+        self.notes.append(f"{s.label}: reached the arena edge — backing off, "
+                          f"then carrying on ({n}/{self.MAX_RESCUES})")
+        return None
+
+    def _step_rescue(self, t, pos, dt, s):
+        self._rescue_t += dt
+        cmd = self.rescuing.step(t, pos, dt)
+        if not self.rescuing.done:
+            return cmd
+
+        err, self.rescuing = self.rescuing.error, None
+        if err and s is not None and not s.error:
+            # A recovery that cannot get back to the middle is the aim frame
+            # again, and there is nothing useful left to measure.
+            s.error = f"could not get back to open floor — {err}"
+            s.done = True
+            return None
+        # The stage was frozen while this ran, so give it its time back rather
+        # than charging it for the rescue and timing it out.
+        if s is not None:
+            s.elapsed = max(0.0, s.elapsed - self._rescue_t)
+        if self._rescues.get(self.i, 0) >= self.MAX_RESCUES and s is not None:
+            s.error = (f"kept reaching the arena edge — after "
+                       f"{self.MAX_RESCUES} recoveries this is the aim frame, "
+                       "not bad luck. Calibrate the heading first.")
+            s.done = True
+        return None
+
     def step(self, t, pos, dt):
         """One frame. Returns (heading_deg, speed_byte), or None to stop."""
         if self.done or self.cancelled:
@@ -1666,6 +1785,14 @@ class Characterization:
         if s is None:
             self.done = True
             return None
+
+        # A rescue owns the robot until the ball is back on open floor, and the
+        # interrupted stage carries on afterwards from wherever it ends up.
+        if self.rescuing is not None:
+            return self._step_rescue(t, pos, dt, s)
+
+        if self._should_rescue(s, pos):
+            return self._begin_rescue(s)
 
         cmd = s.step(t, pos, dt)
         if not s.done:

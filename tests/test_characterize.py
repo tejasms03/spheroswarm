@@ -743,3 +743,63 @@ def test_the_deadband_byte_still_reaches_the_controller():
                            "recommend": {"min_moving_byte": 37}})
     assert g["deadband_cm_s"] == pytest.approx(37 / 255 * 60, abs=0.5)
     assert g["max_speed"] == 60.0, "and it falls back to the nominal ceiling"
+
+
+# -- recentring with a wrong aim frame ---------------------------------------
+
+def _recentre_with(frame_error_deg, start=(25.0, 25.0), target=(69.4, 55.4)):
+    """Drive a Recenter against a world whose frame is rotated."""
+    r = Recenter(target)
+    pos = np.array(start, dtype=float)
+    t, dt = 0.0, 1 / 30.0
+    while not r.done and t < 40.0:
+        cmd = r.step(t, pos, dt)
+        if cmd is None:
+            break
+        heading, byte = cmd
+        a = np.radians((heading + frame_error_deg) % 360.0)
+        pos = pos + np.array([np.sin(a), np.cos(a)]) * (byte / 255.0 * 60.0) * dt
+        t += dt
+    return r, t, pos
+
+
+def test_recentring_arrives_when_the_frame_is_right():
+    r, t, _ = _recentre_with(0.0)
+    assert r.error is None
+    assert t < 6.0
+
+
+def test_a_small_frame_error_still_arrives():
+    """Closing the loop on position absorbs a modest rotation. It must not be
+    mistaken for a broken frame."""
+    r, _, _ = _recentre_with(30.0)
+    assert r.error is None
+
+
+def test_a_reversed_frame_is_caught_in_a_second():
+    """It used to drive 776cm over 30s and end up outside the arena, and the
+    only thing that noticed was the timeout."""
+    r, t, _ = _recentre_with(180.0)
+    assert r.error is not None
+    assert t < 3.0, f"took {t:.1f}s"
+    assert r.travelled < 40.0, f"drove {r.travelled:.0f}cm before noticing"
+    assert "AWAY" in r.error
+
+
+def test_a_perpendicular_frame_is_caught_too():
+    """At 90 degrees the ball drives tangentially — it ORBITS the target at
+    roughly constant distance, so it never gets further away and the
+    wrong-way check alone never fires. Covering ground without arriving is
+    the signal that does."""
+    r, t, _ = _recentre_with(90.0)
+    assert r.error is not None
+    assert t < 10.0, f"took {t:.1f}s"
+    assert "round the middle" in r.error
+
+
+def test_it_never_drives_the_arena_away():
+    """The complaint this exists for: 30 seconds of a wrong frame put the ball
+    metres outside the workspace and left every later stage without room."""
+    for err in (90.0, 135.0, 180.0, 225.0, 270.0):
+        r, _, pos = _recentre_with(err)
+        assert r.travelled < 200.0, f"{err}deg: drove {r.travelled:.0f}cm"

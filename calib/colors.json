@@ -1,12 +1,12 @@
 {
   "red": {
-    "hue": 59,
-    "tol": 11,
-    "s_min": 176,
-    "v_min": 192,
-    "min_area": 10,
-    "max_area": 53298,
-    "led_value": 116
+    "hue": 0,
+    "tol": 6,
+    "s_min": 99,
+    "v_min": 133,
+    "min_area": 676,
+    "max_area": 10149,
+    "led_value": 77
   },
   "yellow": {
     "hue": 16,
@@ -28,10 +28,10 @@
     "tol": 10
   },
   "blue": {
-    "hue": 150,
+    "hue": 108,
     "tol": 8,
-    "s_min": 204,
-    "v_min": 149,
+    "s_min": 68,
+    "v_min": 30,
     "min_area": 669,
     "led_value": 136
   },
