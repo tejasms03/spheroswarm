@@ -97,6 +97,23 @@ class Homography:
             self.corners = [self.corners[i] for i in (3, 2, 1, 0)]
         return self
 
+    def nudge_cm(self, dx, dy):
+        """Shift every reported position by (dx, dy) centimetres.
+
+        Composed onto the matrix rather than applied as a separate correction
+        on the way out. A correction that lives beside the transform has to be
+        inverted by hand in `to_px`, and this project has already lost an
+        afternoon to a drawn robot landing where its blob was not. Folded in,
+        there is one mapping and it cannot drift out of step with itself.
+        """
+        if not self.ready:
+            return self
+        T = np.array([[1.0, 0.0, float(dx)],
+                      [0.0, 1.0, float(dy)],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.M = T @ self.M
+        return self
+
     def matches(self, width, height, tol=1.0):
         """Does this calibration describe the same rectangle as the workspace?"""
         return (abs(self.width - float(width)) <= tol

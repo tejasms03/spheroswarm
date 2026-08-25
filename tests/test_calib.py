@@ -1214,16 +1214,31 @@ def test_it_names_an_outward_splay_as_a_wrong_plane(bench, monkeypatch):
         [t for _, t in bench.log][-3:]
 
 
-def test_it_names_a_constant_shift_as_a_misplaced_corner(bench, monkeypatch):
-    hom = _check_setup(bench, monkeypatch)
-    bench.start_position_check()
-    for truth in ((60.0, 60.0), (140.0, 60.0), (140.0, 140.0), (60.0, 140.0)):
-        bench.handle.pos[:] = [truth[0] + 3.0, truth[1] + 3.0]
-        _click_at_cm(bench, hom, truth)
-    bench.finish_position_check()
-    assert any("constant shift" in t for _, t in bench.log), \
-        [t for _, t in bench.log][-3:]
+def test_a_constant_shift_is_folded_into_the_calibration(bench):
+    """Reporting it was not enough. A tracker reliably five centimetres out is
+    five centimetres out of every arrival radius, every clearance check and
+    every leg the battery plans — and telling somebody to re-pick four corners
+    by hand removes a number the bench has just measured exactly."""
+    _colour_tab(bench, frame=True)
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    h = bench.fleet.handles["ONE"]
+    hom = bench.tracker.tracker.H
+    before = hom.to_cm([[300.0, 250.0]])[0].copy()
 
+    shift = np.array([4.0, -3.0])
+    bench.checks = [{"clicked": np.array(p, dtype=float),
+                     "reported": np.array(p, dtype=float) + shift,
+                     "error": shift.copy()}
+                    for p in ((30.0, 30.0), (100.0, 40.0), (60.0, 90.0),
+                              (120.0, 100.0))]
+    bench.checking = True
+    bench.finish_position_check()
+
+    after = hom.to_cm([[300.0, 250.0]])[0]
+    assert np.allclose(after - before, -shift, atol=0.01), (
+        f"the shift should be folded in: {before} -> {after}")
+    assert any("folded into" in t for _, t in bench.log), [t for _, t in bench.log]
 
 def test_it_says_so_when_there_is_nothing_wrong(bench, monkeypatch):
     hom = _check_setup(bench, monkeypatch)
@@ -1739,3 +1754,32 @@ def test_the_yaw_rate_slider_changes_how_fast_a_and_d_turn(bench):
     assert fast > slow * 3, f"slow {slow:.0f}deg vs fast {fast:.0f}deg"
     labels = [getattr(s, "label", "") for s in bench.sliders]
     assert "yaw deg/s" in labels
+
+
+def test_a_speed_cap_under_the_deadband_is_refused_with_the_reason(bench):
+    """6cm/s reads as a cautious choice and is not one: below the deadband the
+    motors do not turn at all, so the run measures a ball that never moved and
+    blames the tracker. Safety is the edge margin's job — that scales speed
+    with the floor in front, so a workable cap is still slow near a wall."""
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.cap_cm_s = 6
+
+    bench.log.clear()
+    bench.start_run(False)
+
+    assert bench.run is None, "the run must not start"
+    said = " ".join(t for _, t in bench.log)
+    assert "deadband" in said
+    assert "EDGE MARGIN" in said, "it has to say where safety actually comes from"
+
+
+def test_a_workable_cap_starts_the_run(bench):
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.cap_cm_s = 30
+    bench.start_run(False)
+    assert bench.run is not None
+    bench.stop_run("test over")

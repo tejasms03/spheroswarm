@@ -735,6 +735,39 @@ class CalibApp:
                 f"{'seen' if (h is not None and h.connected) else 'NO FIX'}  "
                 f"{len(self.teach_track)} samples")
 
+    def correct_shift(self, mean, mags):
+        """Fold a constant position error into the calibration and say so.
+
+        Reporting it was not enough. A tracker that is reliably five
+        centimetres out is five centimetres out of every arrival radius, every
+        clearance check and every leg the battery plans, and telling somebody
+        to re-pick four corners by hand to remove a number the bench has just
+        measured exactly is asking them to do arithmetic a matrix can do.
+
+        A translation, and only a translation. If the error grew with distance
+        from a point it would be the wrong plane, and `splayed` catches that
+        first — this branch is only reached when the error is the same
+        everywhere, which is precisely what a shift is.
+        """
+        hom = getattr(self.tracker.tracker, "H", None) if self.tracker else None
+        if hom is None or not hom.ready:
+            self.say("warn", f"the error is a constant shift of "
+                             f"({mean[0]:+.1f},{mean[1]:+.1f})cm, but there is "
+                             "no calibration to fold it into")
+            return
+        hom.nudge_cm(-float(mean[0]), -float(mean[1]))
+        try:
+            hom.save()
+        except Exception as e:
+            self.say("error", f"could not save the corrected calibration: {e}")
+            return
+        self.checks = []
+        self.say("ok", f"the error was a constant "
+                       f"({mean[0]:+.1f},{mean[1]:+.1f})cm shift — folded into "
+                       f"the calibration and saved. It was {mags.mean():.1f}cm "
+                       "mean; run `check pos` again and it should be noise. "
+                       "Re-picking the arena clears this.")
+
     def clear_calib_area(self):
         self.calib_bounds = None
         self.say("info", "calibration area cleared — the battery may use the "
@@ -914,6 +947,17 @@ class CalibApp:
     # asks for reaches a robot that is outside the safe margin; it gets driven
     # gently back instead, and the stage is paused meanwhile so the recovery
     # does not appear in the measurement.
+
+    def deadband_cm_s(self):
+        """The speed below which this ball does not move at all.
+
+        Measured when the battery has managed it, and a nominal figure when it
+        has not — an unmeasured robot still has a deadband, and pretending it
+        is zero is how a speed cap gets set underneath one.
+        """
+        g = self.gains()
+        measured = float(g.get("deadband_cm_s") or 0.0)
+        return measured if measured > 0.5 else 7.0
 
     def stop_s(self):
         """This robot's measured stopping constant, or a cautious default."""
@@ -1221,9 +1265,7 @@ class CalibApp:
                                   "a ROBOT placed on each corner.")
 
             elif shifted:
-                self.say("warn", f"the error is a constant shift of "
-                                 f"({mean[0]:+.1f},{mean[1]:+.1f})cm — the corners "
-                                 "were probably clicked slightly off")
+                self.correct_shift(mean, mags)
             else:
                 self.say("ok", "no systematic pattern — that is measurement "
                                "noise, and it is as good as this camera gets")
@@ -1524,8 +1566,26 @@ class CalibApp:
     # -- driving ---------------------------------------------------------
 
     def gains(self):
-        """Gains for the selected robot, from its measurement if it has one."""
-        return gains_from_motion(load_motion(self.selected))
+        """Gains for the selected robot, from its measurement if it has one.
+
+        Memoised per robot. This reads and parses `calib/motion.json` from
+        disk, and the slider getters call it while drawing — so the uncached
+        version did several file reads and JSON parses PER FRAME at 30fps,
+        which is a real cost in the running bench and turned the test suite
+        from two minutes into twelve. Invalidated whenever a run writes a new
+        measurement; see `forget_gains`.
+        """
+        code = self.selected
+        cached = getattr(self, "_gains_cache", None)
+        if cached is not None and cached[0] == code:
+            return cached[1]
+        g = gains_from_motion(load_motion(code))
+        self._gains_cache = (code, g)
+        return g
+
+    def forget_gains(self):
+        """Drop the memo — a fresh measurement has landed, or may have."""
+        self._gains_cache = None
 
     def seed_arrive(self):
         """Set the arrival radius from what this robot can actually hold.
@@ -2011,6 +2071,29 @@ class CalibApp:
             return
         if self.run is not None:
             return
+        # A cap at or below the deadband makes every command a stop, and the
+        # run then reports a tracker that cannot see the robot — which is true,
+        # and blames the wrong thing entirely. This has cost a session.
+        floor = self.deadband_cm_s()
+        if self.cap_cm_s <= floor:
+            self.say("error",
+                     f"top speed {self.cap_cm_s:.0f}cm/s is at or under "
+                     f"{h.code}'s deadband (about {floor:.0f}cm/s), so it is "
+                     "not a slow speed — it is a stopped one. Below the "
+                     "deadband the motors do not turn, the run measures a ball "
+                     "that never moved, and it reports a tracker that cannot "
+                     "see the robot. "
+                     "Keeping it safe is the EDGE MARGIN's job, not this "
+                     "slider's: the limiter already scales speed down with the "
+                     "floor left in front, so a higher cap is still slow near a "
+                     "wall and only fast where there is room.")
+            return
+        if self.cap_cm_s < floor * 1.6:
+            self.say("warn",
+                     f"top speed {self.cap_cm_s:.0f}cm/s is close to {h.code}'s "
+                     f"{floor:.0f}cm/s deadband — it will crawl, and legs may "
+                     "be too short to measure. Raise it if the run complains "
+                     "about not moving.")
         e = self.entry
         self.run = Characterization(
             blob_count=self.blob_count,
@@ -2219,6 +2302,7 @@ class CalibApp:
             self.say("error", err)
         for n in run.notes:
             self.say("warn", n)
+        self.forget_gains()
         self.apply_heading(run, h)
         self.report(fitted)
 
