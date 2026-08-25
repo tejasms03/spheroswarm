@@ -608,6 +608,10 @@ class CalibApp:
         if self.teaching:
             self.finish_teach()
             return
+        if not h.connected:
+            self.say("warn", f"{h.code} has no camera fix — it will still "
+                             "drive, but nothing can be learned from where it "
+                             "goes until the tracker sees it")
         self.stop_path("drive stopped — taking manual control")
         self.teaching = True
         self.keys_held.clear()
@@ -624,6 +628,7 @@ class CalibApp:
             return
         h = self.handle
         if h is None:
+            self.say("error", "the robot went away — teaching stopped")
             self.finish_teach()
             return
         held = {pygame.key.name(k) for k in self.keys_held}
@@ -692,6 +697,33 @@ class CalibApp:
         self.say("ok", f"{h.code} aim frame {res['offset_deg']:+.0f}deg out over "
                        f"{len(res['legs'])} leg(s); offset now "
                        f"{h.heading_offset:.0f}deg, saved{note}")
+        self._build()
+
+    def teach_status(self):
+        """What the keys are doing, for the panel.
+
+        Written because 'I could click it but WASD did nothing' is impossible
+        to diagnose from the outside: a key that never arrived, a robot that
+        never moved and a camera that never saw it look identical from a chair.
+        """
+        if not self.teaching:
+            return None
+        held = "".join(k for k in "wasd"
+                       if k in {pygame.key.name(x) for x in self.keys_held})
+        h = self.handle
+        speed = 0.0
+        if h is not None:
+            speed = float(np.linalg.norm(getattr(h, "_desired", np.zeros(2))))
+        return (f"teaching  keys[{held or '----'}]  "
+                f"aim {self.manual_heading:3.0f}deg  "
+                f"cmd {speed:4.1f}cm/s  "
+                f"{'seen' if (h is not None and h.connected) else 'NO FIX'}  "
+                f"{len(self.teach_track)} samples")
+
+    def clear_calib_area(self):
+        self.calib_bounds = None
+        self.say("info", "calibration area cleared — the battery may use the "
+                         "whole arena again")
         self._build()
 
     def calib_workspace(self):
@@ -2378,14 +2410,18 @@ class CalibApp:
                 "cancel" if self.corner_mode else "set arena",
                 self.cancel_corners if self.corner_mode else self.start_corners,
                 tone=SUN if self.corner_mode else None)
-            add((ax + 730, by, 110, 26), "flip y", self.flip_arena_y, tone=SUN)
             add((ax + 592, by, 130, 26),
                 "done" if self.checking else "check pos",
                 self.finish_position_check if self.checking
                 else self.start_position_check,
                 tone=CYAN if self.checking else None)
+            # Second row: the first is full at 722px and this panel is not
+            # always that wide. A control past the edge is drawn, looks live
+            # and cannot be clicked.
+            by2 = by + 26 + 6
+            add((ax, by2, 110, 26), "flip y", self.flip_arena_y, tone=SUN)
             if self.corner_mode:
-                cy = by + 26 + GAP
+                cy = by2 + 26 + GAP
                 self.sliders.append(Slider((ax + 316, cy, 260, 16),
                                            "width cm", 50, 400,
                                            lambda: self.arena_w,
@@ -2398,12 +2434,18 @@ class CalibApp:
             # Which hue this robot wears. Six swatches for reassigning which
             # SLOT it uses, and a wheel for choosing what that slot actually
             # is — the two are different questions and were being conflated.
-            py = by + 26 + GAP + 20
+            py = by2 + 26 + GAP + 20
             for i, cname in enumerate(vconfig.COLORS):
                 self.palette_rects[cname] = pygame.Rect(ax + i * 54, py, 46, 34)
             self.palette_y = py
 
-            wsize = min(230, max(150, H - py - 130))
+            # Sized so the button UNDER it still fits on the window. Anchored
+            # below the signature sliders, the wheel starts a long way down, so
+            # a fixed floor of 150 put `optimise hues` off the bottom edge on a
+            # 760-tall window — drawn, apparently live, unclickable.
+            wheel_top = by + 26 + GAP + 16
+            below = 30 + 26 + PAD          # gap, button, margin
+            wsize = min(230, max(90, H - wheel_top - below))
             # Clear of the swatch strip by more than its own radius: the robot
             # codes are drawn OUTSIDE the ring, so a rect that merely does not
             # overlap still collides on screen.
@@ -2411,7 +2453,7 @@ class CalibApp:
             # Anchored below the button row rather than beside the swatches:
             # the labels ride outside the ring, so "level with the swatches"
             # still clips whatever is above it.
-            self.wheel_rect = pygame.Rect(wx, by + 26 + GAP + 16, wsize, wsize)
+            self.wheel_rect = pygame.Rect(wx, wheel_top, wsize, wsize)
             if self.wheel_rect.right + 34 > W - PAD:
                 self.wheel_rect.x = max(ax, W - PAD - wsize - 34)
             add((self.wheel_rect.x, self.wheel_rect.bottom + 30, 150, 26),
@@ -2423,15 +2465,23 @@ class CalibApp:
             add((ax + 276, by, 110, 28), "STOP",
                 lambda: self.stop_run("run aborted"), tone=CORAL)
             add((ax + 396, by, 120, 28), "drift 5min", self.start_drift, tone=SUN)
-            b = add((ax + 652, by, 120, 28),
-                    "done" if self.teaching else "teach",
-                    self.toggle_teach, tone=SUN if self.teaching else MINT)
-            b.on = self.teaching
             add((ax + 524, by, 120, 28),
                 "probing..." if self.probe is not None else "sensors",
                 self.probe_sensors,
                 tone=CYAN if self.probe is not None else None)
-            sy = by + 28 + GAP
+            # Its own row: the one above is full, and a button appended past
+            # the panel edge is drawn, looks live, and cannot be clicked.
+            ty = by + 28 + 6
+            b = add((ax, ty, 150, 28),
+                    "done teaching" if self.teaching else "teach",
+                    self.toggle_teach, tone=SUN if self.teaching else MINT)
+            b.on = self.teaching
+            if self.calib_bounds is not None:
+                x0, y0, x1, y1 = self.calib_bounds
+                add((ax + 158, ty, 190, 28),
+                    f"area {x1 - x0:.0f}x{y1 - y0:.0f}cm  clear",
+                    self.clear_calib_area)
+            sy = ty + 28 + GAP
             self.sliders.append(Slider((ax, sy, 300, 16), "top speed", 6,
                                        SPEED_CAP_CM_S,
                                        lambda: self.cap_cm_s,
@@ -2852,6 +2902,11 @@ class CalibApp:
         ax = DOCK + PAD
         aw = W - DOCK - 2 * PAD
         y = self.motion_top
+
+        status = self.teach_status()
+        if status:
+            s.blit(self.f.render(status, True, SUN), (ax, y))
+            y += 24
 
         # The camera lives here too. During a run it is the only thing that
         # distinguishes "the ball is doing the legs" from "the tracker latched

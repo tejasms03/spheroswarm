@@ -1645,3 +1645,66 @@ def test_teaching_gives_the_robot_back(bench):
     assert bench.teaching is False
     assert h.heading_tracking is True
     assert bench.keys_held == set()
+
+
+@pytest.mark.parametrize("tab", ["colour", "motion", "drive"])
+@pytest.mark.parametrize("size", [(1150, 760), (1400, 900), (1024, 700)])
+def test_no_control_is_drawn_off_the_window(bench, tab, size):
+    """A button past the panel edge is drawn, looks live, and cannot be
+    clicked. `teach` shipped 36px off the right of a 1150-wide window and the
+    only symptom was somebody saying the tab did not work — every test passed,
+    because a test that clicks by calling the handler never discovers that no
+    click can reach it.
+
+    The sibling of the existing no-two-regions-overlap test: one says controls
+    do not cover each other, this says they are on the screen at all.
+    """
+    bench.apply_size(*size)
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.set_tab(tab)()
+    w, h = bench.screen.get_size()
+
+    for b in bench.buttons:
+        r = b.rect
+        label = getattr(b, "label", "?")
+        assert r.x >= 0 and r.y >= 0, f"{tab}: {label} starts off-window at {r}"
+        assert r.right <= w, f"{tab}: {label} runs {r.right - w}px past the right edge"
+        assert r.bottom <= h, f"{tab}: {label} runs {r.bottom - h}px past the bottom"
+
+    for sl in bench.sliders:
+        r = sl.rect
+        assert r.right <= w, f"{tab}: slider {getattr(sl, 'label', '?')} off the right"
+        assert r.bottom <= h, f"{tab}: slider {getattr(sl, 'label', '?')} off the bottom"
+
+
+def test_teaching_shows_what_the_keys_are_doing(bench):
+    """'I could click it but WASD did nothing' cannot be diagnosed from the
+    outside: a key that never arrived, a robot that never moved and a camera
+    that never saw it all look identical from a chair. The panel says which."""
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.handle.pos = np.array([60.0, 55.0])
+
+    assert bench.teach_status() is None, "silent when not teaching"
+
+    bench.toggle_teach()
+    assert "keys[----]" in bench.teach_status()
+
+    class E:
+        key = pygame.K_w
+
+    bench.key(E())
+    for _ in range(20):
+        bench.step(1 / 30)
+    live = bench.teach_status()
+    assert "keys[w]" in live
+    assert "0.0cm/s" not in live, "a held key must show as a command"
+    assert "samples" in live
+
+    up = E()
+    bench.key_up(up)
+    for _ in range(5):
+        bench.step(1 / 30)
+    assert "keys[----]" in bench.teach_status(), "releasing must register"
