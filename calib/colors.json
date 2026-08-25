@@ -1,6 +1,6 @@
 {
   "red": {
-    "hue": 174,
+    "hue": 138,
     "tol": 5,
     "s_min": 55,
     "v_min": 100,
@@ -9,7 +9,7 @@
     "led_value": 168
   },
   "yellow": {
-    "hue": 75,
+    "hue": 45,
     "tol": 7,
     "s_min": 42,
     "v_min": 105,
@@ -17,7 +17,7 @@
     "max_area": 5823
   },
   "green": {
-    "hue": 112,
+    "hue": 68,
     "tol": 11,
     "s_min": 110,
     "v_min": 102,
@@ -26,7 +26,7 @@
     "led_value": 224
   },
   "cyan": {
-    "hue": 82,
+    "hue": 91,
     "tol": 7,
     "s_min": 52,
     "v_min": 104,
@@ -34,7 +34,7 @@
     "max_area": 6066
   },
   "blue": {
-    "hue": 112,
+    "hue": 12,
     "tol": 11,
     "s_min": 131,
     "v_min": 191,
@@ -43,7 +43,7 @@
     "led_value": 136
   },
   "magenta": {
-    "hue": 175,
+    "hue": 161,
     "tol": 5,
     "s_min": 53,
     "v_min": 100,

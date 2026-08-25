@@ -142,3 +142,53 @@ def test_the_minimum_area_accounts_for_the_inset():
     side = MIN_AREA_SIDE_CM
     assert driven_bounds(_box(side + 2, side + 2)) is not None
     assert driven_bounds(_box(side - 4, side - 4)) is None
+
+
+# -- the axis trap -------------------------------------------------------
+
+def _legs(told_and_err, cm=30):
+    """Rebuild a drive from (commanded, error) pairs."""
+    track, pos = [], np.array([60.0, 55.0])
+    for told, err in told_and_err:
+        r = np.radians(told)
+        cmd = np.array([np.sin(r), np.cos(r)]) * 20.0
+        ra = np.radians(told + err)
+        step = np.array([np.sin(ra), np.cos(ra)])
+        for _ in range(cm):
+            pos = pos + step
+            track.append((pos.copy(), cmd.copy()))
+    return track
+
+
+def test_driving_up_and_back_down_one_line_is_not_two_directions():
+    """A reflection maps a heading and that heading plus 180 to errors
+    differing by a full turn — the SAME error. So W and S look like the most
+    informative possible pair and are the least, and scoring them as 180
+    degrees of spread is what let a single stray leg decide the verdict."""
+    r = estimate(_legs([(0.0, 40.0), (180.0, 40.0), (0.0, 40.0)]))
+    assert r["direction_spread_deg"] < 5.0, (
+        "one axis driven both ways must not score as maximal spread")
+    assert r.get("confident") is not True
+
+
+def test_one_stray_leg_does_not_call_a_mirrored_arena():
+    """Recorded at the ball: five legs on one axis and one at 105 degrees. The
+    whole mirror verdict rested on that single leg, which is as likely to be a
+    slip, a bump, or the ball catching on a cable."""
+    r = estimate(_legs([(-130.0, 141.0), (50.0, 146.0), (-130.0, 122.0),
+                        (50.0, 154.0), (-130.0, 135.0), (105.0, 59.0)]))
+    assert r.get("mirrored") is not True
+    assert r["ok"] is True, "it should still hand over an offset"
+    assert r["legs_off_axis"] == 1
+    assert r["confident"] is False, "and be honest that one leg is thin"
+
+
+def test_a_mirror_is_still_caught_when_the_evidence_is_there():
+    """The guard must not have disabled the detector — several legs on two
+    genuinely different axes, with the error flipping."""
+    # Four legs on two axes. Consecutive legs sharing a heading would MERGE
+    # into one — `segment` cuts on a turn — so they have to alternate.
+    r = estimate(_legs([(0.0, 0.0), (180.0, 0.0),
+                        (90.0, 180.0), (270.0, 180.0)]))
+    assert r.get("mirrored") is True, r
+    assert r["legs_off_axis"] >= 2
