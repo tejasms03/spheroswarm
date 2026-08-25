@@ -6,14 +6,14 @@
     "color": "blue",
     "ble_name": null,
     "enabled": true,
-    "heading_offset": 17.513667711146326
+    "heading_offset": 359.5
   },
   {
     "name": "Caraxes",
     "code": "CRXS",
     "kind": "real",
     "color": "red",
-    "ble_name": "SK-67D7",
+    "ble_name": "SK-4C2C",
     "enabled": true,
     "heading_offset": 167.3090001551887
   },

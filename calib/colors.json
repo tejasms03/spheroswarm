@@ -34,10 +34,10 @@
     "max_area": 6066
   },
   "blue": {
-    "hue": 99,
+    "hue": 112,
     "tol": 11,
-    "s_min": 63,
-    "v_min": 104,
+    "s_min": 131,
+    "v_min": 191,
     "min_area": 304,
     "max_area": 4566,
     "led_value": 136

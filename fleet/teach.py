@@ -132,7 +132,12 @@ def estimate(track, offset_now=0.0):
     return out
 
 
-def driven_bounds(track, inset_cm=10.0, min_side_cm=40.0):
+# What a driven loop has to span before it describes an area worth planning
+# inside — the inset comes off both sides, so this is the OUTER extent needed.
+MIN_AREA_SIDE_CM = 60.0
+
+
+def driven_bounds(track, inset_cm=10.0, min_side_cm=None):
     """The box the ball was actually driven around, pulled in a little.
 
     Inset because the edge of where somebody drove is the edge of where they
@@ -146,6 +151,7 @@ def driven_bounds(track, inset_cm=10.0, min_side_cm=40.0):
         return None
     a = np.min(pts, axis=0) + inset_cm
     b = np.max(pts, axis=0) - inset_cm
-    if float(b[0] - a[0]) < min_side_cm or float(b[1] - a[1]) < min_side_cm:
+    floor = (MIN_AREA_SIDE_CM - 2 * inset_cm) if min_side_cm is None else min_side_cm
+    if float(b[0] - a[0]) < floor or float(b[1] - a[1]) < floor:
         return None
     return (float(a[0]), float(a[1]), float(b[0]), float(b[1]))

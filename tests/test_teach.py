@@ -132,3 +132,13 @@ def test_a_box_too_small_to_work_in_is_refused():
 def test_standing_still_describes_no_area():
     p = np.array([50.0, 50.0])
     assert driven_bounds([(p, np.array([1.0, 0.0]))] * 50) is None
+
+
+def test_the_minimum_area_accounts_for_the_inset():
+    """The inset comes off BOTH sides, so the outer extent a person has to
+    drive is the stated minimum, not the minimum plus a surprise."""
+    from fleet.teach import MIN_AREA_SIDE_CM
+
+    side = MIN_AREA_SIDE_CM
+    assert driven_bounds(_box(side + 2, side + 2)) is not None
+    assert driven_bounds(_box(side - 4, side - 4)) is None

@@ -668,9 +668,24 @@ class CalibApp:
                            f"from ({x0:.0f},{y0:.0f}) — the battery will plan "
                            "inside this and nowhere else")
         else:
-            self.say("warn", "not enough ground covered to set a calibration "
-                             "area — drive a bigger loop, or the whole arena "
-                             "gets used")
+            # Say the actual numbers. "Drive a bigger loop" leaves a person
+            # guessing whether they were close or nowhere near, and whether the
+            # problem was the driving or the tracker not watching.
+            pts = [p for p, _ in track]
+            if not pts:
+                self.say("warn", "nothing was recorded at all — samples are "
+                                 "only kept while the camera has a fix on the "
+                                 "robot, so fix the tracking first. The whole "
+                                 "arena will be used.")
+            else:
+                lo = np.min(pts, axis=0)
+                hi = np.max(pts, axis=0)
+                need = teach.MIN_AREA_SIDE_CM
+                self.say("warn",
+                         f"drove a {hi[0] - lo[0]:.0f}x{hi[1] - lo[1]:.0f}cm "
+                         f"box over {len(pts)} samples, and an area needs at "
+                         f"least {need:.0f}x{need:.0f}cm to be worth planning "
+                         "inside. The whole arena will be used.")
 
         if h is None:
             self._build()
