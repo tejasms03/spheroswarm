@@ -1708,3 +1708,34 @@ def test_teaching_shows_what_the_keys_are_doing(bench):
     for _ in range(5):
         bench.step(1 / 30)
     assert "keys[----]" in bench.teach_status(), "releasing must register"
+
+
+def test_the_yaw_rate_slider_changes_how_fast_a_and_d_turn(bench):
+    """A sphere has no visible front, so turning shows as nothing until you
+    drive — which is why the default felt like the keys were dead."""
+    bench.set_tab("motion")()
+    bench.connect("ONE", "sim")
+    bench.selected = "ONE"
+    bench.handle.pos = np.array([60.0, 55.0])
+    bench.toggle_teach()
+
+    class E:
+        key = pygame.K_d
+
+    bench.key(E())
+
+    bench.turn_rate = 60.0
+    bench.manual_heading = 0.0
+    for _ in range(30):
+        bench.step_teach(1 / 30)
+    slow = bench.manual_heading
+
+    bench.turn_rate = 240.0
+    bench.manual_heading = 0.0
+    for _ in range(30):
+        bench.step_teach(1 / 30)
+    fast = bench.manual_heading
+
+    assert fast > slow * 3, f"slow {slow:.0f}deg vs fast {fast:.0f}deg"
+    labels = [getattr(s, "label", "") for s in bench.sliders]
+    assert "yaw deg/s" in labels

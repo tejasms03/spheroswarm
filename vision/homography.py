@@ -12,8 +12,7 @@ from . import config
 
 
 class Homography:
-    def __init__(self, matrix=None, arena=config.ARENA_CM, width=None, height=None,
-                 parallax=None):
+    def __init__(self, matrix=None, arena=config.ARENA_CM, width=None, height=None):
         self.arena = arena
         # The rectangle this calibration was built for, in cm. Stored because
         # `arena` alone cannot distinguish a square calibration from a
@@ -25,11 +24,6 @@ class Homography:
         self.height = float(height) if height else float(arena)
         self.M = np.array(matrix, dtype=np.float64) if matrix is not None else None
         self.corners = None
-        # How far the ball's height pushes it outward from the camera's nadir,
-        # fitted by `check pos`. Stored HERE rather than in its own file so it
-        # goes stale together with the calibration it was measured against —
-        # re-pick the corners and this is wrong, and it should not survive.
-        self.parallax = parallax or None
 
     @property
     def ready(self):
@@ -41,15 +35,11 @@ class Homography:
         if not d:
             return cls()
         return cls(d["matrix"], d.get("arena", config.ARENA_CM),
-                   width=d.get("width"), height=d.get("height"),
-                   parallax=d.get("parallax"))
+                   width=d.get("width"), height=d.get("height"))
 
     def save(self):
-        blob = {"matrix": self.M.tolist(), "arena": self.arena,
-                "width": self.width, "height": self.height}
-        if self.parallax:
-            blob["parallax"] = self.parallax
-        config.save("homography", blob)
+        config.save("homography", {"matrix": self.M.tolist(), "arena": self.arena,
+                                   "width": self.width, "height": self.height})
 
     def set_corners(self, pts):
         """pts: 4 pixel points in order top-left, top-right, bottom-right, bottom-left."""
@@ -82,10 +72,6 @@ class Homography:
         self.M = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
         self.width, self.height = width, height
         self.arena = max(width, height)
-        # A parallax fit describes the OLD mapping. Keeping it across a
-        # recalibration would apply a correction measured against corners that
-        # no longer exist, which is worse than not correcting at all.
-        self.parallax = None
         return self
 
     def flip_y(self):
@@ -99,8 +85,7 @@ class Homography:
 
         Composed onto the existing matrix rather than re-solved, so a
         calibration somebody clicked carefully is not thrown away to fix its
-        handedness. Any parallax fit goes, though: it was measured in the old
-        frame and its nadir is now on the wrong side.
+        handedness.
         """
         if not self.ready:
             return self
@@ -110,7 +95,6 @@ class Homography:
         self.M = F @ self.M
         if self.corners:
             self.corners = [self.corners[i] for i in (3, 2, 1, 0)]
-        self.parallax = None
         return self
 
     def matches(self, width, height, tol=1.0):
@@ -121,28 +105,21 @@ class Homography:
     def to_cm(self, pts_px):
         p = np.asarray(pts_px, dtype=np.float64).reshape(-1, 1, 2)
         out = cv2.perspectiveTransform(p, self.M).reshape(-1, 2)
-        if self.parallax:
-            from . import parallax as _px
-            out = np.array([_px.correct(q, self.parallax) for q in out])
         return out
 
     def to_px(self, pts_cm):
-        """The exact inverse of `to_cm`, parallax included.
+        """The exact inverse of `to_cm`. Nothing sits between them.
 
-        It has to be, or every overlay drawn from a tracked position lands
-        somewhere the blob is not: `to_cm` pulls a detection in toward the
-        camera's nadir to account for the ball's height, so `to_px` has to push
-        it back out before projecting. Inverting only the matrix would displace
-        every drawn robot by exactly the correction, which looks like a
-        tracking fault and is not one.
+        There used to be a ball-height parallax correction applied on the way
+        in, and it had to be undone here or every overlay drawn from a tracked
+        position landed where the blob was not. Both halves are gone: a
+        correction that only ever fired on a distorted camera is not worth a
+        pair of transforms that can drift out of step, and this project has
+        already lost an afternoon to positions that disagreed with pixels.
         """
-        pts = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 2)
-        if self.parallax:
-            from . import parallax as _px
-            pts = np.array([_px.uncorrect(q, self.parallax) for q in pts])
         inv = np.linalg.inv(self.M)
-        return cv2.perspectiveTransform(
-            pts.reshape(-1, 1, 2), inv).reshape(-1, 2)
+        p = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(p, inv).reshape(-1, 2)
 
 
 def _orient(pts):

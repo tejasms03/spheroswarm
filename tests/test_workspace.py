@@ -269,14 +269,3 @@ def test_flipping_twice_is_the_identity():
     h.flip_y()
     h.flip_y()
     assert np.allclose(before, h.to_cm([[300, 250], [180, 300]]))
-
-
-def test_flipping_discards_a_parallax_fit():
-    """Its nadir was measured on the other side of the arena."""
-    from vision.homography import Homography
-
-    h = Homography()
-    h.set_rect([(100, 100), (500, 110), (510, 400), (90, 390)], 138.8, 110.8)
-    h.parallax = {"nadir_cm": [70.0, 20.0], "scale": 1.05}
-    h.flip_y()
-    assert h.parallax is None

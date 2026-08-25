@@ -278,6 +278,7 @@ class CalibApp:
         self.teaching = False
         self.keys_held = set()
         self.manual_heading = 0.0
+        self.turn_rate = 150.0          # deg/s on A and D, tunable
         self.teach_track = []           # (pos_cm, commanded_velocity)
         self.calib_bounds = None        # (x0, y0, x1, y1) the battery must stay in
         self.run = None                 # a Characterization in progress
@@ -589,7 +590,6 @@ class CalibApp:
     # -- membership ------------------------------------------------------
 
     MANUAL_SPEED = 14.0         # cm/s at full stick
-    MANUAL_TURN = 150.0         # deg/s on A and D
 
     def toggle_teach(self):
         """Drive it yourself, and let the bench watch.
@@ -635,7 +635,7 @@ class CalibApp:
         turn = (1.0 if "d" in held else 0.0) - (1.0 if "a" in held else 0.0)
         drive = (1.0 if "w" in held else 0.0) - (1.0 if "s" in held else 0.0)
         self.manual_heading = (self.manual_heading
-                               + turn * self.MANUAL_TURN * dt) % 360.0
+                               + turn * self.turn_rate * dt) % 360.0
         if drive == 0.0:
             h.set_velocity(np.zeros(2))
             return
@@ -1219,7 +1219,7 @@ class CalibApp:
                                   "calibration is on the floor, but the balls "
                                   "ride above it. Set the arena again, clicking "
                                   "a ROBOT placed on each corner.")
-                self.fit_parallax()
+
             elif shifted:
                 self.say("warn", f"the error is a constant shift of "
                                  f"({mean[0]:+.1f},{mean[1]:+.1f})cm — the corners "
@@ -1257,50 +1257,6 @@ class CalibApp:
                        "if the error still changes sign, the flip was not the "
                        "problem and you can press it again to undo.")
         self._build()
-
-    def fit_parallax(self):
-        """Measure the ball-height offset from the points just checked, and
-        correct for it rather than only naming it.
-
-        Clicking a robot on each corner is the better fix and the log says so:
-        it maps the plane the balls travel in and the parallax is gone rather
-        than corrected. But the samples to do it the other way have just been
-        taken, and a correction measured from the arena in front of you beats a
-        recalibration nobody gets round to.
-        """
-        from vision import parallax as px
-
-        hom = getattr(self.tracker.tracker, "H", None) if self.tracker else None
-        if hom is None or not hom.ready:
-            return
-        # `reported` already has any previous correction applied, so a second
-        # fit on top of the first would double it.
-        old = hom.parallax
-        hom.parallax = None
-        try:
-            fit = px.fit([(c["clicked"], c["reported"]) for c in self.checks])
-        finally:
-            if fit is None:
-                hom.parallax = old
-
-        if fit is None:
-            self.say("warn", "not enough spread in those points to measure the "
-                             "ball height — check three or more, well apart")
-            return
-        hom.parallax = fit
-        try:
-            hom.save()
-        except Exception as e:
-            self.say("error", f"could not save the parallax fit: {e}")
-            return
-        self.say("ok", f"measured it instead: everything sits {fit['scale']:.3f}x "
-                       f"out from ({fit['nadir_cm'][0]:.0f},{fit['nadir_cm'][1]:.0f})"
-                       f"cm, which is where the camera is looking straight down. "
-                       f"Correcting for it takes the error from {fit['was_cm']}cm "
-                       f"to {fit['residual_cm']}cm. Saved — re-picking the arena "
-                       "clears it.")
-
-    # -- the wheel -------------------------------------------------------
 
     def led_for(self, name):
         """What to tell a robot to glow, derived from the hue we look for."""
@@ -2491,6 +2447,15 @@ class CalibApp:
                     "done teaching" if self.teaching else "teach",
                     self.toggle_teach, tone=SUN if self.teaching else MINT)
             b.on = self.teaching
+            # How fast A and D swing the aim. A sphere has no visible front, so
+            # turning shows as nothing at all until you drive — which is why
+            # the default felt like the keys were dead. Slow it down to place a
+            # heading, speed it up to spin round.
+            self.sliders.append(Slider((ax + 360, ty + 6, 220, 16),
+                                       "yaw deg/s", 20, 360,
+                                       lambda: int(self.turn_rate),
+                                       lambda v: setattr(self, "turn_rate",
+                                                         float(v))))
             if self.calib_bounds is not None:
                 x0, y0, x1, y1 = self.calib_bounds
                 add((ax + 158, ty, 190, 28),
