@@ -2,17 +2,17 @@
   {
     "name": "Seasmoke",
     "code": "SSMK",
-    "kind": "sim",
-    "color": "blue",
-    "ble_name": null,
+    "kind": "real",
+    "color": "red",
+    "ble_name": "SK-5640",
     "enabled": true,
-    "heading_offset": 359.5
+    "heading_offset": 0.0
   },
   {
     "name": "Caraxes",
     "code": "CRXS",
     "kind": "sim",
-    "color": "red",
+    "color": "blue",
     "ble_name": null,
     "enabled": true,
     "heading_offset": 238.6
