@@ -41,6 +41,13 @@ class RobotHandle(ABC):
         self._seed_offset = 0.0
         self.rgb = (255, 255, 255)
         self.blink = None
+        # The aiming taillight. Off is what a Sphero powers up as, and it is
+        # the wrong default for anything being watched: the main LED says WHICH
+        # robot this is and says nothing about which way it is pointing, and
+        # which way it is pointing is the thing every aim-frame bug in this
+        # project comes down to. Held here rather than in each handle so a
+        # renderer can draw it for a simulated robot too.
+        self.back_led = 0
         self.target = None          # set by controllers, read by the renderer
         self._desired = np.zeros(2)
 
@@ -72,6 +79,8 @@ class RobotHandle(ABC):
             "connected": bool(self.connected),
             "battery": None if self.battery is None else round(float(self.battery), 2),
             "led": list(self.rgb),
+            "back_led": (list(self.back_led)
+                         if isinstance(self.back_led, tuple) else self.back_led),
             "blink": self.blink,
             "last_seen": round(float(self.last_seen), 2),
             "target": None if self.target is None
@@ -201,6 +210,20 @@ class RobotHandle(ABC):
     @abstractmethod
     def set_led(self, rgb, blink=None):
         ...
+
+    def set_back_led(self, value):
+        """The taillight: an int brightness 0-255, or an (r, g, b) for a BOLT.
+
+        Concrete rather than abstract, and it stores rather than sends. A
+        simulated robot has no radio to send it to and a renderer still wants
+        to draw the thing, so the state lives here and only the handles with
+        hardware under them override this to also write it out.
+        """
+        if isinstance(value, (tuple, list)):
+            self.back_led = tuple(int(np.clip(c, 0, 255)) for c in value)
+        else:
+            self.back_led = int(np.clip(value, 0, 255))
+        return self.back_led
 
     def aim_zero(self, error_deg):
         """Make the robot's own forward match the arena's.

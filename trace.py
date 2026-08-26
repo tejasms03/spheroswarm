@@ -136,6 +136,7 @@ class TraceApp:
                               motion=None if perfect else self.measured)
         self.home = np.array([self.ws.width * 0.18, self.ws.height * 0.5])
         self.robot.pos = self.home.copy()
+        self.robot.set_back_led(255)
         # The ball's own aim error, before the slider adds any. Kept because
         # the slider sets `bias` outright and would otherwise quietly delete
         # the per-robot error the simulator generated.
@@ -493,6 +494,16 @@ class TraceApp:
             pygame.draw.circle(self.screen, CORAL, t, 4, 1)
         pygame.draw.circle(self.screen, col, p, r)
         pygame.draw.circle(self.screen, (240, 250, 255), p, r, 1)
+        # The aiming taillight, on the BACK of the ball. On a real Sphero it is
+        # how you see which way it is pointing while it sits still, and it is
+        # drawn here for the same reason: the main colour says which robot,
+        # never which way.
+        if self.robot.back_led and self.drive is not None:
+            v = heading_vector(self.drive.plant.heading)
+            tail = (int(p[0] - v[0] * r * 0.75), int(p[1] - v[1] * r * 0.75))
+            b = (self.robot.back_led if not isinstance(self.robot.back_led, tuple)
+                 else 255)
+            pygame.draw.circle(self.screen, (40, 90, int(b)), tail, max(2, r // 3))
         if self.drive is None:
             return
         plant = self.drive.plant

@@ -99,6 +99,8 @@ class SpheroRobot(RobotHandle):
 
         self._pending = None            # (heading, speed) awaiting a write
         self._pending_led = None
+        self._pending_back = None
+        self._back_led_works = True
         self._last_sent = None          # (heading, speed) actually written
         self._last_write_at = 0.0
 
@@ -242,6 +244,21 @@ class SpheroRobot(RobotHandle):
         with self._lock:
             self._pending_led = self.rgb
         self._wake.set()
+
+    def set_back_led(self, value):
+        """Queue the taillight for the worker, like every other write.
+
+        One packet, and only when the value CHANGES — see `_run`. An aiming
+        light that is re-sent every tick is a light that costs as much airtime
+        as driving, on a link where airtime is the binding constraint.
+        """
+        out = super().set_back_led(value)
+        if not self._back_led_works:
+            return out
+        with self._lock:
+            self._pending_back = out
+        self._wake.set()
+        return out
 
     def stop(self):
         self._desired = np.zeros(2)
@@ -397,6 +414,14 @@ class SpheroRobot(RobotHandle):
                 self._api = self._connector(self.ble_name)
                 self._link_up = True
                 self._fast = sphero_fast.attach(self._api) if self.fast_writes else None
+                # A ball that has just connected is a ball with its lights off,
+                # whatever this handle last set them to. Re-assert both, or a
+                # reconnect silently returns the robot to white-and-dark and
+                # the roster's colours stop matching the floor -- which is the
+                # tracker's entire input.
+                with self._lock:
+                    self._pending_led = self.rgb
+                    self._pending_back = self.back_led or None
                 self.last_error = None
                 self.max_connections_hit = False
                 log.info("%s connected as %s", self.code, self.ble_name)
@@ -568,12 +593,32 @@ class SpheroRobot(RobotHandle):
 
             with self._lock:
                 cmd, led = self._pending, self._pending_led
+                back = self._pending_back
                 self._pending = self._pending_led = None
+                self._pending_back = None
 
             try:
                 if led is not None:
                     from spherov2.types import Color
                     self._api.set_main_led(Color(*led))
+                if back is not None:
+                    # An int is the blue aiming light on every toy that has
+                    # one; a triple is a BOLT's addressable back LED. The
+                    # library branches on the type, so the type is the API.
+                    #
+                    # Guarded on its own, because everything else in this block
+                    # tears the link down and reconnects when it throws — which
+                    # is right for a drive command and absurd for an aiming
+                    # light. A toy that cannot do this says so once and then
+                    # stops being asked, exactly like the yaw source.
+                    try:
+                        from spherov2.types import Color
+                        self._api.set_back_led(
+                            Color(*back) if isinstance(back, tuple) else int(back))
+                    except Exception as e:
+                        self._back_led_works = False
+                        self.last_error = f"no taillight on this toy: {e}"
+                        log.info("%s: taillight unsupported, ignoring", self.code)
                 if cmd is not None and self._should_write(cmd):
                     self._write(*cmd)
                     self._last_sent = cmd
