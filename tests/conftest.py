@@ -26,6 +26,7 @@ class FakeApi:
         self.headings = []
         self.speeds = []
         self.leds = []
+        self.back_leds = []
         self.closed = False
         self.lock = threading.Lock()
 
@@ -50,6 +51,13 @@ class FakeApi:
     def set_main_led(self, color):
         with self.lock:
             self.leds.append(color)
+
+    def set_back_led(self, value):
+        """The aiming taillight. An int is brightness, a Color is a BOLT's."""
+        if self.fail_on_write:
+            raise RuntimeError("simulated BLE write failure")
+        with self.lock:
+            self.back_leds.append(value)
 
     def __exit__(self, *a):
         self.closed = True

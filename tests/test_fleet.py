@@ -747,3 +747,61 @@ def test_a_filter_returning_nonsense_is_ignored(open_ws):
         assert np.isfinite(h.vel).all()
     finally:
         h.close()
+
+
+# -- the aiming taillight ------------------------------------------------
+
+def test_a_handle_remembers_its_taillight_and_reports_it(open_ws):
+    from fleet.sim_handle import SimRobot
+    h = SimRobot("One", "ONE", "red", workspace=open_ws, seed=1)
+    assert h.back_led == 0, "a Sphero powers up with the taillight off"
+    h.set_back_led(255)
+    assert h.state()["back_led"] == 255
+    h.set_back_led((10, 20, 30))
+    assert h.state()["back_led"] == [10, 20, 30], "a BOLT's is addressable"
+
+
+def test_the_taillight_reaches_the_radio(open_ws):
+    from fleet.real_handle import SpheroRobot
+    conn = FakeConnector()
+    h = SpheroRobot("One", "ONE", "red", "SK-TEST", workspace=open_ws,
+                    connector=conn)
+    try:
+        h.set_back_led(255)
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not conn.apis:
+            time.sleep(0.02)
+        api = conn.apis.get("SK-TEST")
+        assert api is not None
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not api.back_leds:
+            time.sleep(0.02)
+        assert api.back_leds, "the taillight never went out over the link"
+    finally:
+        h.close()
+
+
+def test_a_toy_with_no_taillight_does_not_lose_the_link(open_ws):
+    """A cosmetic light must never cost a connection. Everything else in that
+    worker block tears the link down and reconnects when it throws."""
+    from fleet.real_handle import SpheroRobot
+
+    class NoTail(FakeApi):
+        def set_back_led(self, value):
+            raise RuntimeError("this toy has no back LED")
+
+    h = SpheroRobot("One", "ONE", "red", "SK-TEST", workspace=open_ws,
+                    connector=lambda name, timeout=8.0: NoTail(name))
+    try:
+        # `connected` also wants a camera fix and there is no camera here, so
+        # the link itself is what this test is about.
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not h._link_up:
+            time.sleep(0.02)
+        assert h._link_up
+        h.set_back_led(255)
+        time.sleep(0.4)
+        assert h._link_up, "a failed taillight write dropped the link"
+        assert not h._back_led_works, "and it should stop asking"
+    finally:
+        h.close()
