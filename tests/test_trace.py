@@ -311,3 +311,80 @@ def test_scoring_starts_where_the_ball_joined_the_path(arena):
     assert d.score()["joined"]
     assert d.joined_at > 0
     assert d.score()["rms_cm"] < 6.0
+
+
+# -- the corridor controller ---------------------------------------------
+
+def track(**kw):
+    kw.setdefault("speed", 20.0)
+    kw.setdefault("arrive_cm", 6.0)
+    from swarm.trace import TrackToPoint
+    return TrackToPoint(**kw)
+
+
+def test_the_corridor_controller_hands_back_a_velocity(arena):
+    """Because that is what every handle and every drive loop here speaks,
+    however roll-shaped the thing underneath is."""
+    c = track()
+    v = c.step([0.0, 0.0], [0.0, 0.0], [100.0, 0.0])
+    assert v.shape == (2,)
+    assert float(np.linalg.norm(v)) == pytest.approx(20.0, abs=1.0)
+    assert v[0] > 0 and abs(v[1]) < 1.0, "pointing at the target"
+
+
+def test_it_reports_the_bearing_it_committed_to_in_the_frame_watch_aim_reads():
+    """Maths convention, anticlockwise, x-right — NOT a Sphero heading. The
+    bench compares this against travel it measures with atan2(dy, dx), and the
+    two conventions run opposite ways."""
+    c = track()
+    c.step([0.0, 0.0], [0.0, 0.0], [0.0, 100.0])     # straight down the screen
+    # +90, not -90: the arena's y runs DOWN, and watch_aim reads travel with
+    # atan2(dy, dx) in that same frame. Getting this backwards would have the
+    # bench correcting every offset by twice the error, in the wrong direction.
+    assert c.aim == pytest.approx(90.0, abs=2.0)
+    c = track()
+    c.step([0.0, 0.0], [0.0, 0.0], [100.0, 0.0])     # straight along +x
+    assert c.aim == pytest.approx(0.0, abs=2.0)
+
+
+def test_arriving_latches_until_the_error_grows_past_the_release():
+    c = track(arrive_cm=6.0)
+    assert not float(np.linalg.norm(c.step([0, 0], [0, 0], [100, 0]))) == 0.0
+    stopped = c.step([98.0, 0.0], [0.0, 0.0], [100.0, 0.0])
+    assert float(np.linalg.norm(stopped)) == 0.0
+    assert c.holding and c.arrived
+    # Just outside the circle but inside the release: still parked.
+    assert float(np.linalg.norm(c.step([92.0, 0.0], [0, 0], [100, 0]))) == 0.0
+    # Well outside: drives again.
+    assert float(np.linalg.norm(c.step([80.0, 0.0], [0, 0], [100, 0]))) > 0.0
+
+
+def test_a_setpoint_that_moves_a_little_keeps_the_corridor():
+    c = track()
+    c.step([0, 0], [0, 0], [100.0, 0.0])
+    first = c.corridor
+    c.step([5, 0], [20, 0], [102.0, 0.0])
+    assert c.corridor is first, "two centimetres is not a new route"
+    c.step([10, 0], [20, 0], [100.0, 40.0])
+    assert c.corridor is not first
+
+
+def test_re_laying_the_corridor_does_not_reset_the_rate_limiter():
+    """A moving setpoint re-lays the route every few centimetres, and a fresh
+    follower each time would think it had never spoken — which is a command
+    per re-lay, on a link that has no room for them."""
+    c = track(cmd_hz=4.0)
+    c.step([0, 0], [0, 0], [100.0, 0.0])
+    assert c.commands == 1
+    for i in range(10):
+        c.step([float(i), 0.0], [20.0, 0.0], [100.0, 10.0 * i], dt=1 / 30.0)
+    assert c.commands <= 3, "ten re-lays inside a second is not ten commands"
+
+
+def test_it_never_claims_to_be_circling():
+    """The bench's aim recovery hangs off that flag, and a controller that
+    converges onto a line cannot orbit a point."""
+    c = track()
+    for i in range(200):
+        c.step([float(i) * 0.5, 0.0], [20.0, 0.0], [100.0, 0.0], dt=1 / 30.0)
+        assert c.orbiting is False
