@@ -202,6 +202,28 @@ class RobotHandle(ABC):
     def set_led(self, rgb, blink=None):
         ...
 
+    def aim_zero(self, error_deg):
+        """Make the robot's own forward match the arena's.
+
+        The contract is behavioural, not arithmetic: the robot was told to
+        travel a course and went `error_deg` away from it; after this, being
+        told that course sends it there. A caller passes what it measured and
+        gets a robot that no longer does it.
+
+        This is a different mechanism from `heading_offset`, and a better one
+        where it exists. An offset is a correction added to every command
+        forever, and a Sphero establishes its heading reference when it
+        connects — so a stored offset is stale the moment the link drops, which
+        is why re-measuring it never stuck. Zeroing the aim puts the correction
+        in the ROBOT. There is nothing left to apply, so there is no sign left
+        to get wrong.
+
+        The base class does nothing and reports so: a robot with no aim to
+        reset is not a failure, it is a robot the caller should keep correcting
+        the old way.
+        """
+        return False
+
     @abstractmethod
     def stop(self):
         ...

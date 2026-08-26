@@ -139,6 +139,24 @@ class SimRobot(RobotHandle):
             self._believed_course = float(
                 np.degrees(np.arctan2(v[1], v[0])) % 360.0)
 
+    def aim_zero(self, error_deg):
+        """The simulated equivalent: take the frame error out of the ball.
+
+        A real Sphero rotates its drive assembly and calls that zero. There is
+        no assembly here, so the same thing is done to the bias the simulator
+        rotates commands by — which is what the assembly's misalignment IS, in
+        this model. The sign is not reasoned about; a test drives the robot
+        afterwards and checks it goes where it was told.
+        """
+        # PLUS, not minus. The error arrives as a compass bearing and the bias
+        # is a maths angle, and those run in opposite directions — so the
+        # correction that looks wrong is the one that works. Verified by
+        # driving afterwards rather than by reasoning about it.
+        self.bias = float(self.bias) + np.radians(float(error_deg))
+        self._drift = 0.0
+        self.heading_offset = 0.0
+        return True
+
     def set_led(self, rgb, blink=None):
         self.rgb = tuple(int(np.clip(c, 0, 255)) for c in rgb)
         self.blink = blink

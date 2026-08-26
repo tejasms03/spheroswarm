@@ -228,6 +228,7 @@ under test is actually present** before believing a null result.
 | where | what |
 |---|---|
 | `fleet/teach.py` | drive it yourself; the aim frame and the safe area read off your driving |
+| `RobotHandle.aim_zero` | move the robot's own forward to match the arena |
 | `fleet/identify.py` | prove identity by driving the LED — **no button yet** |
 | `fleet/sphero_fast.py` | fire-and-forget writes, `SPHERO_FAST_WRITES=1`, **unverified on hardware** |
 | MOTION tab | `teach`, `yaw deg/s`, threaded `sensors` |
@@ -290,7 +291,69 @@ rather than suspected:
    (The parallax correction was built and then removed: it only mattered on a
    distorted camera and cost a pair of transforms that had to stay each other's
    exact inverse.)
-4. **`teach`** — drive a loop with legs on **two different axes**. One axis
-   driven both ways is the least informative pair available, not the most.
+4. **`teach`** — drive until W sends the ball where the screen says, then stop.
+   It now moves the BALL's zero rather than storing a correction (see below),
+   so one leg is enough. Two axes still matter if you want the mirror check.
 5. **`run full`**, with the top speed above the deadband.
 6. **Then** judge the controller.
+
+
+---
+
+## 12. `aim_zero` — the correction moved into the robot
+
+Added after the rest of this document. It changes how the aim frame is fixed,
+so read it before trusting section 4.
+
+`heading_offset` is a number added to every command for as long as the roster
+holds it. A Sphero establishes its heading reference **when it connects**, so a
+stored offset is stale the moment the link drops — which is why re-measuring it
+never stuck across a session, and why the value kept coming back wrong.
+
+The v1.2 protocol can do better and this codebase had never used it.
+`SpheroEduAPI.reset_aim()` takes whichever way the drive assembly is currently
+pointing and calls that zero. So `aim_zero(error_deg)`:
+
+1. rotates the assembly by minus the measured error, **at speed zero** — which
+   turns the assembly without moving the ball, so it needs no clear floor
+2. calls `reset_aim()`, making that direction the robot's own forward
+3. sets `heading_offset` to zero
+
+The correction now lives in the robot. Nothing is applied on every command, so
+there is no signed number left to apply the wrong way round — which is where
+most of this project's aim-frame bugs have come from.
+
+Measured in the simulator, one leg then four different courses:
+
+| true frame error | measured | error afterwards, courses 0 / 90 / 200 / 315 |
+|---:|---:|---|
+| +40° | −40.0 | all under 0.02° |
+| −70° | +70.0 | all under 0.02° |
+| +150° | −150.0 | all under 0.02° |
+| **−175°** | +175.0 | all under 0.02° |
+
+The −175° row is the one that matters: a near-reversal is where wraparound and
+sign errors bite hardest, and it is where every offset-based attempt failed.
+
+`teach` uses it when the robot has one and falls back to storing an offset when
+it does not — the offset is the fallback now, not the mechanism. `SimRobot`
+implements the same contract by moving its own bias, so the behaviour is
+testable with no hardware.
+
+**Not verified on a ball.** The call exists and the path through `spherov2` is
+the v1.2 one a SPRK+ speaks, but that is reading the library, not driving. Two
+things to know before trying it: `reset_aim` briefly turns stabilisation off, so
+the ball will not self-right for that moment; and it corrects a **rotation**
+only — a mirrored arena is still `_orient` and `flip y`'s job.
+
+Three traps found writing the tests, all worth keeping:
+
+- **The live estimator folds mid-measurement.** An open-loop leg looked steady
+  and then quietly changed direction at step 119. `heading_tracking = False`
+  while measuring, which is what `start_calibration` already did and for the
+  same reason.
+- **A sim robot slides along the arena wall**, which corrupts a measured travel
+  direction into something plausible and wrong. Measure in open space.
+- **Compass and maths angles run opposite.** The sim's bias is a maths angle
+  and the measured error is a compass bearing, so the correction that looks
+  wrong is the one that works. Settled by driving afterwards, not by reasoning.

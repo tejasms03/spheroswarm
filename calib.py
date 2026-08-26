@@ -700,18 +700,33 @@ class CalibApp:
             self._build()
             return
 
-        h.heading_offset = res["new_offset_deg"]
+        # Move the ball's own zero if it has one, and only carry an offset if
+        # it does not. The offset is the fallback, not the mechanism: it is
+        # applied to every command forever and goes stale the moment the link
+        # drops, which is why it never stayed right across a session.
+        zeroed = h.aim_zero(res["offset_deg"])
+        if zeroed:
+            h.heading_offset = 0.0
+        else:
+            h.heading_offset = res["new_offset_deg"]
         e = self.roster.by_code(h.code)
         if e is not None:
             e.heading_offset = h.heading_offset
             for x in self.roster.save():
                 self.say("error", x)
         note = ("" if res.get("confident") else
-                " — but only one direction was driven, so this cannot tell a "
+                " — but only one axis was driven, so this cannot tell a "
                 "rotated frame from a mirrored one. Drive a loop to be sure.")
-        self.say("ok", f"{h.code} aim frame {res['offset_deg']:+.0f}deg out over "
-                       f"{len(res['legs'])} leg(s); offset now "
-                       f"{h.heading_offset:.0f}deg, saved{note}")
+        if zeroed:
+            self.say("ok", f"{h.code} was {res['offset_deg']:+.0f}deg out over "
+                           f"{len(res['legs'])} leg(s) — its own forward has "
+                           "been moved to match the arena, so there is no "
+                           "offset left to apply and nothing to go stale. "
+                           "Re-aim after any reconnect" + note)
+        else:
+            self.say("ok", f"{h.code} aim frame {res['offset_deg']:+.0f}deg out "
+                           f"over {len(res['legs'])} leg(s); offset now "
+                           f"{h.heading_offset:.0f}deg, saved{note}")
         self._build()
 
     def teach_status(self):

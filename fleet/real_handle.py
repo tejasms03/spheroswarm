@@ -199,6 +199,43 @@ class SpheroRobot(RobotHandle):
             self._force_write = True
         self._wake.set()
 
+    def aim_zero(self, error_deg):
+        """Move the BALL's zero, instead of carrying a correction forever.
+
+        `heading_offset` is added to every command for as long as the roster
+        holds it, and a Sphero establishes its heading reference when it
+        connects — so a stored offset is stale the moment the link drops. That
+        is why re-measuring it never stuck, and why the number kept coming back
+        wrong after a reconnect.
+
+        The v1.2 protocol can do better and this codebase has never used it.
+        `reset_aim` takes whichever way the drive assembly is currently
+        pointing and calls it zero. So: rotate the assembly by the error that
+        was just measured, then declare that direction forward. The correction
+        now lives in the robot, `heading_offset` goes to zero, and there is no
+        longer a signed number applied on every command that can be applied the
+        wrong way round.
+
+        Rotating uses a speed of zero, which turns the assembly without driving
+        the ball — that is how aiming works on a Sphero, and it is why this
+        needs no floor. Stabilisation is briefly off inside `reset_aim`, so the
+        ball will not self-right for that moment.
+        """
+        api = self._api
+        if api is None:
+            return False
+        try:
+            # Speed zero: the assembly turns, the ball stays put.
+            setattr(api, "_SpheroEduAPI__speed", 0)
+            api.set_heading(int(round(-float(error_deg))) % 360)
+            api.reset_aim()
+        except Exception as e:
+            self.last_error = f"could not reset the aim: {e}"
+            return False
+        self.heading_offset = 0.0
+        self._last_sent = None          # the frame changed under the deadband
+        return True
+
     def set_led(self, rgb, blink=None):
         self.rgb = tuple(int(np.clip(c, 0, 255)) for c in rgb)
         self.blink = blink
