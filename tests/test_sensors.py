@@ -197,20 +197,49 @@ def test_the_probe_leaves_streaming_off():
     assert seen[-1] == 0, f"probe left streaming at {seen[-1]}Hz"
 
 
-def test_an_instant_answer_is_a_cache_not_a_sensor():
+def test_a_value_that_moves_once_per_call_is_fabricated():
     """From a real probe: gyro samples at 596kHz while a drive write took 230ms.
 
-    Nothing reached the robot. The verdict recommended integrating those "live
-    gyro rates", which would have fed an estimator a number that never came
-    from the ball — the worst kind of wrong, because it is smooth and
-    plausible and completely unrelated to reality.
+    The original reading of that was "instant means cached means fake", and it
+    is half right. Instant means LOCAL, which on this library is normal and
+    good — every `get_*` is served from a cache its own streaming handler
+    refreshes, so a healthy sensor answers in 0.0ms and costs no airtime.
+
+    What is actually damning is a value that moves once per CALL rather than
+    once per tick, because nothing on a robot works that way. This fake does:
+    `_tick()` increments on being looked at. So it is still camera-only, and
+    now for a reason that does not also condemn the working case.
     """
-    api = FakeApi()                 # answers instantly, in-process
+    api = FakeApi()                 # answers instantly, and counts per call
     r = probe_reads(api, samples=6, sleep=0)
     assert r["get_gyroscope"]["cached"], r["get_gyroscope"]
+    assert r["get_gyroscope"]["fabricated"], r["get_gyroscope"]
+    assert not r["get_gyroscope"]["usable"]
     v = probe(api, rates=(0,), **FAST)["verdict"]
     assert v["branch"] == "camera-only", v
-    assert "local cache" in v["why"]
+    assert "made up locally" in v["why"]
+
+
+def test_a_cache_a_stream_keeps_refreshing_is_usable():
+    """The case the old rule threw away, and the reason this ball has a gyro.
+
+    Local, instant, free to read — and moving with the clock rather than with
+    the read, which is exactly what a streaming notification looks like from
+    the outside.
+    """
+    import time
+
+    class Streamed(FakeApi):
+        """A cache refreshed at 20Hz by something that is not this thread."""
+
+        def get_gyroscope(self):
+            return {"x": 0.0, "y": 0.0, "z": float(int(time.time() * 20))}
+
+    r = probe_reads(Streamed(), samples=12, sleep=0.02)["get_gyroscope"]
+    assert r["cached"], "reading a local cache is instant, and that is fine"
+    assert r["changing"] and not r["fabricated"]
+    assert r["refresh_hz"] >= 4.0, r
+    assert r["usable"], r
 
 
 def test_a_sensor_that_takes_radio_time_is_believed():

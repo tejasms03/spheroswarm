@@ -33,6 +33,11 @@ READS = ("get_heading", "get_orientation", "get_gyroscope", "get_acceleration",
 LOCAL_CACHE_MS = 1.5
 SAMPLES = 25
 DRIVE_SAMPLES = 20
+# A tight burst with no delay between reads, used to tell a cache that is being
+# REFRESHED from one that is being FABRICATED. See `probe_reads`.
+BURST = 12
+PER_CALL_CHANGE = 0.9       # above this, the value moves per call, not per tick
+MIN_REFRESH_HZ = 4.0        # below this there is nothing to integrate
 
 
 def _finite(value):
@@ -83,6 +88,14 @@ def probe_reads(api, samples=SAMPLES, sleep=0.02):
             out[name] = {"available": False, "error": error}
             continue
         distinct = len({repr(v) for v in values})
+        # How often the value MOVED, per second of wall clock. This is the
+        # number that matters for integrating between camera fixes, and it is
+        # not the read rate: a cache read at 600kHz that a notification
+        # refreshes ten times a second carries ten samples a second of
+        # information and 599,990 repeats.
+        moved = sum(1 for a, b in zip(values, values[1:]) if repr(a) != repr(b))
+        span = sum(times) + (sleep * max(len(times) - 1, 0))
+        refresh_hz = round(moved / span, 1) if span > 0 else None
         # A read that comes back faster than the radio can possibly answer is
         # not a read. This toy returned gyroscope samples in 0.0ms — nominally
         # 596kHz — while a drive command to the same robot took 230ms, and the
@@ -90,6 +103,37 @@ def probe_reads(api, samples=SAMPLES, sleep=0.02):
         # They were a cached struct being handed back locally.
         mean_ms = statistics.mean(times) * 1000 if times else None
         cached = bool(mean_ms is not None and mean_ms < LOCAL_CACHE_MS)
+
+        # An instant answer is a local read. That is all it is, and treating it
+        # as disqualifying on its own was wrong in a way this project nearly
+        # shipped: `spherov2` serves every `get_*` from a cache that its own
+        # background streaming handler refreshes, so a healthy gyro on a
+        # working link answers in 0.0ms BY DESIGN, and reading it costs no
+        # airtime at all, which is the best outcome available rather than the
+        # worst.
+        #
+        # What the check was really reaching for is a value that never came
+        # from the ball, and that has a signature: it moves once per CALL
+        # rather than once per tick. So ask twice. A burst with no delay pins
+        # anything that increments on being looked at; the timed pass above
+        # pins anything that moves with the clock. A refreshed cache changes in
+        # the second and not in the first, and only a fabricated one does both.
+        per_call = None
+        if cached and distinct > 1:
+            burst = []
+            try:
+                for _ in range(BURST):
+                    burst.append(repr(fn()))
+            except Exception:
+                burst = []
+            if len(burst) > 1:
+                per_call = round(sum(1 for a, b in zip(burst, burst[1:])
+                                     if a != b) / (len(burst) - 1), 2)
+        fabricated = bool(per_call is not None and per_call >= PER_CALL_CHANGE)
+        usable = bool(times and error is None and distinct > 1
+                      and not fabricated
+                      and (not cached
+                           or (refresh_hz or 0) >= MIN_REFRESH_HZ))
         out[name] = {
             "available": bool(times) and error is None,
             "reads": len(times),
@@ -104,6 +148,12 @@ def probe_reads(api, samples=SAMPLES, sleep=0.02):
             # One value for twenty-five reads means it is not really reading.
             "changing": distinct > 1,
             "cached": cached,
+            "refresh_hz": refresh_hz,
+            "per_call_change": per_call,
+            "fabricated": fabricated,
+            # The one field a caller should branch on. Everything above it is
+            # the evidence; this is the finding.
+            "usable": usable,
             "sample": values[-1] if values else None,
             "error": error,
         }
@@ -216,17 +266,33 @@ def set_streaming(api, hz):
 
 def probe(api, rates=(0, 10, 20), samples=SAMPLES, sleep=0.02,
           drive_samples=DRIVE_SAMPLES):
-    """The whole §0 report: what answers, how fast, and what streaming costs."""
+    """The whole §0 report: what answers, how fast, and what streaming costs.
+
+    The sensors are read at EVERY streaming rate, not just once at the start,
+    and that is not thoroughness for its own sake. `spherov2`'s `get_*` calls
+    do not ask the robot anything — they hand back the last value a streaming
+    notification left in a local cache. Asked with streaming off, every one of
+    them therefore answers instantly with a number that never changes, which is
+    precisely the signature `probe_reads` reports as `cached`.
+
+    So a single pass taken before streaming was ever enabled can only ever
+    conclude "camera-only", on any toy, however good its gyro. That is what
+    this used to do, and the verdict it produced was an artifact of the
+    question rather than a fact about the hardware.
+    """
     report = {"reads": probe_reads(api, samples=samples, sleep=sleep),
               "streaming": {}}
 
     for hz in rates:
         entry = {}
-        if hz:
-            entry["enable"] = set_streaming(api, hz)
-        else:
-            entry["enable"] = set_streaming(api, 0)
+        entry["enable"] = set_streaming(api, hz if hz else 0)
         entry["drive"] = probe_drive_cost(api, samples=drive_samples)
+        if hz and entry["enable"].get("ok"):
+            # Half the samples: this pass happens once per rate, and the point
+            # of it is whether the numbers MOVE, which a shorter run answers
+            # just as well as a long one.
+            entry["reads"] = probe_reads(api, samples=max(samples // 2, 4),
+                                         sleep=sleep)
         report["streaming"][str(hz)] = entry
     set_streaming(api, 0)
 
@@ -243,10 +309,26 @@ def verdict(report):
     than a tuning pass.
     """
     reads = report.get("reads", {})
+    streaming = report.get("streaming", {})
+
+    def live(rds, name):
+        r = (rds or {}).get(name) or {}
+        return bool(r.get("usable"))
+
     def works(name):
-        r = reads.get(name) or {}
-        return bool(r.get("available") and r.get("changing")
-                    and not r.get("cached"))
+        """Live in ANY pass — with streaming off, or at a rate that enabled.
+
+        Any pass rather than the first one, because the first one is taken with
+        streaming off and a cached getter cannot answer then. Which pass it was
+        is reported, since "works, but only while streaming at 20Hz" is a
+        different engineering position from "works".
+        """
+        if live(reads, name):
+            return "off"
+        for hz, entry in streaming.items():
+            if hz != "0" and live(entry.get("reads"), name):
+                return f"{hz}Hz"
+        return None
 
     base = (report.get("streaming", {}).get("0", {}).get("drive") or {})
     base_ms = base.get("ms_mean")
@@ -260,19 +342,44 @@ def verdict(report):
         return {"branch": "camera-only",
                 "why": f"streaming makes drive commands {cost:.1f}x slower — "
                        "bandwidth is the binding constraint and this spends it"}
-    if works("get_gyroscope"):
-        return {"branch": "full",
-                "why": "gyro rates are live; integrate them between camera fixes"}
-    if works("get_heading"):
-        return {"branch": "heading-only",
+    at = works("get_gyroscope")
+    if at:
+        return {"branch": "full", "streaming": at,
+                "why": "gyro rates are live; integrate them between camera fixes"
+                       + ("" if at == "off" else
+                          f" — but only with streaming on at {at}, which has to "
+                          "stay on for the whole session")}
+    at = works("get_heading")
+    if at:
+        return {"branch": "heading-only", "streaming": at,
                 "why": "no usable gyro, but get_heading changes — integrate its "
-                       "deltas instead. Same architecture, slightly noisier"}
-    if any((reads.get(n) or {}).get("cached") for n in READS):
+                       "deltas instead. Same architecture, slightly noisier"
+                       + ("" if at == "off" else f" (needs streaming at {at})")}
+    # Nothing answered in any pass. If streaming never even turned on, that is
+    # the finding — not "this toy has no sensors", which is what it looks like.
+    failed = [f"{hz}Hz: {(e.get('enable') or {}).get('error')}"
+              for hz, e in streaming.items()
+              if hz != "0" and not (e.get("enable") or {}).get("ok")]
+    if failed and len(failed) == max(len(streaming) - 1, 0):
         return {"branch": "camera-only",
-                "why": "the sensor calls answer instantly, which means they are "
-                       "returning a local cache rather than asking the robot. "
-                       "Predict from the commanded heading and let the camera "
-                       "correct it"}
+                "why": "streaming would not turn on at any rate, so the sensor "
+                       f"getters have nothing to cache — {failed[0]}"}
+    if any((reads.get(n) or {}).get("fabricated") for n in READS):
+        return {"branch": "camera-only",
+                "why": "the sensor calls change on every call rather than with "
+                       "the clock, so the numbers are being made up locally "
+                       "and never came from the ball. Predict from the "
+                       "commanded heading and let the camera correct it"}
+    slow = [n for n in READS
+            if (reads.get(n) or {}).get("changing")
+            and not (reads.get(n) or {}).get("usable")
+            and (reads.get(n) or {}).get("cached")]
+    if slow:
+        hz = (reads.get(slow[0]) or {}).get("refresh_hz")
+        return {"branch": "camera-only",
+                "why": f"the sensor cache refreshes at only {hz}Hz — too slow "
+                       "to integrate between camera fixes. Predict from the "
+                       "commanded heading and let the camera correct it"}
     return {"branch": "camera-only",
             "why": "nothing on this toy reports orientation, so predict from "
                    "the commanded heading and let the camera correct it"}
