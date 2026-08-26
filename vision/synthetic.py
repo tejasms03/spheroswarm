@@ -74,6 +74,26 @@ class SyntheticSource:
 
 
 class CameraSource:
+    # What a lit Sphero needs from a camera, and why. Autofocus hunts on a
+    # scene that is mostly dark floor, and every hunt is a frame or two of
+    # blur — which turns two LEDs a few pixels apart into one smear. Auto
+    # exposure is worse: it meters the whole frame, sees mostly black, and
+    # opens up until the ball's shell blows out to white, which has no hue for
+    # the detector to key on and no separable peaks for a heading.
+    WANTED = {
+        "autofocus": (cv2.CAP_PROP_AUTOFOCUS, 0),
+        "auto_exposure": (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25),
+    }
+
+    PROPS = {
+        "focus": cv2.CAP_PROP_FOCUS,
+        "exposure": cv2.CAP_PROP_EXPOSURE,
+        "gain": cv2.CAP_PROP_GAIN,
+        "brightness": cv2.CAP_PROP_BRIGHTNESS,
+        "autofocus": cv2.CAP_PROP_AUTOFOCUS,
+        "auto_exposure": cv2.CAP_PROP_AUTO_EXPOSURE,
+    }
+
     def __init__(self, index=0, size=(1280, 720)):
         self.cap = cv2.VideoCapture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
@@ -82,6 +102,67 @@ class CameraSource:
             raise RuntimeError(
                 f"camera {index} would not open. On macOS, grant camera access "
                 "to your terminal in System Settings > Privacy & Security.")
+        self.wanted_size = tuple(size)
+
+    @property
+    def size(self):
+        """What the camera is ACTUALLY delivering, not what it was asked for.
+
+        A webcam offered a mode it does not have picks its nearest and reports
+        success, so asking for 1080p is not the same as getting it. Reading it
+        back is the only way to know, and the difference is the difference
+        between two resolvable LEDs and one smear.
+        """
+        return (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+    # -- manual control --------------------------------------------------
+    #
+    # There is deliberately no `capabilities()` here. A previous version probed
+    # each control by WRITING to it and restoring only those that reported a
+    # change, which is not a safe way to ask a camera what it can do — it left
+    # a camera in a state nothing on the bench could get it out of, and the
+    # whole probe was reverted. Every write below happens because a person
+    # moved a control, never to find out what a control does.
+
+    def get(self, name):
+        prop = self.PROPS.get(name)
+        if prop is None:
+            return None
+        try:
+            v = float(self.cap.get(prop))
+        except Exception:
+            return None
+        return None if v in (-1.0,) else v
+
+    def set(self, name, value):
+        """Ask for a setting and report what actually took.
+
+        Cameras accept a `set` and ignore it constantly — the macOS
+        AVFoundation backend in particular reports success for properties it
+        does not implement. Reading the value back is the only way to know, and
+        a control that silently does nothing is worse than one that is absent,
+        because a person will keep turning it.
+        """
+        prop = self.PROPS.get(name)
+        if prop is None:
+            return None
+        try:
+            self.cap.set(prop, float(value))
+        except Exception:
+            return None
+        return self.get(name)
+
+    def manual(self):
+        """Turn off the automatics that blur and blow out a lit ball."""
+        out = {}
+        for name, (prop, value) in self.WANTED.items():
+            try:
+                self.cap.set(prop, value)
+            except Exception:
+                pass
+            out[name] = self.get(name)
+        return out
 
     def read(self):
         return self.cap.read()
@@ -106,9 +187,16 @@ class VideoSource:
         self.cap.release()
 
 
-def open_source(spec):
+def open_source(spec, size=None):
+    """`size` is a request, not a promise — see `CameraSource.size`.
+
+    Only a camera index can honour it; the synthetic source renders what it
+    renders and a video file is whatever was recorded, so passing a size for
+    either is silently ignored rather than raising. That keeps one call site
+    able to open any of the three.
+    """
     if spec == "synthetic":
         return SyntheticSource()
     if str(spec).isdigit():
-        return CameraSource(int(spec))
+        return CameraSource(int(spec), size=size) if size else CameraSource(int(spec))
     return VideoSource(spec)
