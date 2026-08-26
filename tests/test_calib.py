@@ -7,6 +7,7 @@ synthetic and cannot be checked at all when it is a photograph.
 """
 
 import json
+import math
 import time
 import pathlib
 
@@ -1946,3 +1947,236 @@ def test_the_drive_message_names_the_knobs_that_are_in_force(bench):
     said = " ".join(t for _, t in bench.log)
     assert "lookahead" in said
     assert "kp " not in said, "the corridor controller has no proportional gain"
+
+
+# -- the COLOUR tab's light clustering ------------------------------------
+
+def _lit_ball(frame, centre, heading_deg, main=(60, 255, 90),
+              tail=(255, 90, 40), span=26):
+    """Three lights along one axis, drawn into an existing frame."""
+    import cv2
+    c = np.array(centre, dtype=float)
+    r = math.radians(heading_deg)
+    d = np.array([math.cos(r), math.sin(r)]) * span / 2.0
+    cv2.circle(frame, tuple((c + d).astype(int)), 8, main, -1)
+    cv2.circle(frame, tuple(c.astype(int)), 4, main, -1)
+    cv2.circle(frame, tuple((c - d).astype(int)), 6, tail, -1)
+    return cv2.GaussianBlur(frame, (11, 11), 0)
+
+
+def test_the_colour_tab_offers_three_views_and_keeps_the_camera_constant(bench):
+    """The tagged camera view is what you want in front of you the whole time.
+    A view you have to switch back to is one you will forget to."""
+    bench.set_tab("colour")()
+    labels = {b.label for b in bench.buttons}
+    assert {"bright", "mask", "blur"} <= labels
+    for view in ("mask", "blur", "bright"):
+        bench.set_colour_view(view)()
+        assert bench.colour_view == view
+        render(bench)                      # each must draw without raising
+
+
+def test_the_view_selection_survives_a_resize(bench):
+    """It is set in the constructor, not on the resize path — putting it there
+    reset the selection and both knobs every time the window moved."""
+    bench.set_tab("colour")()
+    bench.set_colour_view("blur")()
+    bench.light_min_v = 173
+    bench.apply_size(1400, 900)
+    assert bench.colour_view == "blur"
+    assert bench.light_min_v == 173
+
+
+def test_a_lit_ball_is_clustered_named_and_aimed(bench, monkeypatch):
+    """Brightness finds it, colour only says which robot it is — the reverse
+    of `vision/track.py`, where detection is per-colour by construction."""
+    import cv2
+
+    frame = _lit_ball(np.zeros((480, 640, 3), np.uint8), (320, 240), 137.0)
+    monkeypatch.setattr(bench.tracker, "latest", lambda: (frame, {}))
+    bench.light_min_v = 140
+    det = bench.detector
+    # One slot near the ball and every other slot far from it. The live
+    # palette has yellow at 45 and green at 68, so a ball reading ~50 is
+    # contested between them and correctly refuses a tag — which is a real
+    # property of that palette and not what this test is about.
+    for name, spec in det.colors.items():
+        spec["hue"], spec["tol"] = 160, 8
+    det.colors[bench.sig_color] = {"hue": 55, "tol": 14, "s_min": 90,
+                                   "v_min": 70, "min_area": 10,
+                                   "max_area": 20000}
+    bench.lights_stamp = None
+
+    got = bench.light_readings()
+    aimed = [r for r in got if r["deg"] is not None]
+    assert aimed, [r["why"] for r in got]
+    r = aimed[0]
+    assert abs((r["deg"] - 137 + 180) % 360 - 180) < 6, r["deg"]
+    # Two or three: at this spacing and blur the middle light merges into the
+    # main one, which is what a real shell does too. The heading comes off the
+    # two ENDS of the axis, so it does not depend on the middle surviving.
+    assert 2 <= len(r["group"]) <= 3
+
+
+def test_the_label_is_the_robot_code_not_the_colour_slot(bench, monkeypatch):
+    """A person recognises SSMK. Making them translate 'green' into a robot is
+    work the bench can do itself."""
+    frame = _lit_ball(np.zeros((480, 640, 3), np.uint8), (320, 240), 90.0)
+    monkeypatch.setattr(bench.tracker, "latest", lambda: (frame, {}))
+    bench.light_min_v = 140
+    entry = bench.roster.enabled_entries()[0]
+    det = bench.detector
+    det.colors[entry.color] = {"hue": 60, "tol": 14, "s_min": 90, "v_min": 70,
+                               "min_area": 10, "max_area": 20000}
+    # every other slot far away, so the tag is not contested
+    for name, spec in det.colors.items():
+        if name != entry.color:
+            spec["hue"] = 160
+    bench.lights_stamp = None
+
+    named = [r for r in bench.light_readings() if r["code"]]
+    assert named, [r.get("tag_why") for r in bench.light_readings()]
+    assert named[0]["code"] == entry.code
+
+
+def test_the_reading_is_computed_once_per_frame(bench, monkeypatch):
+    """The render loop asks while drawing and the camera is far slower, so a
+    recompute per draw would be several full passes a frame for one answer."""
+    frame = _lit_ball(np.zeros((480, 640, 3), np.uint8), (320, 240), 45.0)
+    monkeypatch.setattr(bench.tracker, "latest", lambda: (frame, {}))
+    bench.lights_stamp = None
+
+    calls = []
+    import calib as calib_mod
+    real = calib_mod.lights_px
+    monkeypatch.setattr(calib_mod, "lights_px",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    for _ in range(5):
+        bench.light_readings()
+    assert len(calls) == 1, f"ran {len(calls)} times for one frame"
+
+
+def test_the_light_knobs_never_reach_the_colour_calibration(bench, monkeypatch):
+    """They decide what counts as a light, not what a colour looks like. A
+    signature file that grew them would change what the tracker does."""
+    import vision.config as vc
+
+    monkeypatch.setattr(vc, "save_signatures",
+                        lambda *a, **k: pytest.fail("wrote a signature file"))
+    bench.set_tab("colour")()
+    bench.light_min_v = 210
+    bench.ball_span_px = 44
+    render(bench)
+    for spec in (bench.detector.colors.values() if bench.detector else ()):
+        assert "light_min_v" not in spec and "ball_span_px" not in spec
+
+
+def test_the_arrow_is_drawn_along_its_own_lights_not_at_an_angle_to_them(bench):
+    """A perspective warp does not preserve angles. The brightness pane maps
+    the lights through the homography, so drawing the raw IMAGE angle over
+    them puts the arrow at an angle to its own dots — which is what a real
+    ball looked like on screen. `facing_cm` already states the rule: as two
+    POINTS, never as an angle.
+    """
+    drawn = []
+    bench.set_tab("colour")()
+
+    def fake_line(surface, colour, a, b, width=1):
+        drawn.append((a, b))
+
+    # A homography that rotates hard, so an unmapped angle cannot accidentally
+    # agree with the mapped one.
+    from vision.homography import Homography
+    H = Homography()
+    H.set_rect([(100, 300), (300, 100), (500, 300), (300, 500)], 100.0, 100.0)
+    bench._H = H
+
+    reading = {
+        "group": [], "why": None, "deg": 0.0, "conf": 1.0,
+        "centre": (300.0, 300.0), "span_px": 40.0, "colour": None,
+        "code": None, "tag_why": None,
+        "front": {"x": 320.0, "y": 300.0, "core_px": 4.0},
+        "back": {"x": 280.0, "y": 300.0, "core_px": 4.0},
+    }
+    bench.light_readings = lambda: [reading]
+
+    m = 2.0
+    origin = (0, 0)
+
+    def px_of(p):
+        cm = np.asarray(H.to_cm([list(p)])).ravel()[:2]
+        return (origin[0] + float(cm[0]) * m, origin[1] + float(cm[1]) * m)
+
+    import pygame as pg
+    real = pg.draw.line
+    pg.draw.line = fake_line
+    try:
+        bench.draw_light_overlay(origin, m, px_of=px_of)
+    finally:
+        pg.draw.line = real
+
+    assert drawn, "no arrow was drawn"
+    shaft_a, shaft_b = drawn[0]
+    arrow = math.degrees(math.atan2(shaft_b[1] - shaft_a[1],
+                                    shaft_b[0] - shaft_a[0])) % 360.0
+    pf, pb = px_of((320.0, 300.0)), px_of((280.0, 300.0))
+    lights = math.degrees(math.atan2(pf[1] - pb[1], pf[0] - pb[0])) % 360.0
+    assert abs((arrow - lights + 180) % 360 - 180) < 1.0, (
+        f"arrow at {arrow:.1f} but its lights lie along {lights:.1f}")
+    # ...and that this actually differs from the unmapped image angle, so the
+    # test would have failed against the old code.
+    assert abs((lights - reading["deg"] + 180) % 360 - 180) > 5.0
+
+
+def test_defocus_steadies_the_colour_without_moving_the_lights(bench, monkeypatch):
+    """Blur helps a colour and hurts a geometry, so the two are read from
+    different images rather than one compromise between them."""
+    frame = _lit_ball(np.zeros((480, 640, 3), np.uint8), (320, 240), 137.0,
+                      main=(40, 40, 255), tail=(255, 90, 40), span=26)
+    monkeypatch.setattr(bench.tracker, "latest", lambda: (frame, {}))
+    bench.light_min_v = 140
+    det = bench.detector
+    for spec in det.colors.values():
+        spec["hue"], spec["tol"] = 100, 8
+    det.colors[bench.sig_color] = {"hue": 0, "tol": 14, "s_min": 90,
+                                   "v_min": 70, "min_area": 10,
+                                   "max_area": 20000}
+
+    seen = []
+    for blur in (1, 9, 21):
+        bench.tag_blur = blur
+        bench.lights_stamp = None
+        aimed = [r for r in bench.light_readings() if r["deg"] is not None]
+        assert aimed, f"defocus {blur} lost the ball"
+        seen.append(aimed[0]["deg"])
+    assert max(seen) - min(seen) < 0.5, (
+        f"defocus moved the heading: {seen} — positions must come from the "
+        "frame as delivered")
+
+
+def test_the_blur_view_shows_what_the_tagger_actually_samples(bench):
+    """A blur view showing a different image than the tagger reads would be a
+    picture of something nobody is measuring."""
+    import cv2
+
+    frame = np.zeros((480, 640, 3), np.uint8)
+    cv2.circle(frame, (320, 240), 12, (40, 40, 255), -1)
+    bench.tag_blur = 15
+    a = bench.tag_frame(frame)
+    b = cv2.GaussianBlur(frame, (15, 15), 0)
+    assert np.array_equal(a, b)
+    bench.tag_blur = 1
+    assert bench.tag_frame(frame) is frame, "1 means off, not a 1px kernel"
+
+
+def test_defocus_never_reaches_the_colour_calibration(bench, monkeypatch):
+    """It is a lens-substitute for reading hue, not part of a signature."""
+    import vision.config as vc
+
+    monkeypatch.setattr(vc, "save_signatures",
+                        lambda *a, **k: pytest.fail("wrote a signature file"))
+    bench.set_tab("colour")()
+    bench.tag_blur = 17
+    render(bench)
+    for spec in (bench.detector.colors.values() if bench.detector else ()):
+        assert "tag_blur" not in spec

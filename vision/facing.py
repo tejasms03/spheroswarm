@@ -170,6 +170,13 @@ def explain_cm(frame, centre_px, radius_px, homography, floor=PEAK_FLOOR):
 
 LIGHT_MIN_V = 200           # a lit LED against a dark floor, not a bright floor
 ANNULUS = (1.1, 2.4)        # radii, in units of the core's own radius
+# The outer radius above is a multiple of the core, and a multiple of the core
+# is not where the light ends. Measured on a bloomed LED, the coloured halo
+# runs out at about 1.3x the outer radius that rule picks, so the far half of
+# the ring lands on floor — dark pixels whose hue is noise. Keep only ring
+# pixels still carrying a real fraction of this light's own peak.
+RING_V_FRAC = 0.15
+RING_MIN_PX = 8             # below this, the clip has taken too much
 BALL_SPAN_FRAC = 1.0        # lights further apart than a ball are not one ball
 # How collinear three lights must be to be three lights on one shell. Measured
 # rather than guessed: a real arrangement with a couple of pixels of noise
@@ -177,10 +184,24 @@ BALL_SPAN_FRAC = 1.0        # lights further apart than a ball are not one ball
 # first value tried here was 0.35, which accepted the triangle — it sat below
 # the whole range instead of inside the gap.
 STRAIGHT_MIN = 0.75
+# How much the two ends must differ before "which is the front" is an answer
+# rather than a coin toss. Both LEDs clip to 255 on a bright frame, so the
+# brightness fallback can find NO difference at all — and it was then picking
+# whichever end came first along the axis and reporting it with confidence
+# zero. A heading 180 degrees out is worse than no heading, so this refuses.
+MIN_END_CERTAINTY = 0.04
 
 
-def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000):
+def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000,
+              colour_frame=None):
     """Every bright spot in the frame, with the colour in the ring around it.
+
+    `colour_frame` samples the COLOUR from a different image than the one the
+    positions came from — pass a defocused copy and the halo spreads, which
+    averages down sensor noise and gives a steadier hue, while the positions
+    stay as sharp as the sensor delivered them. Blur helps a colour and hurts a
+    geometry, so the two are read from different images rather than one
+    compromise between them. It must be the same size as `frame`.
 
     The core of a lit LED is blown out and has no hue left — that is what
     `vision/detect.py` already knows about lit shells, and it is more true of a
@@ -192,14 +213,42 @@ def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000):
     """
     import cv2
 
+    # One conversion, used twice. V is the channel that saturates, so it is
+    # both the right thing to threshold on and the right thing to call
+    # brightness — and converting the frame a second time to get it back is a
+    # full-resolution pass for nothing, which at 1080p is most of the budget.
+    if colour_frame is None:
+        colour_frame = frame
+    elif colour_frame.shape[:2] != frame.shape[:2]:
+        colour_frame = frame
+    hsv = (cv2.cvtColor(colour_frame, cv2.COLOR_BGR2HSV)
+           if frame.ndim == 3 else None)
+    # Positions and the threshold come from the frame as delivered; only the
+    # ring sample below reads `hsv`, which may be the defocused copy.
     grey = (cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
             if frame.ndim == 3 else frame.astype(np.uint8))
     n, labels, stats, cents = cv2.connectedComponentsWithStats(
         (grey >= min_v).astype(np.uint8), connectivity=8)
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if frame.ndim == 3 else None
-    h, w = grey.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w]
+    # How far each light is from its nearest neighbour, before any sampling.
+    # The lights on one shell are CLOSE — about 13px apart on this arena — and
+    # an annulus of 1.1 to 2.4 core radii around a 7px core reaches 17px, which
+    # lands squarely on the light next door. Sampling a neighbour's colour and
+    # calling it your own reverses front and back whenever the tail is the one
+    # that got read, which is a heading exactly 180 degrees wrong.
+    keep = [i for i in range(1, n)
+            if min_area <= float(stats[i, 4]) <= max_area]
+    spots = np.array([[float(cents[i][0]), float(cents[i][1])] for i in keep]) \
+        if keep else np.zeros((0, 2))
+    gap = {}
+    for k, i in enumerate(keep):
+        if len(spots) < 2:
+            gap[i] = float("inf")
+            continue
+        d = np.linalg.norm(spots - spots[k], axis=1)
+        d[k] = np.inf
+        gap[i] = float(d.min())
+    fh, fw = grey.shape[:2]
     out = []
     for i in range(1, n):
         area = float(stats[i, 4])
@@ -207,27 +256,63 @@ def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000):
             continue
         cx, cy = float(cents[i][0]), float(cents[i][1])
         core = math.sqrt(area / math.pi)
-        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
-        ring = ((d2 >= (ANNULUS[0] * core) ** 2)
-                & (d2 <= (ANNULUS[1] * core) ** 2))
+
+        # Everything below works in a window around the light rather than over
+        # the frame. The obvious version — a full-frame coordinate grid and a
+        # full-frame `labels == i` — is correct and unusable: at 1080p that is
+        # four 2-megapixel arrays PER LIGHT, so a five-light frame does tens of
+        # millions of element-ops before anything is drawn. It is invisible in
+        # a 640x480 test and it will not hold 30fps in the bench.
+        bx, by = int(stats[i, 0]), int(stats[i, 1])
+        bw, bh = int(stats[i, 2]), int(stats[i, 3])
+        box = labels[by:by + bh, bx:bx + bw] == i
         light = {
             "x": cx, "y": cy, "area": area, "core_px": core,
-            "peak": float(grey[labels == i].max()),
+            "peak": float(grey[by:by + bh, bx:bx + bw][box].max()),
             "bgr": None, "hue": None, "sat": None,
         }
-        if frame.ndim == 3 and ring.any():
-            px = frame[ring]
+
+        # Never sample past halfway to the next light. Half the gap is the
+        # furthest a ring can reach and still be unambiguously this light's
+        # own, and it is a bound rather than a tuning knob for that reason.
+        r_out = min(ANNULUS[1] * core, 0.5 * gap.get(i, float("inf")))
+        r_in = min(ANNULUS[0] * core, r_out * 0.7)
+        x0, x1 = max(0, int(cx - r_out) - 1), min(fw, int(cx + r_out) + 2)
+        y0, y1 = max(0, int(cy - r_out) - 1), min(fh, int(cy + r_out) + 2)
+        if frame.ndim != 3 or x1 <= x0 or y1 <= y0:
+            out.append(light)
+            continue
+        # `ogrid` rather than `mgrid`: two 1-D arrays that broadcast, instead of
+        # two 2-D ones materialised in full.
+        wy, wx = np.ogrid[y0:y1, x0:x1]
+        d2 = (wx - cx) ** 2 + (wy - cy) ** 2
+        ring = (d2 >= r_in ** 2) & (d2 <= r_out ** 2)
+        if ring.any():
+            win_hsv = hsv[y0:y1, x0:x1]
+            lit_enough = win_hsv[:, :, 2] >= light["peak"] * RING_V_FRAC
+            clipped = ring & lit_enough
+            # Falling back rather than refusing: on a small or dim light the
+            # clip can take nearly everything, and a rough colour from the
+            # whole ring beats no colour at all — `sat` still reports how much
+            # there was to read, and `identify_cluster` refuses on that.
+            if int(clipped.sum()) >= RING_MIN_PX:
+                ring = clipped
+            light["ring_px"] = int(ring.sum())
+            px = colour_frame[y0:y1, x0:x1][ring]
             light["bgr"] = tuple(float(v) for v in px.mean(axis=0))
-            hp = hsv[ring]
-            # Circular mean of hue, weighted by saturation. A flat average of
-            # OpenCV hue is wrong across the 179/0 seam, which is exactly where
-            # red sits — and red is a colour these balls are often set to.
+            hp = win_hsv[ring]
+            # Circular mean of hue, weighted by SATURATION TIMES VALUE. A flat
+            # average is wrong across the 179/0 seam, which is exactly where red
+            # sits on this bench. Weighting by saturation alone is wrong too:
+            # a dark floor pixel can be fully saturated and its hue is noise,
+            # so brightness has to count as well as colourfulness.
             ang = hp[:, 0].astype(np.float64) * (2 * np.pi / 180.0)
-            wgt = hp[:, 1].astype(np.float64)
+            wgt = (hp[:, 1].astype(np.float64)
+                   * hp[:, 2].astype(np.float64) / 255.0)
             if wgt.sum() > 0:
-                s = float((np.sin(ang) * wgt).sum())
-                c = float((np.cos(ang) * wgt).sum())
-                light["hue"] = float((math.degrees(math.atan2(s, c)) % 360.0) / 2.0)
+                sin_, cos_ = float((np.sin(ang) * wgt).sum()), float((np.cos(ang) * wgt).sum())
+                light["hue"] = float(
+                    (math.degrees(math.atan2(sin_, cos_)) % 360.0) / 2.0)
                 light["sat"] = float(hp[:, 1].mean())
         out.append(light)
     out.sort(key=lambda l: -l["peak"])
@@ -274,7 +359,7 @@ def _axis(points):
     return c, direction, t, straightness
 
 
-def heading_from_lights(group, blue_is_back=True):
+def heading_from_lights(group, blue_is_back=True, signatures=None):
     """Which way a cluster of lights points, and which of them is the front.
 
     Returns `(reading, why)`. The reading carries the heading in IMAGE degrees
@@ -303,26 +388,51 @@ def heading_from_lights(group, blue_is_back=True):
 
     ends = (group[int(np.argmin(t))], group[int(np.argmax(t))])
     blueness = [_blueness(l) for l in ends]
-    by_colour = blue_is_back and max(blueness) > 0.35 and \
+
+    tag, tag_why = (identify_cluster(group, signatures) if signatures
+                    else (None, None))
+    # The tag decides the front only when the light it identified is actually
+    # an END of the axis. A main LED read in the MIDDLE of the cluster names
+    # the robot perfectly well and says nothing about which way it points, and
+    # treating it as the front would put the arrow across the ball instead of
+    # along it.
+    by_tag = tag is not None and any(tag["front"] is e for e in ends)
+    by_colour = (not by_tag) and blue_is_back and max(blueness) > 0.35 and \
         abs(blueness[0] - blueness[1]) > 0.15
-    if by_colour:
+    if by_tag:
+        front = tag["front"]
+        back = ends[1] if front is ends[0] else ends[0]
+    elif by_colour:
         back = ends[0] if blueness[0] > blueness[1] else ends[1]
+        front = ends[1] if back is ends[0] else ends[0]
     else:
         back = ends[0] if ends[0]["peak"] <= ends[1]["peak"] else ends[1]
-    front = ends[1] if back is ends[0] else ends[0]
+        front = ends[1] if back is ends[0] else ends[0]
 
     deg = math.degrees(math.atan2(front["y"] - back["y"],
                                   front["x"] - back["x"])) % 360.0
     # Confidence: how cleanly the two ends separated, and how sure we are which
     # way round they go. A pair that is only just distinguishable front-to-back
     # is a heading that may be 180 degrees out, which is worse than no heading.
-    certainty = (abs(blueness[0] - blueness[1]) if by_colour
-                 else abs(ends[0]["peak"] - ends[1]["peak"]) / 255.0)
+    if by_tag:
+        certainty = tag["conf"]
+    elif by_colour:
+        certainty = abs(blueness[0] - blueness[1])
+    else:
+        certainty = abs(ends[0]["peak"] - ends[1]["peak"]) / 255.0
+    if certainty < MIN_END_CERTAINTY:
+        return None, ("cannot tell the front from the back: no colour tag, "
+                      "neither end is blue, and both are equally bright"
+                      + (f" ({tag_why})" if tag_why else "")
+                      + ". Turn the taillight on, or fix the tag")
     conf = round(float(min(1.0, span / 40.0) * min(1.0, certainty * 3.0)), 3)
     return {"deg": deg, "conf": conf, "front": front, "back": back,
             "centre": (float(centre[0]), float(centre[1])),
             "span_px": span, "straightness": round(straightness, 3),
-            "by_colour": bool(by_colour), "lights": list(group)}, None
+            "by_colour": bool(by_colour), "by_tag": bool(by_tag),
+            "color": tag["color"] if tag else None,
+            "tag_conf": tag["conf"] if tag else None,
+            "tag_why": tag_why, "lights": list(group)}, None
 
 
 def _blueness(light):
@@ -355,3 +465,168 @@ def bearing_cm(a_px, b_px, homography):
     if float(np.linalg.norm(d)) < 1e-9:
         return None
     return float(math.degrees(math.atan2(d[0], d[1])) % 360.0)
+
+
+# -- naming a cluster from the colour of its own lights -------------------
+
+MIN_TAG_SAT = 40.0          # below this the annulus hue is noise, not a colour
+# The runner-up slot must be this many hue units further away than the winner.
+# ABSOLUTE rather than proportional, and the difference matters: a ratio rule
+# accepts 2-away over 4-away, because 4 is twice 2 — but the gap is two units,
+# and hue noise is a few units whatever the distances are. Measured on the
+# yellow-60/cyan-62 pair this bench actually shipped, a proportional rule named
+# hue 58 "yellow" and hue 64 "cyan", so a ball sitting still and wobbling by
+# four would change its own name.
+TAG_GAP = 8.0
+
+
+def hue_err(a, b):
+    """Distance between two OpenCV hues (0-179), the short way round.
+
+    A subtraction is wrong here and wrong in a way that hides: red currently
+    sits at hue 172 on this bench, five units from the seam, so `abs(172 - 2)`
+    says 170 when the true distance is 10. That is a colour the roster is
+    actually using, so the naive version fails on the live calibration rather
+    than on some hypothetical one.
+    """
+    d = abs(float(a) - float(b)) % 180.0
+    return min(d, 180.0 - d)
+
+
+def identify_cluster(group, signatures, min_sat=MIN_TAG_SAT):
+    """Which colour slot this cluster is wearing, and which light is the front.
+
+    Colour is used for identity here, not for detection — the lights were
+    already found without it. That is the whole point of the arrangement: hue
+    has to survive a blown-out core to find a robot, but only has to be roughly
+    right to name one you have already located.
+
+    Returns `(reading, why)`. The reading names a colour SLOT, not a robot —
+    the roster owns the slot-to-code mapping and this layer has no business
+    knowing about it.
+    """
+    if not signatures:
+        return None, "no colour signatures to match against"
+
+    # The tail first, so it cannot be mistaken for an identity. It is blue on
+    # every toy that has one, and blue is also a slot a robot can be wearing —
+    # which is the one genuine ambiguity here and is reported rather than
+    # guessed at.
+    blues = sorted(group, key=lambda l: -_blueness(l))
+    tail = blues[0] if _blueness(blues[0]) > 0.35 else None
+
+    # Readability is judged among the lights that could BE the identity, not
+    # across the whole cluster. Checking the cluster lets a perfectly readable
+    # taillight vouch for a main LED that has blown out to white, and the
+    # refusal then blames hue matching for a exposure problem — which is the
+    # wrong knob, and this bench exists to name the right one.
+    candidates = [l for l in group if l is not tail]
+    lit = [l for l in candidates if l.get("hue") is not None
+           and (l.get("sat") or 0.0) >= min_sat]
+    if not lit:
+        best_sat = max((l.get("sat") or 0.0) for l in candidates) if candidates else 0.0
+        return None, (f"no light has a readable colour — best saturation "
+                      f"{best_sat:.0f}, need {min_sat:.0f}. The LEDs are "
+                      "blowing out: dim them, or shorten the exposure")
+
+    best, contested, nearest = None, None, None
+    for light in lit:
+        ranked = sorted(((hue_err(light["hue"], spec.get("hue", 0)), name)
+                         for name, spec in signatures.items()),
+                        key=lambda t: t[0])
+        if not ranked:
+            continue
+        err, name = ranked[0]
+        if nearest is None or err < nearest[0]:
+            nearest = (err, name, light["hue"])
+        tol = float(signatures[name].get("tol", 10))
+        if err > tol:
+            continue
+        runner_err, runner_name = (ranked[1] if len(ranked) > 1
+                                   else (180.0, None))
+        # A match that is barely closer than the next slot is not a match.
+        # Picking whichever won by a hair is how a robot gets called by its
+        # neighbour's name every few frames.
+        if runner_err - err < TAG_GAP:
+            if contested is None or err < contested[1]:
+                contested = (name, err, runner_name, runner_err, light["hue"])
+            continue
+        score = (1.0 - err / max(tol, 1e-6)) * min(1.0, light["peak"] / 255.0)
+        if best is None or score > best[0]:
+            best = (score, name, light, err)
+
+    if best is None and contested is not None:
+        # Name the two slots and the gap, rather than saying "no match". The
+        # fix for a contested hue is a better-separated palette, and that is
+        # only obvious if the message says which pair is fighting.
+        name, err, runner_name, runner_err, hue = contested
+        apart = hue_err(signatures[name].get("hue", 0),
+                        signatures[runner_name].get("hue", 0))
+        return None, (f"reads hue {hue:.0f}: {name} is {err:.0f} away and "
+                      f"{runner_name} is {runner_err:.0f} — too close to call. "
+                      f"Those two slots are {apart:.0f} apart and want "
+                      f"{TAG_GAP:.0f}+. Run `optimise hues`")
+    if best is None:
+        near = (f" (nearest is {nearest[1]}, {nearest[0]:.0f} away, "
+                f"outside its tolerance)" if nearest else "")
+        return None, ("no light matches a known colour within its tolerance"
+                      + near + " — tune the signature, or this is not an "
+                      "enrolled robot")
+
+    score, name, front, err = best
+    if tail is not None and name == "blue":
+        return None, ("this cluster reads BLUE and so does its taillight — "
+                      "which end is the front cannot be told apart. Give this "
+                      "robot another colour, or turn the taillight off")
+    return {"color": name, "front": front, "back": tail,
+            "hue_err": round(err, 1), "conf": round(float(score), 3)}, None
+
+
+def radial_profile(frame, centre_px, max_r, step=1.0):
+    """Value and saturation against radius, for one light.
+
+    The instrument for choosing `ANNULUS`. Those radii are currently a guess —
+    1.1 to 2.4 times the core — and the right values depend on the lens, the
+    exposure and how hard the LED is driven, none of which this module can
+    know. Rather than defend the guess, this lets a person look at where the
+    colour actually lives on their own camera: the white core is where `sat`
+    collapses, the halo is where `sat` is high and `val` is still up, and the
+    floor is where `val` falls away.
+
+    Returns a list of dicts: r, val, sat, hue, n.
+    """
+    import cv2
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if frame.ndim == 3 else None
+    if hsv is None:
+        return []
+    fh, fw = hsv.shape[:2]
+    cx, cy = float(centre_px[0]), float(centre_px[1])
+    x0, x1 = max(0, int(cx - max_r) - 1), min(fw, int(cx + max_r) + 2)
+    y0, y1 = max(0, int(cy - max_r) - 1), min(fh, int(cy + max_r) + 2)
+    if x1 <= x0 or y1 <= y0:
+        return []
+    win = hsv[y0:y1, x0:x1]
+    wy, wx = np.ogrid[y0:y1, x0:x1]
+    d = np.sqrt((wx - cx) ** 2 + (wy - cy) ** 2)
+
+    out = []
+    r = 0.0
+    while r <= max_r:
+        band = (d >= r) & (d < r + step)
+        n = int(band.sum())
+        if n:
+            hp = win[band]
+            ang = hp[:, 0].astype(np.float64) * (2 * np.pi / 180.0)
+            wgt = (hp[:, 1].astype(np.float64)
+                   * hp[:, 2].astype(np.float64) / 255.0)
+            hue = None
+            if wgt.sum() > 0:
+                sin_ = float((np.sin(ang) * wgt).sum())
+                cos_ = float((np.cos(ang) * wgt).sum())
+                hue = float((math.degrees(math.atan2(sin_, cos_)) % 360.0) / 2.0)
+            out.append({"r": round(r, 2), "n": n,
+                        "val": float(hp[:, 2].mean()),
+                        "sat": float(hp[:, 1].mean()), "hue": hue})
+        r += step
+    return out

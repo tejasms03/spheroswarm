@@ -50,7 +50,9 @@ from ui.theme import (CARD, CHALK, CORAL, CYAN, DIM, GAP, GREY, INK, LED_RGB,
                       MINT, PAD, PANEL, PANEL2, RULE, SUN, Button, Slider, card,
                       section, stat_tile)
 from vision import config as vconfig
+from vision import lighting as vlighting
 from vision import palette as vpalette
+from vision.facing import cluster_px, heading_from_lights, lights_px
 from workspace.space import Workspace
 
 W, H = 1500, 950
@@ -356,6 +358,25 @@ class CalibApp:
         self.arrive_cm = 5
         self.last_fit = None
         self.cam_surface, self.cam_stamp = None, None
+        # The right-hand pane on the COLOUR tab. `bright` is where the light
+        # falls, `mask` is what the signature selects, `blur` is what the
+        # tagger reads a hue from. The camera pane on the left never changes:
+        # the tagged view is the one you want in front of you constantly, and
+        # a view you have to switch back to is one you will forget to.
+        self.colour_view = "bright"
+        self.lights_stamp = None
+        self.lights_reading = []
+        # What counts as a light, and how far apart two lights can be and
+        # still be one ball. Both depend on the lens and the mounting height,
+        # so both are knobs rather than constants.
+        self.light_min_v = 200
+        self.ball_span_px = 60
+        # Manual defocus, for the tagger only. 1 is off. This is a SOFTWARE
+        # blur and the lens is untouched: defocusing the lens for real would
+        # buy the same fatter, smoother blobs and pay for it in the geometry,
+        # because two LEDs 13px apart merge into one long before the colour
+        # stops improving.
+        self.tag_blur = 1
         self.sliders = []
         self.buttons = []
         # Cleared here, in the one block every branch runs, rather than in each
@@ -2619,6 +2640,30 @@ class CalibApp:
                     (ax, sy + i * 26, min(300, aw - 20), 16), key, lo, hi,
                     lambda k=key: self.get_sig(k, lo),
                     lambda v, k=key: self.set_slider(k, v)))
+            # The light reader's own two knobs. They are not part of a colour
+            # signature — they decide what counts as a light at all and how far
+            # apart two lights can be and still be one ball — so they are not
+            # in `specs` and are never written to calib/colors.json.
+            #
+            # In a SECOND COLUMN rather than under the others. This row sits
+            # below both panes so the width is free, while two more rows cost
+            # 52px of height the tab does not have: putting them in line pushed
+            # `optimise hues` 30px off the bottom of a 760-tall window, which
+            # the off-window guard caught.
+            lw = min(300, max(120, aw - 20 - 316))
+            for i, (label, lo, hi, get, set_) in enumerate((
+                    ("light floor", 60, 254,
+                     lambda: self.light_min_v,
+                     lambda v: setattr(self, "light_min_v", int(v))),
+                    ("ball span", 10, 300,
+                     lambda: self.ball_span_px,
+                     lambda v: setattr(self, "ball_span_px", int(v))),
+                    ("defocus", 1, 41,
+                     lambda: self.tag_blur,
+                     lambda v: setattr(self, "tag_blur", int(v))))):
+                self.sliders.append(Slider((ax + 316, sy + i * 26, lw, 16),
+                                           label, lo, hi, get, set_))
+
             by = sy + len(specs) * 26 + GAP
             add((ax, by, 150, 26), "auto-tune this",
                 lambda: self.start_autotune(False), tone=CYAN)
@@ -2639,6 +2684,22 @@ class CalibApp:
             # and cannot be clicked.
             by2 = by + 26 + 6
             add((ax, by2, 110, 26), "flip y", self.flip_arena_y, tone=SUN)
+
+            # The view selector sits on the TOP row, right-aligned over the
+            # pane it controls, rather than on the second row with `flip y`.
+            # The second row has 228px free between that button and the hue
+            # wheel and these need 270, so putting them there drew a live-
+            # looking control on top of the wheel — which the overlap guard
+            # caught, and which is the same class of bug as the `teach` button
+            # 36px off the right edge.
+            vw, vgap = 104, 6
+            span = len(self.COLOUR_VIEWS) * vw + (len(self.COLOUR_VIEWS) - 1) * vgap
+            vx = ax + self.CAM_W + GAP + self.CAM_W - span
+            if vx > ax + 3 * 110 + GAP:      # never under the tab buttons
+                for i, vname in enumerate(self.COLOUR_VIEWS):
+                    b = add((vx + i * (vw + vgap), 14, vw, 26), vname,
+                            self.set_colour_view(vname))
+                    b.on = (self.colour_view == vname)
             if self.corner_mode:
                 cy = by2 + 26 + GAP
                 self.sliders.append(Slider((ax + 316, cy, 260, 16),
@@ -2843,6 +2904,249 @@ class CalibApp:
             self.cam_stamp = id(frame)
         return self.cam_surface, raw, f
 
+    def tag_frame(self, frame):
+        """The frame the TAGGER reads colour from. `tag_blur` of 1 is off.
+
+        One implementation for the view and the reader, deliberately: a blur
+        view showing a different image than the tagger actually samples would
+        be a picture of something nobody is measuring, and the whole point of
+        putting it on screen is to see what the tagger sees.
+        """
+        b = max(1, int(self.tag_blur)) | 1
+        if b <= 1 or frame is None:
+            return frame
+        import cv2
+        return cv2.GaussianBlur(frame, (b, b), 0)
+
+    def light_readings(self):
+        """Every cluster of lights the camera can see, named and aimed.
+
+        The other way round from `Detector`: brightness finds the robots and
+        colour only says which one each is. That inverts what `vision/track.py`
+        does — "detection is per-colour, so identity is unambiguous by
+        construction" — and the reason is that hue has to survive a blown-out
+        core to FIND a robot, but only has to be roughly right to NAME one you
+        have already located. A lit ball is the brightest thing in a dim room
+        by a wide margin, which is a far easier thing to key on.
+
+        Cached per frame: the render loop asks for this while drawing and the
+        camera thread produces frames far more slowly, so recomputing per draw
+        would be several full passes a frame for one answer.
+        """
+        if self.tracker is None:
+            return []
+        try:
+            frame, _ = self.tracker.latest()
+        except Exception:
+            return []
+        if frame is None:
+            return []
+        if id(frame) == self.lights_stamp:
+            return self.lights_reading
+
+        det = self.detector
+        sigs = det.colors if det is not None else vconfig.load_signatures()
+        # Slot -> the robot wearing it, so the label is the CODE a person
+        # recognises rather than a colour they have to translate.
+        wearer = {e.color: e.code for e in self.roster.enabled_entries()}
+        out = []
+        try:
+            spots = lights_px(frame, min_v=self.light_min_v,
+                              colour_frame=self.tag_frame(frame))
+            for group in cluster_px(spots, self.ball_span_px):
+                got, why = heading_from_lights(group, signatures=sigs)
+                if got is None:
+                    out.append({"group": group, "why": why, "deg": None,
+                                "code": None, "colour": None, "centre": None})
+                    continue
+                out.append({"group": group, "why": None, "deg": got["deg"],
+                            "conf": got["conf"], "centre": got["centre"],
+                            "front": got["front"], "back": got["back"],
+                            "colour": got.get("color"),
+                            "code": wearer.get(got.get("color")),
+                            "tag_why": got.get("tag_why"),
+                            "span_px": got["span_px"]})
+        except Exception as e:
+            # Said once, not every frame. This runs from the render loop, so a
+            # fault that persists would otherwise fill the log with one message
+            # thirty times a second and push everything else off the top.
+            self.lights_stamp, self.lights_reading = id(frame), []
+            if getattr(self, "_said_lights_error", None) != str(e):
+                self._said_lights_error = str(e)
+                self.say("error", f"light reading failed: {e}")
+            return []
+        self._said_lights_error = None
+        self.lights_stamp, self.lights_reading = id(frame), out
+        return out
+
+    def cam_scale(self):
+        """Source pixels -> camera-panel pixels. 1.0 when there is no frame."""
+        if self.tracker is None:
+            return 1.0
+        try:
+            frame, _ = self.tracker.latest()
+        except Exception:
+            return 1.0
+        if frame is None:
+            return 1.0
+        return self.CAM_W / float(frame.shape[1])
+
+    def draw_right_overlay(self, origin, pane):
+        """The same clusters on the right-hand pane, mapped into its frame.
+
+        `mask` and `blur` are the camera frame scaled, so the camera mapping
+        works unchanged. `bright` has been through the homography and needs
+        its own, because a light at frame (900, 400) is somewhere else
+        entirely on a warped floor — and an overlay half a ball out from the
+        thing it labels is worse than no overlay.
+        """
+        if self.colour_view != "bright":
+            return self.draw_light_overlay(origin, self.cam_scale())
+        H = self.homography
+        if H is None or not H.ready:
+            return self.draw_light_overlay(origin, self.cam_scale())
+        m = vlighting.arena_scale(H, pane.get_width(), pane.get_height())
+        if not m:
+            return
+        w, h = pane.get_width(), pane.get_height()
+
+        def px_of(p):
+            try:
+                cm = np.asarray(H.to_cm([list(p)])).ravel()[:2]
+            except Exception:
+                return None
+            out = (origin[0] + float(cm[0]) * m, origin[1] + float(cm[1]) * m)
+            inside = (origin[0] <= out[0] <= origin[0] + w
+                      and origin[1] <= out[1] <= origin[1] + h)
+            return out if inside else None
+
+        # A radius is in SOURCE pixels and this pane is not a uniform scaling
+        # of those — a perspective map stretches one end of the arena more
+        # than the other. Rather than pretend otherwise, take the local scale
+        # near the middle of the frame and use it for every circle: a marker
+        # a few pixels out is fine, and claiming exactness here would not be.
+        try:
+            probe = np.asarray(H.to_cm([[0.0, 0.0], [10.0, 0.0]]))
+            cm_per_px = float(np.linalg.norm(probe[1] - probe[0])) / 10.0
+        except Exception:
+            cm_per_px = 0.0
+        self.draw_light_overlay(origin, m * cm_per_px, px_of=px_of)
+
+    def draw_light_overlay(self, origin, f, px_of=None):
+        """Name and heading arrow for every cluster, over whichever pane.
+
+        `px_of` maps a SOURCE pixel into the pane. The camera pane is a plain
+        scale, but the brightness pane has been through the homography, so a
+        light at frame (900, 400) is somewhere else entirely on the warped
+        floor — one shared mapping argument rather than two overlay routines.
+        """
+        s = self.screen
+        if px_of is None:
+            def px_of(p):
+                return (origin[0] + p[0] * f, origin[1] + p[1] * f)
+
+        for r in self.light_readings():
+            for light in r["group"]:
+                p = px_of((light["x"], light["y"]))
+                if p is None:
+                    continue
+                pygame.draw.circle(s, DIM, (int(p[0]), int(p[1])),
+                                   max(3, int(light["core_px"] * f) + 2), 1)
+            if r["deg"] is None or r["centre"] is None:
+                continue
+            c = px_of(r["centre"])
+            if c is None:
+                continue
+            # The direction comes from the two mapped ENDPOINTS, never from
+            # `deg`. `deg` is an angle in the camera frame, and the brightness
+            # pane has been through the homography — a perspective map does not
+            # preserve angles, so drawing the image angle over warped dots puts
+            # the arrow at an angle to its own lights. `facing_cm` states this
+            # rule and this overlay was breaking it.
+            pf = px_of((r["front"]["x"], r["front"]["y"]))
+            pb = px_of((r["back"]["x"], r["back"]["y"]))
+            if pf is not None and pb is not None:
+                ang = math.atan2(pf[1] - pb[1], pf[0] - pb[0])
+                rad = max(7.0, math.hypot(pf[0] - pb[0], pf[1] - pb[1]) / 2.0)
+            else:
+                ang = math.radians(r["deg"])
+                rad = max(7.0, (r["span_px"] * f) / 2.0)
+            tip = (c[0] + math.cos(ang) * rad * 1.9,
+                   c[1] + math.sin(ang) * rad * 1.9)
+            tail = (c[0] - math.cos(ang) * rad * 1.4,
+                    c[1] - math.sin(ang) * rad * 1.4)
+            tone = LED_RGB.get(r["colour"], CHALK) if r["colour"] else SUN
+            pygame.draw.line(s, tone, tail, tip, 3)
+            for side in (150, -150):
+                a2 = ang + math.radians(side)
+                pygame.draw.line(s, tone, tip,
+                                 (tip[0] + math.cos(a2) * rad * 0.7,
+                                  tip[1] + math.sin(a2) * rad * 0.7), 3)
+            # An unnamed cluster still gets its arrow and says so. A robot the
+            # bench can aim but cannot name is a different problem from one it
+            # cannot see, and they want different fixes.
+            label = r["code"] or (r["colour"] or "?")
+            s.blit(self.f.render(label, True, tone),
+                   (int(c[0]) + 10, int(c[1]) - 20))
+
+    COLOUR_VIEWS = ("bright", "mask", "blur")
+
+    def set_colour_view(self, name):
+        def go():
+            self.colour_view = name
+            self.say("info", {
+                "bright": "where the light falls, over the ARENA only — red is "
+                          "clipped, and clipped is where hue and heading both "
+                          "die",
+                "mask": "what this signature selects — the hue sliders are "
+                        "pointless without it",
+                "blur": "what the tagger reads a hue from. The colour lives in "
+                        "the ring around a blown core, not at the middle",
+            }[name])
+            self._build()
+        return go
+
+    def right_pane(self, name):
+        """The COLOUR tab's right-hand surface, whichever view is selected.
+
+        Returns `(surface, caption, note)`. `note` is a warning to draw over
+        the pane rather than a failure — a brightness map that fell back to
+        the whole frame is still worth looking at, as long as it says so.
+        """
+        if self.colour_view == "mask":
+            return self.mask_surface(name), f"{name} mask — what the signature selects", None
+        if self.tracker is None:
+            return None, None, None
+        try:
+            frame, _ = self.tracker.latest()
+        except Exception:
+            return None, None, None
+        if frame is None:
+            return None, None, None
+
+        import cv2
+        h, w = frame.shape[:2]
+        if self.colour_view == "blur":
+            img = self.tag_frame(frame)
+            f = self.CAM_W / float(w)
+            img = cv2.resize(img, (self.CAM_W, max(1, int(h * f))))
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return (pygame.surfarray.make_surface(rgb.swapaxes(0, 1)),
+                    f"defocus {self.tag_blur} — what the tagger reads a hue "
+                    f"from", None)
+
+        out_h = int(self.CAM_W * 0.75)
+        img, stats, why = vlighting.brightness_map(frame, self.homography,
+                                                   self.CAM_W, out_h)
+        if img is None:
+            return None, None, why
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+        cap = (f"brightness over the arena — clipped {stats['blown']:.2f}%  "
+               f"dark {stats['dark']:.0f}%  mean {stats['mean']:.0f}")
+        self.light_stats = stats
+        return surf, cap, why
+
     def mask_surface(self, name):
         """The mask this colour's signature produces, as the trainer sees it."""
         d = self.detector
@@ -2948,14 +3252,23 @@ class CalibApp:
         else:
             self.cam_rect = self.draw_camera_panel(
                 ax, y, caption="click the frame to sample a hue")
-            mask = self.mask_surface(name)
+            # The tagged view is constant: names and arrows are what you want
+            # in front of you the whole time, and a view you have to switch
+            # back to is one you will forget to.
+            self.draw_light_overlay((ax, y), self.cam_scale())
+
+            pane, cap, note = self.right_pane(name)
             mx = ax + self.cam_rect.width + GAP
-            if mask is not None and mx + mask.get_width() <= W - PAD:
-                s.blit(mask, (mx, y))
+            if pane is not None and mx + pane.get_width() <= W - PAD:
+                s.blit(pane, (mx, y))
                 pygame.draw.rect(s, RULE,
-                                 (mx, y, mask.get_width(), mask.get_height()), 1)
-                s.blit(self.fs.render(f"{name} mask — what the signature selects",
-                                      True, DIM), (mx, y - 14))
+                                 (mx, y, pane.get_width(), pane.get_height()), 1)
+                if cap:
+                    s.blit(self.fs.render(cap[:78], True, DIM), (mx, y - 14))
+                if note:
+                    s.blit(self.fs.render(note[:70], True, SUN), (mx + 8, y + 8))
+                # The same clusters on the right-hand pane, in its own frame.
+                self.draw_right_overlay((mx, y), pane)
 
         # What the ball will actually glow, at the size a person can judge. The
         # wheel says which hue; this says what that hue looks like once the
