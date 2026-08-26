@@ -1,12 +1,12 @@
 {
   "red": {
-    "hue": 138,
+    "hue": 172,
     "tol": 5,
-    "s_min": 55,
-    "v_min": 100,
+    "s_min": 154,
+    "v_min": 51,
     "min_area": 147,
     "max_area": 2217,
-    "led_value": 168
+    "led_value": 73
   },
   "yellow": {
     "hue": 45,
