@@ -43,6 +43,7 @@ from fleet.characterize import (Characterization, DriftWatch, Recenter,
 from swarm.pd import (Circle, Line, PDController, Point, TurnAndGo,
                       gains_from_motion,
                       implied_heading_error, straightness, tracking_error)
+from swarm.trace import TrackToPoint
 from fleet.manager import Fleet
 from fleet.roster import RobotEntry, Roster
 from ui.theme import (CARD, CHALK, CORAL, CYAN, DIM, GAP, GREY, INK, LED_RGB,
@@ -288,6 +289,7 @@ class CalibApp:
         self.last_probe = None
         self._said_orbit = False
         self._said_arrival = False
+        self._said_aim_mode = False
         self._lost_for = 0.0
         self._said_lost = False
         self.pd = None                  # PDController while driving
@@ -302,6 +304,12 @@ class CalibApp:
         # circle it can never close — which is what a real ball does here. A
         # committed leg goes the WRONG WAY instead, in a straight line, and a
         # wrong direction is a measurement. See `watch_aim`.
+        # The aiming taillight, on by default. A Sphero shows WHICH robot it is
+        # with the main LED and shows nothing at all about which way it is
+        # pointing, and which way it is pointing is what every aim-frame bug in
+        # this project comes down to. Costs one packet when it changes.
+        self.taillight = True
+        self._said_blue_tail = False
         self.drive_mode = "straight"
         # Hand-tuning values. `None` means "whatever the measurement says";
         # touching a slider pins it, so a number a person chose is never
@@ -324,6 +332,12 @@ class CalibApp:
         # issuing headings the robot has not finished acting on. Re-aiming
         # under 10deg of drift buys nothing a 230ms link can deliver.
         self.tune_retarget, self.tune_interval, self.tune_creep = 10.0, 0.45, 0.45
+        # Track mode. The lookahead is the only real knob it has and it trades
+        # two failures against each other -- short wobbles down a straight,
+        # long cuts the corner onto the line -- so it belongs on a slider
+        # rather than in a constant. 18cm is about two seconds of travel at the
+        # speed a person actually watches a ball at.
+        self.tune_lookahead, self.tune_cmd_hz = 18.0, 6.0
         self.aim_legs = []              # (commanded_deg, error_deg) this drive
         self.aim_from = None            # position when the current leg began
         self.aim_deg = None             # the bearing it committed to
@@ -857,6 +871,7 @@ class CalibApp:
         h = self.fleet.handles[code]
         self.sync_tracked_colours()
         h.set_led(self.led_for(entry.color))
+        self.apply_taillight(h)
         self.say("ok", f"{code} joined as {kind}"
                        + (f" ({entry.ble_name})" if kind == "real" else ""))
         self._build()
@@ -1617,15 +1632,63 @@ class CalibApp:
                              f"{self.selected}'s own measurement")
             self._build()
 
-    def toggle_drive_mode(self):
-        self.drive_mode = "pd" if self.drive_mode == "straight" else "straight"
+    DRIVE_MODES = ("straight", "track", "pd")
+    DRIVE_MODE_LABEL = {"straight": "straight", "track": "track", "pd": "PD loop"}
+    DRIVE_MODE_NOTE = {
+        "straight":
+            "straight: aim once, drive a straight leg, stop. A committed leg "
+            "goes the wrong WAY if the frame is off, instead of curving — and "
+            "a wrong way is measurable. Use this to CALIBRATE.",
+        "track":
+            "track: holds the ball to the LINE to its target, correcting "
+            "sideways error at the rate the radio carries rather than every "
+            "frame. Straightest arrival of the three, and it drives THROUGH a "
+            "frame error rather than measuring it.",
+        "pd":
+            "PD loop: corrects every frame. Smoother into the target when the "
+            "aim frame is right, and circles when it is not.",
+    }
+
+    BACK_LED_BRIGHT = 255
+
+    def apply_taillight(self, handle=None):
+        """Push the taillight to one robot, or to all of them.
+
+        Re-applied on connect as well as on the toggle, because a ball comes up
+        with its lights off however this bench last left them.
+        """
+        targets = [handle] if handle is not None else list(self.fleet.handles.values())
+        for h in targets:
+            if h is not None:
+                h.set_back_led(self.BACK_LED_BRIGHT if self.taillight else 0)
+        # The taillight is BLUE — `set_back_led(int)` is Color(0, 0, n) on
+        # every toy that has one — and the tracker finds robots by hue, with
+        # blue among them. An always-on taillight on a floor where a blue robot
+        # is enrolled is a second blue blob, which shows up as a BLOBS count
+        # that will not settle and a tracker that swaps between the two.
+        if self.taillight and not self._said_blue_tail and \
+                any(h is not None and h.color == "blue"
+                    for h in self.fleet.handles.values()):
+            self._said_blue_tail = True
+            self.say("warn",
+                     "the taillight is blue and there is a BLUE robot on the "
+                     "floor — the tracker hunts hues, so that is now two blue "
+                     "blobs. Watch the BLOBS count, and give that robot "
+                     "another colour if it will not settle.")
+
+    def toggle_taillight(self):
+        self.taillight = not self.taillight
+        self.apply_taillight()
         self.say("info",
-                 "straight: aim once, drive a straight leg, stop. A committed "
-                 "leg goes the wrong WAY if the frame is off, instead of "
-                 "curving — and a wrong way is measurable."
-                 if self.drive_mode == "straight" else
-                 "PD loop: corrects every frame. Smoother into the target when "
-                 "the aim frame is right, and circles when it is not.")
+                 "taillight ON — the dark side of the ball is the front, so "
+                 "you can see its aim on the floor and in the camera"
+                 if self.taillight else "taillight off")
+        self._build()
+
+    def toggle_drive_mode(self):
+        i = self.DRIVE_MODES.index(self.drive_mode)
+        self.drive_mode = self.DRIVE_MODES[(i + 1) % len(self.DRIVE_MODES)]
+        self.say("info", self.DRIVE_MODE_NOTE[self.drive_mode])
         if self.path is not None:
             self.start_path(self.path)      # rebuild under the new mode
         self._build()
@@ -1666,6 +1729,18 @@ class CalibApp:
             c.creep_frac = float(self.tune_creep)
             c.speed = float(self.path_speed)
             c.tol = float(self.arrive_cm)
+        elif self.drive_mode == "track":
+            c.speed = float(self.path_speed)
+            c.tol = float(self.arrive_cm)
+            c.lookahead = float(self.tune_lookahead)
+            c.cmd_hz = float(self.tune_cmd_hz)
+            # And onto the follower already driving, or the knob is a settings
+            # page until the next corridor happens to be laid.
+            if c.follower is not None:
+                c.follower.speed = c.speed
+                c.follower.lookahead = c.lookahead
+                c.follower.cmd_hz = c.cmd_hz
+                c.follower.arrive = c.tol
         else:
             if self.tune_kp is not None:
                 c.kp = float(self.tune_kp)
@@ -1688,6 +1763,18 @@ class CalibApp:
         if self.drive_mode == "straight":
             self.pd = TurnAndGo(speed=float(self.path_speed),
                                 arrive_cm=float(self.arrive_cm))
+        elif self.drive_mode == "track":
+            # Measured constants where there are any: the deadband decides
+            # which commands the motors will honour at all, and the stopping
+            # constant is what lets it ease into the target rather than arrive
+            # at speed and coast past.
+            self.pd = TrackToPoint(speed=float(self.path_speed),
+                                   arrive_cm=float(self.arrive_cm),
+                                   lookahead=float(self.tune_lookahead),
+                                   cmd_hz=float(self.tune_cmd_hz),
+                                   max_speed=g["max_speed"],
+                                   deadband_cm_s=g["deadband_cm_s"],
+                                   stop_s=g["dead_s"] + g["tau_s"])
         else:
             self.pd = PDController(g["kp"], g["kd"], g["max_speed"],
                                    g["deadband_cm_s"], tol=float(self.arrive_cm),
@@ -1706,6 +1793,7 @@ class CalibApp:
         self.recovered = 0
         self._said_orbit = False
         self._said_arrival = False
+        self._said_aim_mode = False
         self._lost_for = 0.0
         self._said_lost = False
         # Asking for less than the motors will accept is not a slow robot, it
@@ -1719,11 +1807,21 @@ class CalibApp:
                               "deadband it sits still and then lurches; raise "
                               "the speed slider above it.")
         note = "measured" if g["measured"] else "UNMEASURED — run the battery for better gains"
+        # The knobs actually in force. Printing kp and kd while driving a
+        # controller that has neither is how a trainer ends up tuning a gain
+        # that is not connected to anything.
+        if self.drive_mode == "straight":
+            knobs = (f"aim and commit, re-aim over {self.tune_retarget:.0f}deg "
+                     f"/ {self.tune_interval * 1000:.0f}ms")
+        elif self.drive_mode == "track":
+            knobs = (f"corridor, lookahead {self.tune_lookahead:.0f}cm, "
+                     f"{self.tune_cmd_hz:.0f} cmds/s")
+        else:
+            knobs = (f"kp {g['kp']:.2f} kd {g['kd']:.2f} "
+                     f"pred {g['predict_s'] * 1000:.0f}ms")
         self.say("ok" if g["measured"] else "warn",
                  f"{h.code} -> {path.describe()}  "
-                 f"[kp {g['kp']:.2f} kd {g['kd']:.2f} "
-                 f"pred {g['predict_s'] * 1000:.0f}ms, stop within "
-                 f"{self.arrive_cm}cm, {note}]")
+                 f"[{knobs}, stop within {self.arrive_cm}cm, {note}]")
         if g.get("delay_clamped"):
             self.say("warn", "the measured loop delay was over 450ms, which is "
                              "not a loop delay — it is a run taken against a "
@@ -1746,8 +1844,22 @@ class CalibApp:
             return
         deg = implied_heading_error(ratio)
         if deg is None:
-            self.say("ok", f"{h.code} arrived, path {ratio:.2f}x straight-line "
-                           "— the aim frame looks right")
+            # A straight path only means a straight FRAME if nothing was
+            # steering. In track mode it means the steering worked, which is a
+            # different fact and a dangerous one to confuse with the first: the
+            # bench reported "the aim frame looks right" after a drive with
+            # twenty degrees of frame error in it, because track had corrected
+            # its way through them.
+            if self.drive_mode == "straight":
+                self.say("ok", f"{h.code} arrived, path {ratio:.2f}x "
+                               "straight-line — the aim frame looks right")
+            else:
+                self.say("ok", f"{h.code} arrived, path {ratio:.2f}x "
+                               f"straight-line. That is the {self.drive_mode} "
+                               "controller holding the line, and says nothing "
+                               "about the aim frame — a rotated one would be "
+                               "corrected away rather than shown. Drive it "
+                               "STRAIGHT to read the frame.")
             return
         self.say("warn", f"{h.code} arrived by a curve, {ratio:.2f}x the straight "
                          f"line. That is about {deg:.0f}deg of heading error: "
@@ -1829,6 +1941,24 @@ class CalibApp:
         err = wrap180(actual - self.aim_deg)
         self.aim_from = np.asarray(h.pos, dtype=float).copy()
         if abs(err) <= self.AIM_TOLERANCE_DEG:
+            return
+
+        # Only a COMMITTED leg may write an offset. A tracking controller holds
+        # a steady heading too, so this arithmetic runs and produces a number —
+        # but the number is the crab angle of a loop that is already correcting
+        # the error, not the error. Measured on the bench at a true 25deg of
+        # frame error: the straight mode lands on 334deg against a correct 335,
+        # and the track mode on 343. Both are improvements and only one is a
+        # calibration, and roster.json is where this ends up.
+        if self.drive_mode != "straight":
+            if not self._said_aim_mode:
+                self._said_aim_mode = True
+                self.say("warn",
+                         f"{h.code} is driving about {err:+.0f}deg off the "
+                         f"course it was given, which is an aim-frame error — "
+                         f"but {self.drive_mode} mode corrects it as it goes, "
+                         "so what can be measured here is the leftover and not "
+                         "the error. Switch to STRAIGHT to measure and fix it.")
             return
 
         # The same arithmetic as every other correction here: what was measured
@@ -2207,9 +2337,28 @@ class CalibApp:
                 self.say("warn", f"{name}: {r.get('error', 'no')}")
             elif not r.get("changing"):
                 self.say("warn", f"{name}: answers in {r['ms_mean']}ms but never "
-                                 "changes — a cached value, not a reading")
+                                 "changes — a dead cache, not a reading")
+            elif r.get("fabricated"):
+                self.say("warn", f"{name}: changes on every CALL, not with the "
+                                 "clock — that number is being made up locally "
+                                 "and never came from the ball")
+            elif r.get("usable"):
+                # The refresh rate, not the read rate. Reading a cache at
+                # 600kHz that a stream refreshes twenty times a second gives
+                # you twenty samples a second and 599,980 repeats, and it is
+                # the twenty that decides whether it can be integrated.
+                self.say("ok", f"{name}: refreshes at {r.get('refresh_hz')}Hz, "
+                               f"read in {r['ms_mean']}ms — usable"
+                               + (" and free (local read)" if r.get("cached") else ""))
             else:
-                self.say("ok", f"{name}: {r['ms_mean']}ms, up to {r['hz_ceiling']}Hz")
+                self.say("warn", f"{name}: refreshes at only "
+                                 f"{r.get('refresh_hz')}Hz — too slow to "
+                                 "integrate between camera fixes")
+        for hz, entry in report["streaming"].items():
+            en = entry.get("enable") or {}
+            if hz != "0" and not en.get("ok"):
+                self.say("warn", f"streaming at {hz}Hz would not turn on: "
+                                 f"{en.get('error')}")
         base = (report["streaming"].get("0", {}).get("drive") or {}).get("ms_mean")
         for hz, entry in report["streaming"].items():
             d = entry.get("drive") or {}
@@ -2573,18 +2722,25 @@ class CalibApp:
             self.motion_top = sy + 52 + GAP
         else:
             by = 14 + 26 + GAP
+            # Tight on purpose: at MIN_W the pane is 722px and these five have
+            # to fit in it. A button that falls off the edge of the smallest
+            # supported window is a button nobody can press.
             for i, name in enumerate(("point", "line", "circle")):
-                b = add((ax + i * 92, by, 86, 28), name,
+                b = add((ax + i * 84, by, 80, 28), name,
                         lambda n=name: self.set_shape(n))
                 b.on = (self.shape == name)
-            add((ax + 402, by, 120, 28), "auto radius", self.seed_arrive)
-            add((ax + 292, by, 100, 28), "STOP",
+            add((ax + 256, by, 90, 28), "STOP",
                 lambda: self.stop_path("drive stopped"), tone=CORAL)
-            b = add((ax + 530, by, 120, 28),
-                    "straight" if self.drive_mode == "straight" else "PD loop",
+            add((ax + 356, by, 110, 28), "auto radius", self.seed_arrive)
+            b = add((ax + 476, by, 110, 28),
+                    self.DRIVE_MODE_LABEL[self.drive_mode],
                     self.toggle_drive_mode,
-                    tone=MINT if self.drive_mode == "straight" else CYAN)
+                    tone={"straight": MINT, "track": SUN}.get(self.drive_mode,
+                                                              CYAN))
             b.on = True
+            b = add((ax + 596, by, 110, 28), "taillight", self.toggle_taillight,
+                    tone=CYAN if self.taillight else None)
+            b.on = self.taillight
             self.drive_top = by + 28 + GAP
             # The arena, square-ish and as large as the pane allows: this is
             # the thing being clicked, so it gets the room.
@@ -2618,7 +2774,18 @@ class CalibApp:
             # it is a settings page, and tuning by stop-edit-start loses the
             # feel of what the change did.
             ty = self.drive_top + 124
-            if self.drive_mode == "straight":
+            if self.drive_mode == "track":
+                self.sliders.append(Slider((sx, ty, 280, 16),
+                                           "lookahead cm", 4, 60,
+                                           lambda: int(self.tune_lookahead),
+                                           lambda v: self.set_tune("lookahead",
+                                                                   float(v))))
+                self.sliders.append(Slider((sx, ty + 28, 280, 16),
+                                           "cmds / s", 1, 20,
+                                           lambda: int(self.tune_cmd_hz),
+                                           lambda v: self.set_tune("cmd_hz",
+                                                                   float(v))))
+            elif self.drive_mode == "straight":
                 self.sliders.append(Slider((sx, ty, 280, 16),
                                            "re-aim deg", 4, 45,
                                            lambda: int(self.tune_retarget),
@@ -3184,6 +3351,18 @@ class CalibApp:
             px = self.to_px(h.pos)
             col = LED_RGB.get(h.color, CHALK)
             pygame.draw.circle(s, col, px, 7)
+            # The taillight sits on the BACK of the ball, so the gap between
+            # the dot and the direction it is travelling is the aim error, on
+            # screen, without anybody having to compute it.
+            course = getattr(h, "_believed_course", None)
+            if h.back_led and course is not None:
+                rad = math.radians(course)
+                tail = (int(px[0] - math.cos(rad) * 10),
+                        int(px[1] - math.sin(rad) * 10))
+                tone = (tuple(h.back_led) if isinstance(h.back_led, tuple)
+                        else (40, 80, int(h.back_led)))
+                pygame.draw.circle(s, tone, tail, 4)
+                pygame.draw.circle(s, CHALK, tail, 4, 1)
             if h.kind == "real":
                 pygame.draw.circle(s, CHALK, px, 10, 1)
             if code == self.selected:

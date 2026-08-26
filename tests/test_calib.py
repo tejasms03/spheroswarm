@@ -1783,3 +1783,166 @@ def test_a_workable_cap_starts_the_run(bench):
     bench.start_run(False)
     assert bench.run is not None
     bench.stop_run("test over")
+
+
+# -- track mode --------------------------------------------------------------
+#
+# The third way to reach a point. `straight` commits to a bearing, which is what
+# makes a rotated frame measurable and what makes a disturbance permanent.
+# `pd` corrects every frame on a link that carries four commands a second.
+# `track` holds the ball to the LINE to its target and re-commands at the rate
+# the radio will actually carry.
+
+
+def _to_point(bench, h, mode, target=(160.0, 60.0), bias_deg=0.0,
+              start=(40.0, 60.0), seconds=30.0, nudge=None):
+    """One point-to-point drive under one mode. Returns what it did."""
+    from swarm.pd import straightness
+    bench.stop_path("reset")
+    h.pos[:] = list(start)
+    h.vel[:] = [0.0, 0.0]
+    h.bias = np.radians(bias_deg)
+    h.heading_offset = 0.0
+    bench.trail = []
+    bench.aim_fixes = 0
+    bench.log = []
+    bench.drive_mode = mode
+    bench.path_speed = 20
+    bench._build()
+    bench.click(bench.to_px(np.array(list(target))))
+
+    line_a, line_b = np.array(start, dtype=float), np.array(target, dtype=float)
+    off_line, nudged = [], False
+    for i in range(int(seconds * 30)):
+        bench.step(1 / 30.0)
+        if nudge is not None and not nudged and \
+                float(np.linalg.norm(np.asarray(h.pos) - line_a)) > 40.0:
+            # Shove it off the route, the way a bump or a slipping wheel would.
+            h.pos[:] = np.asarray(h.pos) + np.asarray(nudge, dtype=float)
+            nudged = True
+            continue
+        if nudged:
+            ab = line_b - line_a
+            u = float(np.clip((np.asarray(h.pos) - line_a) @ ab / (ab @ ab), 0, 1))
+            off_line.append(float(np.linalg.norm(np.asarray(h.pos)
+                                                 - (line_a + ab * u))))
+        if bench.pd is not None and bench.pd.arrived:
+            break
+    return {
+        "straightness": straightness(bench.trail),
+        "final_cm": float(np.linalg.norm(np.asarray(h.pos) - line_b)),
+        "commands": getattr(bench.pd, "commands", None),
+        "offset": float(h.heading_offset),
+        "off_line": off_line,
+        "wrote_offset": any("aim-frame error. Offset" in t for _, t in bench.log),
+        "seconds": (i + 1) / 30.0,
+    }
+
+
+def test_the_drive_mode_button_cycles_three_ways(bench):
+    bench.drive_mode = "straight"
+    seen = []
+    for _ in range(3):
+        bench.toggle_drive_mode()
+        seen.append(bench.drive_mode)
+    assert seen == ["track", "pd", "straight"], "and back to where it started"
+
+
+def test_track_builds_the_corridor_controller(bench):
+    from swarm.trace import TrackToPoint
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    bench.drive_mode = "track"
+    bench.click(bench.to_px(np.array([160.0, 60.0])))
+    assert isinstance(bench.pd, TrackToPoint)
+    assert bench.pd.max_speed == bench.gains()["max_speed"]
+
+
+def test_track_parks_closer_to_the_target_than_the_other_two(bench):
+    """On a plant with nothing wrong with it, which is the easy case."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    scores = {m: _to_point(bench, h, m)["final_cm"]
+              for m in ("straight", "track", "pd")}
+    assert scores["track"] < scores["straight"]
+    assert scores["track"] < scores["pd"]
+    assert scores["track"] < 3.0
+
+
+def test_track_arrives_straighter_than_a_pd_loop_on_a_rotated_frame(bench):
+    """A curve into the target is the signature of a frame error being chased.
+    Correcting toward a LINE bends less than correcting toward a point."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    track = _to_point(bench, h, "track", bias_deg=25.0)
+    pd = _to_point(bench, h, "pd", bias_deg=25.0)
+    assert track["straightness"] < pd["straightness"]
+
+
+def test_track_returns_to_the_route_after_a_shove_rather_than_cutting(bench):
+    """The one thing a committed leg cannot do. `straight` re-aims at the
+    TARGET from wherever it was pushed to, so it finishes along a chord;
+    `track` aims back at the line it was supposed to be on."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    shove = (0.0, 25.0)
+    track = _to_point(bench, h, "track", nudge=shove)
+    straight = _to_point(bench, h, "straight", nudge=shove)
+    assert track["off_line"] and straight["off_line"]
+    assert float(np.mean(track["off_line"])) < \
+           float(np.mean(straight["off_line"])), \
+        "correcting toward the route beats correcting toward the destination"
+
+
+def test_track_does_not_write_a_heading_offset(bench):
+    """It corrects the frame error as it drives, so what is left to measure is
+    the leftover and not the error — and roster.json is where this would end
+    up. Only a committed leg may calibrate."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    assert _to_point(bench, h, "straight", bias_deg=25.0)["wrote_offset"]
+    assert not _to_point(bench, h, "track", bias_deg=25.0)["wrote_offset"]
+
+
+def test_track_does_not_flood_the_radio(bench):
+    """Closed loop on this link is only affordable because it is rate limited."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    r = _to_point(bench, h, "track", bias_deg=25.0)
+    assert r["commands"] <= r["seconds"] * bench.tune_cmd_hz + 2
+
+
+def test_the_lookahead_slider_reaches_the_running_controller(bench):
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    bench.drive_mode = "track"
+    bench._build()
+    bench.click(bench.to_px(np.array([160.0, 60.0])))
+    for _ in range(30):
+        bench.step(1 / 30.0)
+    bench.set_tune("lookahead", 42.0)
+    assert bench.pd.lookahead == 42.0
+    assert bench.pd.follower.lookahead == 42.0
+
+
+def test_the_track_sliders_are_the_ones_it_actually_has(bench):
+    _drive_tab(bench)
+    bench.drive_mode = "track"
+    bench._build()
+    labels = [s.label for s in bench.sliders]
+    assert "lookahead cm" in labels and "cmds / s" in labels
+    assert "kp x100" not in labels, "those belong to the PD loop"
+
+
+def test_a_straight_path_under_track_is_not_reported_as_a_good_aim_frame(bench):
+    """The bench used to say "the aim frame looks right" after a drive with
+    twenty degrees of frame error in it, because track had corrected its way
+    through them. A straight path means a straight FRAME only when nothing was
+    steering."""
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    _to_point(bench, h, "track", bias_deg=20.0)
+    said = " ".join(t for _, t in bench.log)
+    assert "the aim frame looks right" not in said
+    assert "says nothing about the aim frame" in said
+
+
+def test_the_drive_message_names_the_knobs_that_are_in_force(bench):
+    h = _drive_tab(bench, pos=(40.0, 60.0))
+    bench.drive_mode = "track"
+    bench.click(bench.to_px(np.array([160.0, 60.0])))
+    said = " ".join(t for _, t in bench.log)
+    assert "lookahead" in said
+    assert "kp " not in said, "the corridor controller has no proportional gain"

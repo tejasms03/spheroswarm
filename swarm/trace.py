@@ -717,6 +717,138 @@ class Program:
         return self.command
 
 
+# -- driving to a point ------------------------------------------------------
+
+class TrackToPoint:
+    """Hold the ball to the LINE to its target, wearing `swarm.pd`'s interface.
+
+    The bench already had two ways to reach a point and both give something up.
+    `TurnAndGo` aims at the target and commits, which is what makes a rotated
+    frame measurable — a committed leg goes visibly the wrong WAY rather than
+    curving — but it has no memory of the line it was meant to be on, so
+    anything that pushes the ball sideways is answered by aiming at the target
+    again from wherever it drifted to, and it arrives along a bow. `PDController`
+    corrects continuously and forms a fresh opinion thirty times a second on a
+    link that carries four, so the commands argue with each other.
+
+    This one owns a corridor: the straight line from where the leg began to
+    where it is going. It projects the ball onto that line, aims a lookahead
+    ahead of the projection, and re-commands only at the rate the radio will
+    carry. Sideways error is corrected — that is the point — but it is
+    corrected toward a line rather than toward a point, so the ball converges
+    onto the route instead of curving around to the destination.
+
+    It returns a velocity because that is what the drive loop and every handle
+    in this codebase speak. Underneath there is nothing but a roll command: one
+    heading, one speed, held until the next one is due.
+
+    What it does NOT do is measure the aim frame for you, and that difference
+    matters on a calibration bench. A committed leg turns a frame error into a
+    straight line in the wrong direction, which is a number. This corrects the
+    error away instead — `aim` still reports the bearing it committed to, so
+    `watch_aim` reads the same crab angle out of the steady stretch, but if you
+    are here to MEASURE the frame rather than to drive, the straight mode is
+    still the honest one.
+    """
+
+    RELAY_CM = 4.0              # setpoint movement that re-lays the corridor
+    STOPPED_CM_S = 4.0          # under this, an arrival counts as parked
+
+    def __init__(self, speed=8.0, arrive_cm=6.0, lookahead=18.0,
+                 cmd_hz=DEFAULT_CMD_HZ, max_speed=MAX_SPEED, deadband_cm_s=0.0,
+                 release=1.7, stop_s=1.0):
+        self.speed = float(speed)
+        self.tol = float(arrive_cm)
+        self.lookahead = float(lookahead)
+        self.cmd_hz = float(cmd_hz)
+        self.max_speed = float(max_speed)
+        self.release = float(release)
+        self.stop_s = float(stop_s)
+        self.speeds = SpeedMap(
+            max_speed=max_speed,
+            min_moving_byte=int(round(float(deadband_cm_s) /
+                                      max(float(max_speed), 1e-6) * 255.0)))
+
+        self.error = None
+        self.arrived = False
+        self.holding = False
+        # Never set. A corridor tracker converges onto a line; it does not
+        # circle a point, which is the failure mode a PD loop has when the
+        # frame is rotated. The bench's recovery hangs off this flag, and
+        # claiming a circle that cannot happen would trigger it forever.
+        self.orbiting = False
+        # MATH convention — x-right, y-down, anticlockwise — because that is
+        # what `watch_aim` compares against the travel it measures. The
+        # follower underneath thinks in Sphero headings, and the conversion
+        # lives here so only one place has to know both.
+        self.aim = None
+        self.commands = 0
+        self.cross_track = 0.0
+        self.follower = None
+        self.corridor = None
+        self._target = None
+
+    def _lay(self, pos, target):
+        """Build the corridor, or keep the one already being driven."""
+        if self.follower is not None and self._target is not None \
+                and float(np.linalg.norm(target - self._target)) <= self.RELAY_CM:
+            return
+        old = self.follower
+        self._target = np.array(target, dtype=float)
+        self.corridor = Polyline([pos, target], speed=self.speed)
+        self.follower = RollFollower(self.corridor, speed=self.speed,
+                                     lookahead=self.lookahead,
+                                     cmd_hz=self.cmd_hz, arrive_cm=self.tol,
+                                     speeds=self.speeds, stop_s=self.stop_s)
+        if old is not None:
+            # Carry the rate limiter across. A moving setpoint re-lays the
+            # corridor every few centimetres, and a fresh follower each time
+            # would think it had never spoken and command on every one of them
+            # — which is the airtime problem this exists to avoid.
+            self.follower.since = old.since
+            self.follower.command = old.command
+            self.follower.commands = old.commands
+
+    def step(self, pos, vel, setpoint, feedforward=None, dt=1.0 / 30.0):
+        pos = np.asarray(pos, dtype=float)
+        target = np.asarray(setpoint, dtype=float)
+        d = float(np.linalg.norm(target - pos))
+        self.error = d
+
+        # Hysteresis, same as the other two: once inside, stay stopped until
+        # the error grows past `tol * release`. Without it the ball creeps out,
+        # gets a command, overshoots back in, and calls that arriving.
+        inside = self.tol if not self.holding else self.tol * self.release
+        if d <= inside:
+            self.holding = True
+            self.arrived = float(np.linalg.norm(vel)) < self.STOPPED_CM_S
+            self.aim = None
+            self.follower = self.corridor = self._target = None
+            return np.zeros(2)
+        self.holding = False
+        self.arrived = False
+
+        self._lay(pos, target)
+        if self.follower.step(pos, dt) is not None:
+            self.commands += 1
+            self.aim = (90.0 - self.follower.command[0]) % 360.0
+        self.cross_track = self.follower.cross_track
+
+        held = self.follower.command
+        if held is None:
+            return np.zeros(2)
+        v = heading_vector(held[0]) * self.speeds.cm_s_for(held[1])
+        if feedforward is not None:
+            # A moving setpoint. Without this the ball is permanently behind by
+            # whatever the setpoint covers in one lag, and the corridor is
+            # being re-laid toward a target that has already left.
+            v = v + np.asarray(feedforward, dtype=float)
+        speed = float(np.linalg.norm(v))
+        if speed > self.max_speed:
+            v = v / speed * self.max_speed
+        return v
+
+
 # -- one drive ---------------------------------------------------------------
 
 class Drive:
