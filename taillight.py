@@ -62,19 +62,24 @@ import cv2
 import numpy as np
 import pygame
 
-from ui.theme import (CHALK, CORAL, DIM, GREY, INK, MINT, SUN, Button, Slider,
-                      card, section)
-from vision import config
+from ui.theme import (CHALK, CORAL, CYAN, DIM, GREY, INK, MINT, RULE, SUN,
+                      Button, Slider, card, section)
+from vision import config, lighting
 from vision.detect import Detector
-from vision.facing import (LIGHT_MIN_V, bearing_cm, cluster_px,
-                           explain_cm, explain_px, heading_from_lights,
-                           lights_px)
+from vision.facing import (ANNULUS, LIGHT_MIN_V, MIN_TAG_SAT, bearing_cm,
+                           cluster_px, explain_cm, explain_px,
+                           heading_from_lights, lights_px, radial_profile)
 from vision.homography import Homography
 from vision.synthetic import open_source
 
 W, H = 1480, 940
 VIEW = pygame.Rect(14, 48, 900, 506)          # 16:9, whatever the source is
-LOG = pygame.Rect(14, 570, 900, 356)
+LOG = pygame.Rect(14, 570, 620, 356)
+# The radial profile sits beside the log rather than in the panel, because it
+# is the instrument for choosing ANNULUS and a plot too small to read is not an
+# instrument. It also belongs under the camera view, which is where a person
+# tuning the exposure is already looking.
+PROFILE = pygame.Rect(648, 570, 266, 356)
 PANEL_X, PANEL_W = 930, 536
 
 LOG_HZ = 5.0            # lines per second; faster than this is unreadable
@@ -212,7 +217,10 @@ class Lab:
         group = groups[0]
         out["group"] = group
 
-        got, why = heading_from_lights(group)
+        # The detector's own signatures, so a name here means the same thing
+        # it means on the bench. Passing them is what turns a heading into a
+        # heading with a robot's name on it.
+        got, why = heading_from_lights(group, signatures=self.detector.colors)
         if got is None:
             out["why"] = why
             if len(group) == 1:
@@ -223,7 +231,9 @@ class Lab:
                    centre_px=got["centre"], front=got["front"],
                    back=got["back"], by_colour=got["by_colour"],
                    span_px=got["span_px"], straightness=got["straightness"],
-                   radius_px=max(4.0, got["span_px"] / 2.0))
+                   radius_px=max(4.0, got["span_px"] / 2.0),
+                   color=got.get("color"), tag_conf=got.get("tag_conf"),
+                   tag_why=got.get("tag_why"), by_tag=got.get("by_tag"))
 
         if self.hom is not None and self.hom.ready:
             pts = self.hom.to_cm([list(got["centre"])])
@@ -238,7 +248,8 @@ class Lab:
                 "area": None, "theta_img": None, "theta_cm": None,
                 "conf": None, "xy_cm": None, "why": None, "lights": [],
                 "group": [], "front": None, "back": None, "by_colour": None,
-                "span_px": None, "straightness": None}
+                "span_px": None, "straightness": None, "tag_conf": None,
+                "tag_why": None, "by_tag": None}
 
     def analyse_blob(self, frame):
         """The original route: find a hue blob, read the heading inside it.
@@ -286,60 +297,13 @@ class Lab:
 
     # -- lighting --------------------------------------------------------
 
-    BLOWN = 250         # V at or above this has no colour left in it
-    DARK = 30           # ...and below this there is nothing to key on
-
     def arena_view(self, frame, out_w, out_h):
-        """The frame warped flat to the arena rectangle, top-down.
-
-        Same composition the main app's floor view uses: the camera's
-        pixel->cm matrix, then cm->local pixels. Restricting the lighting
-        answer to the arena is the whole point — a bright window behind the
-        floor is not a problem, and averaged into a whole-frame number it
-        hides one that is.
-        """
-        if frame is None:
-            return None, "no frame yet"
-        if self.hom is None or not self.hom.ready:
-            return None, "no arena calibration — this is the whole frame"
-        scale = min(out_w / self.hom.width, out_h / self.hom.height)
-        w, h = int(self.hom.width * scale), int(self.hom.height * scale)
-        to_local = np.array([[scale, 0.0, 0.0],
-                             [0.0, scale, 0.0],
-                             [0.0, 0.0, 1.0]], dtype=np.float64)
-        try:
-            return cv2.warpPerspective(frame, to_local @ self.hom.M, (w, h)), None
-        except Exception as e:
-            return None, f"warp failed: {e}"
+        """The frame warped flat to the arena. See `vision/lighting.py`."""
+        return lighting.arena_view(frame, self.hom, out_w, out_h)
 
     def brightness_map(self, frame, out_w, out_h):
-        """Where the light actually falls, over the floor the robots use.
-
-        Value from HSV rather than a grey mix, because V is max(r,g,b) — which
-        is precisely the channel that saturates. A shell reading 255 has no hue
-        left for the detector and no separable peaks for a heading, so the
-        number worth watching is not the average but the blown fraction.
-        """
-        warped, why = self.arena_view(frame, out_w, out_h)
-        src = warped if warped is not None else frame
-        if src is None:
-            return None, None, why
-        v = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)[:, :, 2]
-        flat = v.reshape(-1)
-        stats = {
-            "mean": float(flat.mean()),
-            "p05": float(np.percentile(flat, 5)),
-            "p95": float(np.percentile(flat, 95)),
-            "max": int(flat.max()),
-            "blown": float((flat >= self.BLOWN).mean() * 100.0),
-            "dark": float((flat <= self.DARK).mean() * 100.0),
-        }
-        img = cv2.applyColorMap(v, cv2.COLORMAP_INFERNO)
-        # Blown pixels in flat red, which is nowhere on the inferno ramp. The
-        # ramp's own top end is a pale yellow that reads as "bright" — the one
-        # thing that must not be mistaken for "bright" is "clipped".
-        img[v >= self.BLOWN] = (0, 0, 255)
-        return img, stats, why
+        """Where the light falls, over the arena. See `vision/lighting.py`."""
+        return lighting.brightness_map(frame, self.hom, out_w, out_h)
 
     # -- the ball --------------------------------------------------------
 
@@ -754,6 +718,7 @@ class App:
             True, GREY), (130, 16))
         self.draw_view(s)
         self.draw_log(s)
+        self.draw_profile(s)
         self.draw_panel(s)
 
     def _blit_bgr(self, s, img):
@@ -868,7 +833,17 @@ class App:
         # measured. The arena heading beside it has been through the
         # homography; if the two ever disagree about which way is which, the
         # calibration is the thing to doubt.
-        ang = math.radians(r["theta_img"])
+        # From the two mapped ENDPOINTS, not from the angle. `theta_img` is an
+        # angle in the camera frame and the brightness view has been through
+        # the homography, which does not preserve angles — drawing the image
+        # angle over warped dots puts the arrow at an angle to its own lights.
+        pf = px_of((r["front"]["x"], r["front"]["y"])) if r.get("front") else None
+        pb = px_of((r["back"]["x"], r["back"]["y"])) if r.get("back") else None
+        if pf is not None and pb is not None:
+            ang = math.atan2(pf[1] - pb[1], pf[0] - pb[0])
+            rad = max(6.0, math.hypot(pf[0] - pb[0], pf[1] - pb[1]) / 2.0)
+        else:
+            ang = math.radians(r["theta_img"])
         tip = (cx + math.cos(ang) * rad * 1.9, cy + math.sin(ang) * rad * 1.9)
         tail = (cx - math.cos(ang) * rad * 1.4, cy - math.sin(ang) * rad * 1.4)
         tone = MINT if (r["conf"] or 0) > 0.35 else SUN
@@ -891,6 +866,91 @@ class App:
                 continue
             s.blit(self.fs.render(label, True, colour),
                    (int(p[0]) + 8, int(p[1]) - 6))
+
+    def draw_profile(self, s):
+        """Saturation and value against radius, for one light.
+
+        ANNULUS is a guess — 1.1 to 2.4 times the core — and the right values
+        depend on the lens, the exposure and how hard the LED is driven. This
+        is how you replace the guess with a measurement: the white core is
+        where SAT collapses, the halo is where SAT is high and VAL is still up,
+        and floor is where VAL falls away. The shaded band is where the code is
+        currently sampling; if it is not sitting on the halo, that is the bug.
+        """
+        card(s, PROFILE)
+        y = section(s, self.fs, "colour vs radius", PROFILE.x + 10,
+                    PROFILE.y + 8, PROFILE.w - 20)
+        r = self.reading
+        light = r.get("front") or (r.get("group") or r.get("lights") or [None])[0]
+        frame = self.grab.frame
+        if light is None or frame is None:
+            s.blit(self.f.render("no light to profile", True, GREY),
+                   (PROFILE.x + 12, y + 10))
+            return
+
+        core = max(1.0, float(light.get("core_px") or 1.0))
+        max_r = max(8.0, core * 4.0)
+        prof = radial_profile(frame, (light["x"], light["y"]), max_r,
+                              step=max(0.5, max_r / 40.0))
+        if not prof:
+            s.blit(self.f.render("nothing to profile", True, GREY),
+                   (PROFILE.x + 12, y + 10))
+            return
+
+        plot = pygame.Rect(PROFILE.x + 34, y + 8, PROFILE.w - 50, 190)
+        pygame.draw.rect(s, (8, 22, 36), plot)
+
+        def at(row, key):
+            fx = plot.x + (row["r"] / max_r) * plot.w
+            fy = plot.bottom - (row[key] / 255.0) * plot.h
+            return (fx, fy)
+
+        # where the code is sampling now
+        band = pygame.Rect(
+            plot.x + (ANNULUS[0] * core / max_r) * plot.w, plot.y,
+            max(2, ((ANNULUS[1] - ANNULUS[0]) * core / max_r) * plot.w), plot.h)
+        band = band.clip(plot)
+        if band.w:
+            shade = pygame.Surface((band.w, band.h), pygame.SRCALPHA)
+            shade.fill((99, 210, 232, 40))
+            s.blit(shade, band.topleft)
+
+        # the saturation floor a tag needs to clear
+        fy = plot.bottom - (MIN_TAG_SAT / 255.0) * plot.h
+        pygame.draw.line(s, (70, 60, 40), (plot.x, fy), (plot.right, fy), 1)
+
+        for key, tone in (("val", CHALK), ("sat", CYAN)):
+            pts = [at(row, key) for row in prof]
+            if len(pts) > 1:
+                pygame.draw.lines(s, tone, False, pts, 2)
+        pygame.draw.rect(s, RULE, plot, 1)
+
+        s.blit(self.fs.render("255", True, GREY), (PROFILE.x + 8, plot.y - 4))
+        s.blit(self.fs.render("0", True, GREY), (PROFILE.x + 8, plot.bottom - 8))
+        s.blit(self.fs.render(f"{max_r:.0f}px", True, GREY),
+               (plot.right - 26, plot.bottom + 4))
+        ty = plot.bottom + 20
+        s.blit(self.fs.render("val", True, CHALK), (PROFILE.x + 12, ty))
+        s.blit(self.fs.render("sat", True, CYAN), (PROFILE.x + 52, ty))
+        s.blit(self.fs.render(f"band {ANNULUS[0] * core:.0f}-"
+                              f"{ANNULUS[1] * core:.0f}px", True, DIM),
+               (PROFILE.x + 96, ty))
+        ty += 16
+        for label, value in (("core", f"{core:.1f}px"),
+                             ("ring", f"{light.get('ring_px', 0)}px"),
+                             ("sat", f"{(light.get('sat') or 0):.0f}"),
+                             ("hue", "—" if light.get("hue") is None
+                              else f"{light['hue']:.0f}")):
+            s.blit(self.fs.render(label, True, DIM), (PROFILE.x + 12, ty))
+            s.blit(self.f.render(value, True, CHALK), (PROFILE.x + 70, ty - 2))
+            ty += 17
+        if r.get("color"):
+            s.blit(self.f.render(f"tag: {r['color']}", True, MINT),
+                   (PROFILE.x + 12, ty + 2))
+        elif r.get("tag_why"):
+            for ln in _wrap(r["tag_why"], 30)[:4]:
+                s.blit(self.fs.render(ln, True, SUN), (PROFILE.x + 12, ty))
+                ty += 13
 
     def draw_log(self, s):
         card(s, LOG)
