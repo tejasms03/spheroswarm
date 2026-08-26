@@ -405,6 +405,138 @@ class Circle:
                 for a in np.linspace(0, 2 * math.pi, n)]
 
 
+class Polyline:
+    """A drawn path: a chain of points, walked at a fixed speed.
+
+    The same moving-setpoint contract as `Line` and `Circle`, so nothing above
+    this can tell a hand-drawn shape from a generated one and `tracking_error`
+    measures all three the same way. What it adds is ARCLENGTH. A shape with
+    two ends and a fixed speed can be followed by the clock; a shape somebody
+    drew has to be followed by where the robot actually got to, and "where it
+    got to" is a distance along the path rather than a time.
+    """
+
+    kind = "polyline"
+    MIN_SEGMENT = 1e-6
+    BACKTRACK_CM = 2.0          # how far a projection may slide backwards
+
+    def __init__(self, points, speed=25.0, loop=False):
+        pts = dedupe(points)
+        if loop and len(pts) > 2 and np.linalg.norm(pts[0] - pts[-1]) > self.MIN_SEGMENT:
+            pts = np.vstack([pts, pts[0]])
+        self.points = pts
+        self.loop = bool(loop) and len(pts) > 2
+        self.speed = float(speed)
+        self.t = 0.0
+        if len(pts) > 1:
+            self.seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        else:
+            self.seg = np.zeros(0)
+        self.cum = np.concatenate([[0.0], np.cumsum(self.seg)])
+
+    @property
+    def length(self):
+        return float(self.cum[-1])
+
+    def clamp_s(self, s):
+        """Arclength brought into range: wrapped on a loop, clipped otherwise."""
+        length = self.length
+        if length <= self.MIN_SEGMENT:
+            return 0.0
+        if self.loop:
+            return float(s % length)
+        return float(min(max(s, 0.0), length))
+
+    def point_at(self, s):
+        """(point, unit tangent) at arclength `s` along the path."""
+        if len(self.points) < 2 or self.length <= self.MIN_SEGMENT:
+            return self.points[0].copy(), np.zeros(2)
+        s = self.clamp_s(s)
+        i = int(np.searchsorted(self.cum, s, side="right") - 1)
+        i = min(max(i, 0), len(self.seg) - 1)
+        seg = float(self.seg[i])
+        a, b = self.points[i], self.points[i + 1]
+        u = 0.0 if seg <= self.MIN_SEGMENT else (s - self.cum[i]) / seg
+        return a + (b - a) * u, (b - a) / max(seg, self.MIN_SEGMENT)
+
+    def project(self, pos, from_s=0.0, window=None):
+        """Arclength of the nearest point on the path, searched FORWARD.
+
+        Forward, because a drawn path crosses itself and a loop meets itself:
+        the geometrically nearest point is ambiguous there, and a follower that
+        takes the wrong one jumps branches mid-drive. `window` caps how far
+        ahead one call may skip, so a robot knocked off the path rejoins near
+        where it left rather than wherever the shape happens to pass closest.
+        """
+        if len(self.points) < 2 or self.length <= self.MIN_SEGMENT:
+            return 0.0
+        p = np.asarray(pos, dtype=float)
+        a, b = self.points[:-1], self.points[1:]
+        ab = b - a
+        denom = np.maximum((ab * ab).sum(axis=1), 1e-12)
+        u = np.clip(((p - a) * ab).sum(axis=1) / denom, 0.0, 1.0)
+        proj = a + ab * u[:, None]
+        d = np.linalg.norm(proj - p, axis=1)
+        s = self.cum[:-1] + u * self.seg
+
+        lo = float(from_s) - self.BACKTRACK_CM
+        ok = s >= lo
+        if window is not None:
+            ok &= s <= float(from_s) + float(window)
+        if self.loop and window is not None and from_s + window > self.length:
+            # Past the seam the window continues at the start of the shape.
+            ok |= s <= (from_s + window) % self.length
+        if not ok.any():
+            # Nothing in range: either the robot is behind the whole window or
+            # the path ran out. Falling back to the global nearest is better
+            # than freezing the progress, and on a finished path it lands on
+            # the end — which is where the follower wants to be told to stop.
+            ok = np.ones_like(d, dtype=bool)
+        idx = int(np.argmin(np.where(ok, d, np.inf)))
+        return float(s[idx])
+
+    def step(self, dt, pos=None):
+        self.t += dt
+        s = self.speed * self.t
+        point, tangent = self.point_at(s)
+        if self.done:
+            return point, np.zeros(2)
+        return point, tangent * self.speed
+
+    @property
+    def done(self):
+        return (not self.loop) and self.speed * self.t >= self.length
+
+    def describe(self):
+        return (f"path {len(self.points)} pts, {self.length:.0f}cm"
+                f"{' closed' if self.loop else ''} at {self.speed:.0f}cm/s")
+
+    def preview(self, n=48):
+        """Sampled evenly by ARCLENGTH, not by vertex.
+
+        A drawn path has vertices wherever the hand happened to move, so one
+        sample per vertex is dense on the wiggles and sparse on the straights —
+        which is exactly backwards for anything measuring distance to the shape.
+        """
+        if len(self.points) < 2 or self.length <= self.MIN_SEGMENT:
+            return [self.points[0].copy() for _ in range(max(2, n))]
+        return [self.point_at(s)[0]
+                for s in np.linspace(0.0, self.length, max(2, n))]
+
+
+def dedupe(points, tol=1e-6):
+    """(n, 2) float array with consecutive repeats dropped, never empty."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    if not len(pts):
+        return np.zeros((1, 2))
+    keep = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - keep[-1]) > tol:
+            keep.append(p)
+    return np.asarray(keep, dtype=float)
+
+
+
 # Path length over straight-line distance, against the heading error that
 # produced it. Measured on the plant rather than derived: a closed-loop
 # controller with a rotated command frame reaches its target by a curve, and
