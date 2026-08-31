@@ -889,7 +889,20 @@ class App:
             return
 
         core = max(1.0, float(light.get("core_px") or 1.0))
-        max_r = max(8.0, core * 4.0)
+        # Out to the light's own EXTENT, not to a multiple of its core.
+        #
+        # `core * 4` is fine for a crisp LED and blind for a bloomed one. On an
+        # over-exposed frame the core thresholds tiny -- 2.4px -- while the
+        # light itself bleeds out past a hundred, so the profile only ever
+        # showed the innermost tenth of it: sat flat and low across the whole
+        # plot, because every sample was still inside the white middle. The
+        # colour was there, just further out than anything was looking.
+        #
+        # The floor of 40px is what makes this an instrument rather than a
+        # confirmation of the guess it exists to test.
+        area = float(light.get("area") or 0.0)
+        spread = math.sqrt(max(area, 1.0) / math.pi)
+        max_r = max(40.0, core * 4.0, spread * 4.0)
         prof = radial_profile(frame, (light["x"], light["y"]), max_r,
                               step=max(0.5, max_r / 40.0))
         if not prof:
