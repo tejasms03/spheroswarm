@@ -1,0 +1,84 @@
+[
+  {
+    "name": "exec_robot_create_thread",
+    "description": "Drives the robot along the path already generated for it by trace_targets. Returns immediately -- it posts the request and the tracking bench does the driving. Call wait_for_robot afterwards to find out how it ended.\n\nReturns one of:\n- \"Started controller thread for robot <id>\"\n- \"Path for specific robot doesn't exist. Generate path first\"\n- \"No robot is attached to this service — start the bench with --rpc before asking anything to drive.\"\n- \"Selected ID doesn't exist (<ids>)\"",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "robot_id": {
+          "type": "INTEGER",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "robot_padding": {
+          "type": "INTEGER",
+          "description": "Accepted and ignored. This rig has one robot, so there is nothing to keep clear of. Default: 30."
+        }
+      },
+      "required": ["robot_id"]
+    }
+  },
+  {
+    "name": "stop_robot_thread",
+    "description": "Stops the robot. The bench disarms on its next tick and the ball coasts briefly to a halt.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "robot_id": {
+          "type": "INTEGER",
+          "description": "Robot ID whose drive should be stopped."
+        },
+        "join_timeout": {
+          "type": "NUMBER",
+          "description": "Accepted and ignored -- there is no thread to join. Default: 5.0."
+        }
+      },
+      "required": ["robot_id"]
+    }
+  },
+  {
+    "name": "wait_for_robot",
+    "description": "Waits for the current drive to finish and reports HOW it ended. Always call this after exec_robot_create_thread instead of polling get_robot_state, which wastes calls on round trips.\n\nIMPORTANT: a robot stops for four different reasons and only one is success -- it arrived, it gave up stuck, the tracker lost the ball, or a person stopped it. Read 'arrived', not the fact that it stopped.\n\nReturns {\"arrived\": bool, \"outcome\": str, \"reason\": str, \"timed_out\": bool}. When outcome is 'stuck' the ball is against a boundary; a goal further from the edge is worth trying. When outcome is 'refused' the rig would not start at all and 'reason' says why -- a mirrored camera frame or a missing calibration cannot be fixed by retrying.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "robot_id": {
+          "type": "INTEGER",
+          "description": "Robot ID to wait on."
+        },
+        "timeout_s": {
+          "type": "NUMBER",
+          "description": "Seconds to wait before giving up. Default: 30."
+        }
+      },
+      "required": ["robot_id"]
+    }
+  },
+  {
+    "name": "get_robot_position",
+    "description": "Where the tracker last saw the robot, in arena pixels.\n\nReturns {\"tracked\": false, \"reason\": ...} when the ball is not currently visible -- a missing robot means 'not seen', never 'has not moved'. When tracked, 'theta' is the direction of TRAVEL rather than which way the robot faces (a Sphero is a sphere and has no visible facing); 'theta_is_measured' is false when the ball is at rest and the bearing is being held from its last motion, and 'theta_age_s' says how old that held bearing is.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "robot_id": {
+          "type": "INTEGER",
+          "description": "Robot ID to look up."
+        }
+      },
+      "required": ["robot_id"]
+    }
+  },
+  {
+    "name": "get_robot_state",
+    "description": "Returns 'moving' or 'halt'. Prefer wait_for_robot -- 'halt' says the robot stopped but not whether it arrived.",
+    "parameters": {
+      "type": "OBJECT",
+      "properties": {
+        "robot_id": {
+          "type": "INTEGER",
+          "description": "Robot ID to look up."
+        }
+      },
+      "required": ["robot_id"]
+    }
+  }
+]
