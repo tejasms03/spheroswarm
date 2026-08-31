@@ -20,6 +20,7 @@ import math
 import threading
 import time
 
+import cv2
 import numpy as np
 
 
@@ -86,6 +87,41 @@ class ArenaFrame:
     def scalar_to_px(self, cm):
         """A length, not a point. Radii and margins have to cross too."""
         return float(cm) * self.px_per_cm
+
+    def matrix_from(self, homography):
+        """Camera pixels straight to arena pixels, as one 3x3.
+
+        The scale composed onto the homography rather than applied after it.
+        Two transforms that have to be kept in step is how this project already
+        lost an afternoon to a drawn robot landing where its blob was not --
+        `Homography.nudge_cm` says so in as many words. One matrix cannot
+        disagree with itself.
+        """
+        S = np.array([[self.px_per_cm, 0.0, 0.0],
+                      [0.0, self.px_per_cm, 0.0],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        return S @ np.asarray(homography.M, dtype=np.float64)
+
+    def warp(self, frame, homography):
+        """The camera frame, rectified into the arena frame.
+
+        THIS MATTERS MORE THAN IT LOOKS. Their `stitched_frame` is not a
+        snapshot for the UI to pretty up -- `PlanningClient._get_planner` takes
+        the A* GRID SIZE from `frame.shape[:2]`, and with no `arena_corners` in
+        DataService it takes the arena rectangle from the frame bounds too. So
+        publishing the raw camera frame while publishing poses in arena pixels
+        builds a planner whose grid is one size and a robot whose coordinates
+        are another: on this rig a 1280x1020 grid under poses running to
+        1388x1108, where a ball at the far edge is simply off the map.
+
+        Warping fixes both halves at once. The grid matches the coordinates,
+        and their UI gets the rectified top-down view their own stitcher would
+        have produced, which is what it was written to draw.
+        """
+        if frame is None or not getattr(homography, "ready", False):
+            return None
+        return cv2.warpPerspective(frame, self.matrix_from(homography),
+                                   self.size_px)
 
 
 class Reading:
@@ -290,9 +326,13 @@ class Bridge(threading.Thread):
                 self.last_theta_at = time.time()
             self.published += 1
 
-        frame = self.app.frame
+        # Rectified, not raw -- see `ArenaFrame.warp`. A frame in camera
+        # pixels under poses in arena pixels gives their planner a grid that
+        # disagrees with the coordinates it is planning in.
+        w, h = self.arena.size_px
+        frame = self.arena.warp(self.app.frame, self.app.homography)
         if frame is None:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            frame = np.zeros((h, w, 3), dtype=np.uint8)
 
         # `ind`, `raw` and `hf` are the per-camera dicts their stitcher
         # produces. Nothing in Functions/Library or backend/ reads them on the
