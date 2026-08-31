@@ -61,6 +61,9 @@ class FakeApp:
         self._travel = travel
         self.frame = frame
         self.code = "CRXS"
+        # Read by the driver on every tick, because publishing also serves.
+        self.armed = False
+        self.fleet = None
 
     def to_cm(self, xy):
         return self.homography.to_cm([xy])[0]
@@ -88,6 +91,32 @@ def _tilted_homography():
     return cv2.getPerspectiveTransform(src, dst).astype(np.float64)
 
 
+class FakeRobot:
+    """The command half. Present because publishing SERVES as well as sends --
+    one thread and one socket do both, so a client with only `Data` on it is
+    not a client the bridge can use."""
+
+    def __init__(self):
+        self.attached = False
+
+    def attach(self):
+        self.attached = True
+        return True
+
+    def detach(self):
+        self.attached = False
+        return True
+
+    def take_request(self, rid):
+        return None
+
+    def take_course(self, rid):
+        return None
+
+    def set_outcome(self, rid, outcome, reason=None):
+        return True
+
+
 class FakeClient:
     """Records what `update_state` was called with."""
 
@@ -95,6 +124,7 @@ class FakeClient:
         self.calls = []
         self.raises = raises
         self.Data = self
+        self.Robot = FakeRobot()
 
     def update_state(self, frame, poses, obstacles, ind, raw, hf):
         if self.raises:
@@ -507,3 +537,26 @@ def test_no_frame_still_publishes_an_arena_sized_placeholder():
     bridge.publish_once()
     sent = client.calls[0]["frame"]
     assert (sent.shape[1], sent.shape[0]) == (1388, 1108)
+
+
+def test_publishing_ALSO_SERVES_drive_requests_on_the_same_thread():
+    """The wiring that was silently missing once already.
+
+    `str.replace` with a mismatched indent no-ops without complaining, and the
+    bridge published happily while never once serving a request -- every drive
+    came back "No robot is attached". One socket, one thread, both halves.
+    """
+    client = FakeClient()
+    bridge = Bridge(FakeApp(), robot_id=2, arena=ArenaFrame(ARENA_W, ARENA_H),
+                    client=client)
+    bridge.publish_once()
+    assert bridge.driver is not None
+    assert bridge.driver.attached is True
+
+
+def test_drive_can_be_turned_off_for_a_read_only_bridge():
+    client = FakeClient()
+    bridge = Bridge(FakeApp(), robot_id=2, arena=ArenaFrame(ARENA_W, ARENA_H),
+                    client=client, drive=False)
+    bridge.publish_once()
+    assert bridge.driver is None

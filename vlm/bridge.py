@@ -340,6 +340,15 @@ class Bridge(threading.Thread):
         # running -- so one camera under key 0 satisfies the signature without
         # pretending to a rig we do not have.
         client.Data.update_state(frame, poses, [], {0: frame}, {0: frame}, {})
+
+        # The command half, on THIS thread with THIS client. `RPCClient` holds
+        # one ZMQ REQ socket and it is not thread-safe, so a second thread
+        # polling for drive requests would interleave sends and receives on it.
+        if self._drive:
+            if self.driver is None:
+                from vlm.driver import Driver
+                self.driver = Driver(self.app, self.arena, self.robot_id)
+            self.driver.serve(client)
         return poses
 
 
