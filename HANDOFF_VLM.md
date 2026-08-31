@@ -182,8 +182,16 @@ Worth sending upstream. None are our doing and all four are live.
   darker matte arena, blink-and-difference, or a bandpass filter. Putting the
   robot's IDENTITY in a blink pattern rather than in hue is the only approach
   that survives full room lighting for detection and identity at once.
-- **Their React UI has not been run.** `backend/server.py` + `npm run build`.
-  The data is flowing, so this should mostly be setup.
+- **Their React UI RUNS**, and shows the ball live. Three things it needed:
+  `pip install pyserial` (`ReactGUI/port_utils` imports it at module scope even
+  with no serial hardware); a CLEAN `npm install` in `frontend/` -- the shipped
+  `node_modules` had a `vite` with no `dist/`, so `rm -rf node_modules
+  package-lock.json` first; and note it serves on **8080**, not the 8000 their
+  CLAUDE.md claims. Start it with `python3.13 backend/server.py` from the
+  framework root, after `vlm.server` and the bench.
+- **`vlm/server.py` names the robot Caraxes/CRXS by default**, so the UI labels
+  it that whatever the bench actually connected. Pass `--name/--code` to match,
+  or wire it to the roster.
 - **Per-point dwell times are dropped.** Their fourth path element is a pause in
   milliseconds; `pursue` follows a path, it does not stop partway along one. A
   route asking for a pause is driven straight through and says so.
