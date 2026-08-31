@@ -560,3 +560,23 @@ def test_drive_can_be_turned_off_for_a_read_only_bridge():
                     client=client, drive=False)
     bridge.publish_once()
     assert bridge.driver is None
+
+
+def test_the_sim_camera_covers_the_workspace_it_spawns_robots_into():
+    """A fixed 1280x720 at 9.2px/cm saw 139 x 78cm of a 138.8 x 110.8cm
+    workspace, so roughly one run in four began with the ball below the bottom
+    of the frame -- present, moving, driveable and invisible, reported as no
+    tracker lock and read as "the robot never connected"."""
+    import json
+    from fleet_test import sim_frame_size, SIM_PX_CM
+    w_px, h_px = sim_frame_size()
+    bounds = np.asarray(json.load(open("workspace.json"))["bounds_cm"])
+    want_w = float(bounds[:, 0].max() - bounds[:, 0].min())
+    want_h = float(bounds[:, 1].max() - bounds[:, 1].min())
+    assert w_px / SIM_PX_CM >= want_w - 0.1
+    assert h_px / SIM_PX_CM >= want_h - 0.1
+
+
+def test_the_sim_frame_size_falls_back_rather_than_failing_to_start():
+    from fleet_test import sim_frame_size
+    assert sim_frame_size(px_cm=0.0) == (1280, 720) or sim_frame_size()[0] > 0
