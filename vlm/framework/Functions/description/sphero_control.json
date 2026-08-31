@@ -121,5 +121,94 @@
         "radius"
       ]
     }
+  },
+  {
+    "name": "patrol",
+    "description": "Patrols back and forth between two points until stopped. Use this for any 'patrol', 'back and forth', 'sweep' or 'guard the edge' request.\n\nDO NOT build a patrol out of waypoints with trace_targets. An out-and-back route lays both legs on the same line, the follower cannot tell them apart, and the ball reverses early and oscillates around one end instead of covering the run.\n\nThis never arrives and wait_for_robot will time out on it. Call stop_robot_thread to end it.\n\nKeep both ends at least 100 pixels from every edge.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "x1": {
+          "type": "number",
+          "description": "First end, x in arena pixels."
+        },
+        "y1": {
+          "type": "number",
+          "description": "First end, y in arena pixels."
+        },
+        "x2": {
+          "type": "number",
+          "description": "Second end, x in arena pixels."
+        },
+        "y2": {
+          "type": "number",
+          "description": "Second end, y in arena pixels."
+        }
+      },
+      "required": [
+        "robot_id",
+        "x1",
+        "y1",
+        "x2",
+        "y2"
+      ]
+    }
+  },
+  {
+    "name": "set_trajectory",
+    "description": "Drives an explicit list of [x, y] waypoints in order, with no path planner in between. trace_targets runs A* and may move a goal it judges unreachable; this drives exactly the shape given, so use it when the shape itself matters. Needs at least two points. Reports arrival through wait_for_robot like an ordinary drive.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "points": {
+          "type": "array",
+          "description": "Waypoints as [[x, y], [x, y], ...] in arena pixels.",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "required": [
+        "robot_id",
+        "points"
+      ]
+    }
+  },
+  {
+    "name": "follow",
+    "description": "Chases a point, and keeps chasing it as you move it. Call again with a new x, y to move the target under a ball already on its way -- that updates the goal rather than starting a fresh drive.\n\nNOTE: nothing on this rig can pick a target by itself. Object detection needs SAM2 and a lit room while the ball tracker needs the room dark, and there is only one robot, so there is no second one to chase. You supply the coordinates.\n\nCall stop_robot_thread to stop.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "x": {
+          "type": "number",
+          "description": "Target x in arena pixels."
+        },
+        "y": {
+          "type": "number",
+          "description": "Target y in arena pixels."
+        }
+      },
+      "required": [
+        "robot_id",
+        "x",
+        "y"
+      ]
+    }
   }
 ]

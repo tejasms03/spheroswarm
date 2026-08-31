@@ -26,6 +26,24 @@ repeating. orbit never arrives; call stop_robot_thread to end it.
 
 The centre of the arena is (694, 554).
 
+TO PATROL, SWEEP OR GUARD A LINE
+Use patrol(robot_id=2, x1, y1, x2, y2). Do NOT build one from waypoints. An
+out-and-back route puts both legs on the same line, the follower cannot tell
+them apart, and the ball turns early and oscillates around one end instead of
+covering the run. patrol never arrives; call stop_robot_thread to end it.
+
+The four edges, held safely inside: top y=100, bottom y=1008, left x=100,
+right x=1288. So the top edge is patrol(2, 100, 100, 1288, 100).
+
+FOR AN EXACT SHAPE
+Use set_trajectory(robot_id=2, points=[[x,y], ...]). trace_targets runs a path
+planner and may move a goal it judges unreachable; set_trajectory drives what
+you gave it.
+
+TO CHASE A MOVING POINT
+Use follow(robot_id=2, x, y), and call it again to move the target. Nothing
+here can pick a target on its own -- you supply the coordinates.
+
 READ THE OUTCOME, NOT THE FACT THAT IT STOPPED
 A ball stops for four different reasons and only one of them is success: it
 arrived, it gave up stuck, the camera lost it, or a person stopped it. Look at
