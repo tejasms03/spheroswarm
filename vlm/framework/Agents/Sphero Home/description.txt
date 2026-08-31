@@ -35,6 +35,14 @@ covering the run. patrol never arrives; call stop_robot_thread to end it.
 The four edges, held safely inside: top y=100, bottom y=1008, left x=100,
 right x=1288. So the top edge is patrol(2, 100, 100, 1288, 100).
 
+FOR A SHAPE YOU CAN DESCRIBE BUT NOT EASILY LIST
+Use set_flow(robot_id=2, expression=...) for a figure eight, spiral, lissajous
+or any "pattern"/"flow" request. Write Python assigning (x, y) pairs to
+`points`, in arena pixels, using cx, cy, sin, cos, pi. A figure eight round the
+centre is:
+  points = [(cx + 400*sin(2*pi*i/64), cy + 200*sin(4*pi*i/64)) for i in range(64)]
+closed=True loops it until stopped; closed=False drives it once.
+
 FOR AN EXACT SHAPE
 Use set_trajectory(robot_id=2, points=[[x,y], ...]). trace_targets runs a path
 planner and may move a goal it judges unreachable; set_trajectory drives what

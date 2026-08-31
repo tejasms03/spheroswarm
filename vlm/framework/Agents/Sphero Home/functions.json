@@ -17,6 +17,10 @@
   },
   {
     "library": "sphero_control",
+    "name": "set_flow"
+  },
+  {
+    "library": "sphero_control",
     "name": "set_trajectory"
   },
   {

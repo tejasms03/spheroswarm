@@ -124,6 +124,8 @@ class Driver:
             self.app.disarm("stopped by the framework")
             self.last_note = "stopped"
             return "stopped"
+        if want == "flow":
+            return self.flow(client, request)
         if want == "patrol":
             return self.patrol(client, request)
         if want == "follow":
@@ -230,6 +232,88 @@ class Driver:
         self.served += 1
         self.was_armed = True
         self.last_note = "following"
+        return self.last_note
+
+    FLOW_VARS_PX = ("cx", "cy", "width", "height",
+                    "xmin", "xmax", "ymin", "ymax")
+
+    def flow(self, client, request):
+        """Evaluate a parametric curve in the sandbox, then drive it.
+
+        `tools/validate.compute_points` is the sandbox the formation tools
+        already use -- no imports, no attribute access beyond maths, no
+        `while`, one second. Two of its options are set differently here:
+        `expected_count=None`, because a curve is not one point per robot, and
+        `min_separation=0`, because consecutive samples along a curve are
+        MEANT to be close and the formation rule that keeps robots apart would
+        reject every trajectory.
+
+        The expression works in ARENA PIXELS, like every other tool the agent
+        has. Converting after evaluation rather than asking the model to think
+        in two unit systems at once is the whole reason `cx`, `cy` and the
+        bounds are handed in already scaled.
+        """
+        try:
+            from tools.validate import run_sandboxed
+        except Exception as e:
+            self.last_note = f"no sandbox: {type(e).__name__}: {e}"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+
+        w, h = self.arena.size_px
+        variables = {"n": 1, "cx": w / 2.0, "cy": h / 2.0,
+                     "width": float(w), "height": float(h),
+                     "xmin": 0.0, "xmax": float(w),
+                     "ymin": 0.0, "ymax": float(h)}
+        # `run_sandboxed`, not `compute_points`. The latter validates what it
+        # produced against the workspace, which is in CENTIMETRES -- feeding it
+        # pixels clamps every point to one corner, which is exactly what it did
+        # the first time. The checks that matter here are done below, in the
+        # units they belong to.
+        run = run_sandboxed(request["expression"], variables=variables)
+        if not run["ok"] or run["value"] is None:
+            self.refused += 1
+            self.last_note = ("the curve was refused: " +
+                              (run.get("error") or "it assigned no `points`"))
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+
+        try:
+            points = [np.asarray(self.arena.to_cm((float(x), float(y))),
+                                 dtype=float) for x, y in run["value"]]
+        except (TypeError, ValueError) as e:
+            self.refused += 1
+            self.last_note = f"`points` must be a list of (x, y): {e}"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        if len(points) < 2:
+            self.refused += 1
+            self.last_note = "a curve needs at least two points"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+
+        # The bench's own boundary rule, not a second copy of it. It refuses a
+        # goal the ball can only reach by shoving, and a curve is only as safe
+        # as its worst point.
+        bad = self.app.agent_check(points)
+        if bad:
+            self.refused += 1
+            self.last_note = bad
+            client.Robot.set_outcome(self.robot_id, "refused", bad)
+            return None
+
+        self.app.path = self.Path(points, closed=bool(request.get("closed")),
+                                  kind="flow")
+        self.app._arm_source = "vlm"
+        self.app.arm()
+        if not self.app.armed:
+            self.refused += 1
+            self.last_note = getattr(self.app, "note", "") or "arm refused"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        self.served += 1
+        self.was_armed = True
+        self.last_note = f"driving a {len(points)}-point curve"
         return self.last_note
 
     def report_probe(self, client):

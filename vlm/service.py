@@ -334,6 +334,35 @@ class SpheroRobot:
         return (f"Following ({x:.0f}, {y:.0f}). Call again to move the target; "
                 f"call stop_robot_thread to stop.")
 
+    def request_flow(self, robot_id, expression, closed=True):
+        """Drive a curve the caller DESCRIBES rather than enumerates.
+
+        For the shapes a waypoint list is a poor way to say: a figure eight, a
+        spiral, a lissajous. `tools/generate.py` already exists for exactly
+        this case -- "a model wants twenty points on a curve and would rather
+        write the curve than the twenty points" -- and this is that, pointed at
+        one robot's path instead of a formation.
+
+        The expression is evaluated on the BENCH, not here, because the sandbox
+        needs the workspace to check what it produced.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc before asking anything to drive.")
+        if not str(expression or "").strip():
+            return "An expression is required."
+        with self._lock:
+            self._requests[rid] = {"want": "flow", "at": time.time(),
+                                   "expression": str(expression),
+                                   "closed": bool(closed)}
+            self._outcomes.pop(rid, None)
+        return ("Evaluating the curve and driving it." +
+                (" This REPEATS until you call stop_robot_thread."
+                 if closed else ""))
+
     def request_stop(self, robot_id):
         rid = int(robot_id)
         with self._lock:
