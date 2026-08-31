@@ -181,7 +181,7 @@ class Bridge(threading.Thread):
         super().__init__(daemon=True, name="vlm-bridge")
         self.app = app
         self.robot_id = int(robot_id)
-        self.arena = arena or ArenaFrame(*_workspace_cm(app))
+        self._arena = arena
         self.period = 1.0 / max(1.0, float(hz))
         self._client = client
         self._stop = threading.Event()
@@ -191,6 +191,25 @@ class Bridge(threading.Thread):
         self.errors = 0
         self.last_error = None
         self.last_theta = None
+
+    @property
+    def arena(self):
+        """The arena rectangle, worked out on FIRST USE and then held.
+
+        Deliberately not resolved in `__init__`. In sim the bench replaces the
+        saved calibration with a bare px/cm scale and sets the homography's
+        width and height to zero -- it is a real mapping with no declared
+        rectangle -- so the only honest source for the arena size is the frame
+        the camera is actually producing, and at construction time there is not
+        one yet.
+
+        Held once resolved. An arena that changed size under a running planner
+        would move every published position without anything downstream being
+        told the units had shifted.
+        """
+        if self._arena is None:
+            self._arena = ArenaFrame(*_workspace_cm(self.app))
+        return self._arena
 
     def connect(self):
         """An RPCClient, or None and the bridge simply idles.
@@ -271,4 +290,22 @@ def _workspace_cm(app):
     h = app.homography
     if h is not None and getattr(h, "width", None) and getattr(h, "height", None):
         return float(h.width), float(h.height)
+
+    # No declared rectangle. In sim that is the normal case rather than a
+    # fault: the bench throws away the saved calibration and substitutes the
+    # exact scale the fake camera draws at, which is a real mapping that simply
+    # does not know how big the arena is. What the camera SEES is then the only
+    # honest answer, so map the frame's own corners through the homography and
+    # take the box they land in.
+    frame = getattr(app, "frame", None)
+    if h is not None and getattr(h, "ready", False) and frame is not None:
+        rows, cols = frame.shape[0], frame.shape[1]
+        corners = [(0, 0), (cols - 1, 0), (cols - 1, rows - 1), (0, rows - 1)]
+        cm = np.asarray(h.to_cm(corners), dtype=float)
+        return (float(cm[:, 0].max() - cm[:, 0].min()),
+                float(cm[:, 1].max() - cm[:, 1].min()))
+
+    # Nothing to go on. 200x200 is `vision.config.ARENA_CM`, and it is a
+    # placeholder rather than a measurement -- a bridge reporting into it is
+    # reporting into a floor nobody has calibrated.
     return 200.0, 200.0
