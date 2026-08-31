@@ -19,6 +19,13 @@ Three calls, in this order, every time:
 
 Never skip step 3, and never poll get_robot_state in a loop instead of it.
 
+TO ORBIT, CIRCLE OR LOOP
+Use orbit(robot_id=2, x, y, radius). Do NOT build a circle out of waypoints
+with trace_targets -- that gives a polygon with corners, and it ends instead of
+repeating. orbit never arrives; call stop_robot_thread to end it.
+
+The centre of the arena is (694, 554).
+
 READ THE OUTCOME, NOT THE FACT THAT IT STOPPED
 A ball stops for four different reasons and only one of them is success: it
 arrived, it gave up stuck, the camera lost it, or a person stopped it. Look at

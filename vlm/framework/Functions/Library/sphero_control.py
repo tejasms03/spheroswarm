@@ -96,3 +96,17 @@ def get_robot_position(robot_id: int) -> dict:
             # as a measured one.
             "theta_is_measured": bool(pose.get("theta_fresh", False)),
             "theta_age_s": pose.get("theta_age_s", 0.0)}
+
+
+def orbit(robot_id: int, x: float, y: float, radius: float) -> str:
+    """Drive a real CIRCLE around a point, repeating until stopped.
+
+    Use this instead of trace_targets whenever the ask is to orbit, circle,
+    go round, or patrol a loop. `trace_targets` can only express a list of
+    waypoints, so a circle asked for through it becomes a polygon: it has
+    corners the lookahead cuts, and it ENDS rather than repeating.
+
+    This never arrives. Call stop_robot_thread to end it.
+    """
+    return client.Robot.request_orbit(int(robot_id), float(x), float(y),
+                                      float(radius))

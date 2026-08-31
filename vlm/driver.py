@@ -124,6 +124,8 @@ class Driver:
             self.app.disarm("stopped by the framework")
             self.last_note = "stopped"
             return "stopped"
+        if want == "orbit":
+            return self.orbit(client, request)
         if want == "probe":
             return self.probe()
         if want != "drive":
@@ -150,6 +152,29 @@ class Driver:
         # as a transition. `drive` sets `was_armed` for the same reason.
         self.was_probing = True
         self.last_note = "probing the frame"
+        return self.last_note
+
+    def orbit(self, client, request):
+        """A real circle, not a polygon that approximates one.
+
+        Closed, so `pursue` runs it until something stops it. Nothing here
+        reports an arrival because there is not one to report -- the caller is
+        told that up front by `request_orbit` rather than discovering it when
+        `wait_for_robot` times out.
+        """
+        centre = self.arena.to_cm(request["centre"])
+        radius = self.arena.to_cm((request["radius"], 0.0))[0]
+        self.app.path = self.Path.circle(np.asarray(centre, float), radius)
+        self.app._arm_source = "vlm"
+        self.app.arm()
+        if not self.app.armed:
+            self.refused += 1
+            self.last_note = getattr(self.app, "note", "") or "arm refused"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        self.served += 1
+        self.was_armed = True
+        self.last_note = f"orbiting r={radius:.0f}cm"
         return self.last_note
 
     def report_probe(self, client):
