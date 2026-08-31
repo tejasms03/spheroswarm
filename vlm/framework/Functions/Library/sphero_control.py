@@ -110,3 +110,41 @@ def orbit(robot_id: int, x: float, y: float, radius: float) -> str:
     """
     return client.Robot.request_orbit(int(robot_id), float(x), float(y),
                                       float(radius))
+
+
+def patrol(robot_id: int, x1: float, y1: float, x2: float, y2: float) -> str:
+    """Patrol back and forth between two points, until stopped.
+
+    Use this for any "patrol", "back and forth", "sweep", or "guard the edge"
+    request. Do NOT build one out of waypoints with trace_targets: an
+    out-and-back route lays both legs on the same line, the follower cannot
+    tell them apart, and the ball reverses early and oscillates around one end
+    instead of covering the run.
+
+    This never arrives. Call stop_robot_thread to end it.
+    """
+    return client.Robot.request_patrol(int(robot_id), float(x1), float(y1),
+                                       float(x2), float(y2))
+
+
+def set_trajectory(robot_id: int, points: list) -> str:
+    """Drive an explicit list of [x, y] waypoints, in order, with no planner.
+
+    `trace_targets` runs A* and may move a goal it judges unreachable; this
+    drives exactly the shape given. Use it when the shape itself matters.
+    """
+    return client.Robot.request_trajectory(int(robot_id), points)
+
+
+def follow(robot_id: int, x: float, y: float) -> str:
+    """Chase a point, and keep chasing it as you move it.
+
+    Call again with a new x, y to move the target under a ball already on its
+    way -- that updates the goal rather than starting a fresh drive.
+
+    There is nothing on this rig for it to lock onto by itself: object
+    detection needs SAM2 and a lit room while the ball tracker needs the room
+    dark, and there is only one robot, so there is no second one to chase. You
+    supply the target.
+    """
+    return client.Robot.set_follow_target(int(robot_id), float(x), float(y))

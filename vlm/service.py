@@ -264,6 +264,76 @@ class SpheroRobot:
         return (f"Orbiting ({x:.0f}, {y:.0f}) at radius {radius:.0f}px. This "
                 f"REPEATS until you call stop_robot_thread — it never arrives.")
 
+    def request_patrol(self, robot_id, x1, y1, x2, y2):
+        """Back and forth between two points, until stopped.
+
+        NOT a path through `set_path`, and the difference is the whole reason
+        this exists. An out-and-back route lays both legs on the same line, so
+        the projection cannot tell them apart and the follower reverses on
+        floating-point noise near the far end -- a patrol that oscillates
+        around one corner and never covers the run. Pure pursuit cannot aim
+        around a 180-degree reversal either, so the fix is not a better path:
+        the bench drives two ordinary one-way legs and swaps the ends on
+        arrival, where arriving is an ordinary arrival.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc before asking anything to drive.")
+        with self._lock:
+            self._requests[rid] = {"want": "patrol", "at": time.time(),
+                                   "a": [float(x1), float(y1)],
+                                   "b": [float(x2), float(y2)]}
+            self._outcomes.pop(rid, None)
+        return (f"Patrolling ({x1:.0f}, {y1:.0f}) to ({x2:.0f}, {y2:.0f}). This "
+                f"REPEATS until you call stop_robot_thread — it never arrives.")
+
+    def request_trajectory(self, robot_id, points):
+        """Drive an explicit list of waypoints, with no planner in between.
+
+        `trace_targets` runs A* and may move a goal it thinks is unreachable;
+        this drives exactly what was asked for. Useful when the shape matters.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc before asking anything to drive.")
+        pts = [[float(a), float(b)] for a, b in (points or [])]
+        if len(pts) < 2:
+            return "A trajectory needs at least two points."
+        with self._lock:
+            self._paths[rid] = [[x, y, 0.0, 0] for x, y in pts]
+            self._requests[rid] = {"want": "drive", "at": time.time()}
+            self._outcomes.pop(rid, None)
+        return f"Driving a {len(pts)}-point trajectory for robot {rid}."
+
+    def set_follow_target(self, robot_id, x, y):
+        """Chase a point, and keep chasing it as it is updated.
+
+        A FOLLOWER, not a drive: calling this again while it is running moves
+        the target under a ball already going for it, rather than starting
+        again. There is nothing on this rig for it to lock onto by itself --
+        object detection needs SAM2 and a lit room while the tracker needs it
+        dark, and there is one robot, so there is no second one to chase. The
+        target has to be told to it.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc before asking anything to drive.")
+        with self._lock:
+            self._requests[rid] = {"want": "follow", "at": time.time(),
+                                   "target": [float(x), float(y)]}
+            self._outcomes.pop(rid, None)
+        return (f"Following ({x:.0f}, {y:.0f}). Call again to move the target; "
+                f"call stop_robot_thread to stop.")
+
     def request_stop(self, robot_id):
         rid = int(robot_id)
         with self._lock:

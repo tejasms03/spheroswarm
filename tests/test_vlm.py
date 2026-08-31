@@ -621,3 +621,43 @@ def test_with_NOTHING_saturated_the_order_is_unchanged_largest_first():
     blobs, _m, _n = find_blobs(frame)
     assert [b["area"] for b in blobs] == sorted(
         (b["area"] for b in blobs), reverse=True)
+
+
+# -- the ratchet must not rewind ----------------------------------------------
+
+def test_progress_NEVER_REWINDS_on_an_open_path():
+    """`BACK_CM` lets the projection settle behind so jitter cannot drag the
+    ball forward. Storing that as progress made it COMPOUND: the next window
+    centres on the rewound position and may go back again. A ball drifting
+    where the route passes near its own earlier self walked backwards a few
+    centimetres a frame -- a robot apparently returning to an old waypoint."""
+    from fleet_test import Path, pursue
+    path = Path([np.array([0.0, 0.0]), np.array([100.0, 0.0])])
+    pursue(path, np.array([50.0, 0.0]), lookahead=15.0, speed=20.0)
+    advanced = path.s
+    assert advanced > 40.0
+
+    for _ in range(20):                       # jitter backwards, repeatedly
+        pursue(path, np.array([advanced - 3.0, 2.0]), lookahead=15.0, speed=20.0)
+    assert path.s >= advanced, "progress rewound and compounded"
+
+
+def test_a_ball_PICKED_UP_may_still_relock_backwards():
+    """More than RELOCK_CM off the route means it was moved by hand, and
+    insisting on the old arc position would drive it somewhere it is not."""
+    from fleet_test import Path, pursue
+    path = Path([np.array([0.0, 0.0]), np.array([200.0, 0.0])])
+    pursue(path, np.array([150.0, 0.0]), lookahead=15.0, speed=20.0)
+    assert path.s > 100.0
+    pursue(path, np.array([10.0, 0.0]), lookahead=15.0, speed=20.0)
+    assert path.s < 60.0, "a moved ball must be allowed to re-lock"
+
+
+def test_a_CLOSED_path_may_still_wrap_to_zero():
+    """An orbit's arc position has to return to zero at the lap boundary."""
+    from fleet_test import Path, pursue
+    ring = Path.circle(np.array([0.0, 0.0]), 30.0)
+    pursue(ring, np.array([30.0, 0.0]), lookahead=15.0, speed=20.0)
+    ring.s = ring.length - 1.0
+    pursue(ring, np.array([30.0, 0.0]), lookahead=15.0, speed=20.0)
+    assert ring.s < ring.length / 2.0

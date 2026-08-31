@@ -1124,7 +1124,37 @@ def pursue(path, pos, lookahead, speed, goal_tol=ARRIVE_CM, radius=0.0,
     # what lets a run start with the ball anywhere near the route.
     s, off = path.project(pos, near=path.s if ratchet else None)
     if ratchet:
-        path.s = s
+        # PROGRESS DOES NOT REWIND, and the window alone did not guarantee it.
+        #
+        # `BACK_CM` lets the projection settle a couple of centimetres behind
+        # so blob jitter cannot drag the ball forward. Storing that as the new
+        # progress is what made it compound: the next frame's window is centred
+        # on the rewound position, so it may go back again, and again. A ball
+        # that drifts sideways where the route passes near its own earlier self
+        # walks backwards down the path a few centimetres a frame -- which
+        # looks exactly like a robot deciding to return to an old waypoint.
+        #
+        # The frame's own `s` is still what aims the lookahead, so the jitter
+        # allowance is unchanged. Only the RECORD of progress is monotonic.
+        #
+        # Two exceptions. A closed path wraps, so its arc position must be free
+        # to return to zero at the lap boundary. And a genuine re-lock -- the
+        # ball more than `RELOCK_CM` off the route, which means it was picked
+        # up and put somewhere -- has to be able to move progress backwards,
+        # because insisting on the old position would drive it to a place it is
+        # no longer near.
+        # A RE-LOCK IS RECOGNISED BY WHERE IT LANDED, not by `off`. When
+        # `project` gives up on the window and searches globally it returns the
+        # global distance, which is small by construction -- so the off-path
+        # distance can never reveal that it re-locked. What does reveal it is
+        # an arc position behind the window it was allowed to search.
+        #
+        # `path.s` is None until the first fix of a run, which is what lets a
+        # run start with the ball anywhere near the route.
+        if path.s is None or path.closed or s < path.s - path.BACK_CM:
+            path.s = s
+        else:
+            path.s = max(path.s, s)
     if not path.closed:
         remaining = path.length - s
         end = path.ring[-1]

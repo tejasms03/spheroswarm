@@ -124,6 +124,10 @@ class Driver:
             self.app.disarm("stopped by the framework")
             self.last_note = "stopped"
             return "stopped"
+        if want == "patrol":
+            return self.patrol(client, request)
+        if want == "follow":
+            return self.follow(client, request)
         if want == "orbit":
             return self.orbit(client, request)
         if want == "probe":
@@ -175,6 +179,57 @@ class Driver:
         self.served += 1
         self.was_armed = True
         self.last_note = f"orbiting r={radius:.0f}cm"
+        return self.last_note
+
+    def patrol(self, client, request):
+        """The bench's own patrol, which is a state machine and not a shape.
+
+        `start_patrol` drives one plain one-way leg and swaps the ends when it
+        arrives. The obvious alternative -- a single `[a, b, a]` path -- is the
+        thing that was already failing: both legs lie on the same line, the
+        projection cannot tell them apart, and the follower reverses on
+        floating-point noise near the far end. That is a patrol that
+        oscillates around one corner instead of covering its run.
+        """
+        a = self.arena.to_cm(request["a"])
+        b = self.arena.to_cm(request["b"])
+        self.app.start_patrol(np.asarray(a, float), np.asarray(b, float))
+        self.app._arm_source = "vlm"
+        self.app.arm()
+        if not self.app.armed:
+            self.refused += 1
+            self.last_note = getattr(self.app, "note", "") or "arm refused"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        self.served += 1
+        self.was_armed = True
+        self.last_note = "patrolling"
+        return self.last_note
+
+    def follow(self, client, request):
+        """Chase a point, and MOVE the target rather than restarting.
+
+        Re-arming on every update would zero the aim and clear the escape
+        budget each time the target twitched, which on a fast-moving target is
+        a ball that spends its life in `zero_at_rest` and never travels.
+        """
+        goal = np.asarray(self.arena.to_cm(request["target"]), dtype=float)
+        if self.app.armed and getattr(self.app.path, "kind", None) == "point":
+            self.app.path = self.Path.point(goal)
+            self.last_note = "target moved"
+            return self.last_note
+
+        self.app.path = self.Path.point(goal)
+        self.app._arm_source = "vlm"
+        self.app.arm()
+        if not self.app.armed:
+            self.refused += 1
+            self.last_note = getattr(self.app, "note", "") or "arm refused"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        self.served += 1
+        self.was_armed = True
+        self.last_note = "following"
         return self.last_note
 
     def report_probe(self, client):

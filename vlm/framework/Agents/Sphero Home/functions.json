@@ -13,6 +13,18 @@
   },
   {
     "library": "sphero_control",
+    "name": "follow"
+  },
+  {
+    "library": "sphero_control",
+    "name": "set_trajectory"
+  },
+  {
+    "library": "sphero_control",
+    "name": "patrol"
+  },
+  {
+    "library": "sphero_control",
     "name": "wait_for_robot"
   },
   {
