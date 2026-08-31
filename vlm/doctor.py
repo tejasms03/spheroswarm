@@ -42,6 +42,25 @@ def main(argv=None):
     if a.framework not in sys.path:
         sys.path.insert(0, a.framework)
 
+    # CHECKED BEFORE THE CONNECTION, because on cbor2 6.x the failure is not a
+    # connection error -- the server answers and then every numpy array over
+    # the wire dies with "error decoding semantic tag 42". Version 6 changed
+    # the tag_hook signature to pass the CBORTag first, and `rpc_system.py:69`
+    # expects 5.x's (decoder, tag), so `tag` binds to a bool. Their pyproject
+    # leaves cbor2 unpinned, so any fresh install or env change re-breaks it.
+    try:
+        import importlib.metadata as _meta
+        cbor = _meta.version("cbor2")
+        if int(cbor.split(".")[0]) >= 6:
+            print(f"{BAD} cbor2 {cbor} breaks their RPC layer")
+            print("       every numpy array over the wire will fail with")
+            print("       'error decoding semantic tag 42'")
+            print("\n  fix:  python3.13 -m pip install 'cbor2==5.9.0'\n")
+        else:
+            print(f"{OK} cbor2 {cbor}")
+    except Exception:
+        pass
+
     print(f"checking tcp://{a.host}:{a.port}\n")
     try:
         client = _client(a.host, a.port, int(a.timeout * 1000))

@@ -325,3 +325,23 @@ def test_a_tick_with_nothing_waiting_does_nothing():
     assert drv.serve(client) is None
     assert app.armed is False
     assert client.Robot.outcomes == []
+
+
+def test_arming_over_a_live_run_closes_the_old_one_first():
+    """Otherwise the replaced run never reaches disarm and never gets its end
+    row, which is where the verdict is written -- the reason `run_outcome` was
+    blank on most logged runs. An agent re-aiming mid-drive is exactly the case
+    that produces back-to-back arms."""
+    drv, app, client = a_driver(path=A_PATH_PX)
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    assert app.armed is True
+
+    app.disarms.clear()
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    # The FakeApp's arm() is a stand-in, so this pins the driver's half: a
+    # second request re-arms rather than being dropped, and the bench's own
+    # arm() closes the previous run (tests/test_fleet.py covers that side).
+    assert app.armed is True
+    assert drv.served == 2

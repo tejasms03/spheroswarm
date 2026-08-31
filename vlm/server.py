@@ -36,8 +36,27 @@ DEFAULT_FRAMEWORK = os.path.expanduser(
 FRAMEWORK = os.environ.get("VLM_FRAMEWORK", DEFAULT_FRAMEWORK)
 
 
-def build(port=5555, framework=None, robot_id=2, name="Caraxes", code="CRXS"):
+def roster_name(code):
+    """The roster's own name for a code, or the code itself.
+
+    So the dashboard labels the robot the bench actually connected. It used to
+    say Caraxes whatever was running, because the name was a default here
+    rather than a lookup, and a UI confidently naming the wrong robot is worse
+    than one naming none.
+    """
+    try:
+        from fleet.roster import Roster
+        entry = Roster.load().by_code(code)
+        if entry is not None:
+            return entry.name
+    except Exception:
+        pass
+    return code
+
+
+def build(port=5555, framework=None, robot_id=2, name=None, code="CRXS"):
     """The configured server, not yet running. Returned so tests can drive it."""
+    name = name or roster_name(code)
     root = framework or FRAMEWORK
     if not os.path.isdir(root):
         raise SystemExit(
@@ -70,13 +89,14 @@ def main(argv=None):
                    help="their Functions/Utilities directory "
                         "(or set VLM_FRAMEWORK)")
     p.add_argument("--robot-id", type=int, default=2)
-    p.add_argument("--name", default="Caraxes")
+    p.add_argument("--name", default=None,
+                   help="defaults to the roster's name for --code")
     p.add_argument("--code", default="CRXS")
     a = p.parse_args(argv)
 
     server = build(port=a.port, framework=a.framework, robot_id=a.robot_id,
                    name=a.name, code=a.code)
-    print(f"robot {a.robot_id} is {a.name} ({a.code}); "
+    print(f"robot {a.robot_id} is {a.name or roster_name(a.code)} ({a.code}); "
           f"start the bench with --rpc to put a ball behind it")
     server.run()
     return 0

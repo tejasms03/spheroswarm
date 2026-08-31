@@ -2534,6 +2534,17 @@ class BlobTest:
                      "re-probe. Nothing converges until then.", CORAL)
             return
         self.plant = plant_constants(self.code)
+        # CLOSE THE PREVIOUS RUN before starting another.
+        #
+        # Arming while already armed used to raise `run_id` and carry on, so
+        # the run that was replaced never reached `disarm` and never got its
+        # end row -- which is where the verdict is written. That is why
+        # `run_outcome` is blank on most of the logged runs: not because the
+        # outcome was unknown, but because nothing ever asked. It matters most
+        # exactly where the log matters most, since an agent re-aiming
+        # mid-drive is the case that produces back-to-back arms.
+        if self.armed:
+            self.disarm("superseded by a new path")
         h = self.fleet.handles.get(self.code)
         if h is not None:
             self.zero_at_rest(h)
