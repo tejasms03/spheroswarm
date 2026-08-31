@@ -392,3 +392,31 @@ def test_a_ball_at_each_corner_of_the_workspace_still_converts():
         assert got is not None
         assert 0 <= got.xy_px[0] <= w
         assert 0 <= got.xy_px[1] <= h
+
+
+def test_the_sim_bench_gets_its_arena_from_what_the_camera_SEES():
+    """In sim the homography is a real scale with no declared rectangle.
+
+    `fleet_test` throws away the saved calibration under `--source sim` and
+    substitutes the exact px/cm the fake camera draws at, setting width and
+    height to zero. Falling back to the 200x200 placeholder there would report
+    into a floor nobody calibrated; the frame's own extent is the honest answer.
+    """
+    app = FakeApp(frame=np.zeros((1020, 1280, 3), np.uint8))
+    app.homography = Homography(
+        [[1.0 / 9.2, 0.0, 0.0], [0.0, 1.0 / 9.2, 0.0], [0.0, 0.0, 1.0]])
+    app.homography.width = app.homography.height = 0.0
+
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    assert bridge.arena.width_cm == pytest.approx(1279 / 9.2, abs=0.2)
+    assert bridge.arena.height_cm == pytest.approx(1019 / 9.2, abs=0.2)
+
+
+def test_the_arena_is_resolved_once_and_then_held():
+    """A rectangle that changed under a running planner would move every
+    published position with nothing downstream told the units had shifted."""
+    app = FakeApp(frame=np.zeros((1020, 1280, 3), np.uint8))
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    first = bridge.arena
+    app.homography.width, app.homography.height = 999.0, 999.0
+    assert bridge.arena is first

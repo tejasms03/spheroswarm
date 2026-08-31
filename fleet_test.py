@@ -1185,6 +1185,16 @@ def latency_advice(speed_cm_s, plant):
 
 # -- the agent's tools -----------------------------------------------------
 
+RPC_ROBOT_ID = 2
+"""Which integer id this bench publishes as, under `--rpc`.
+
+The VLM framework addresses robots by int -- its `RobotService` ships with
+`[1, 2, 3, 4, 147, 248, 225, 699]` -- while this bench names them by code.
+One robot means one mapping, and 2 is the id their own sample
+`Data/robot_pos.txt` and `Data/astar_segments.json` already use, so their
+debug data and ours line up when read side by side.
+"""
+
 AGENT_MODEL = "qwen3.5:9b"
 """Preset from `llm/models.yaml`. Local by default; pointing this at a
 frontier model is a base-URL change in that file and nothing here."""
@@ -1443,7 +1453,7 @@ def to_surface(bgr):
 
 class BlobTest:
     def __init__(self, spec="0", size=None, exposure=-7, code=None,
-                 with_fleet=True, model=None):
+                 with_fleet=True, model=None, rpc=False):
         pygame.init()
         pygame.display.set_caption("fleet test — many bots, driven by an agent")
         try:
@@ -1580,6 +1590,24 @@ class BlobTest:
 
         self.sliders, self.buttons = [], []
         self.build_dock()
+
+        # -- publishing into the VLM framework, if asked --------------------
+        #
+        # Off by default and never fatal. The framework is a separate project
+        # with its own services running in their own processes; a bench that
+        # would not start because one of them is down would be a bad trade for
+        # an output nothing here reads back.
+        self.bridge = None
+        if rpc:
+            try:
+                from vlm.bridge import Bridge
+                self.bridge = Bridge(self, robot_id=RPC_ROBOT_ID)
+                self.bridge.start()
+                self.say(f"publishing to the VLM framework as robot "
+                         f"{RPC_ROBOT_ID}", DIM)
+            except Exception as e:
+                self.bridge = None
+                self.say(f"no VLM bridge: {e}", CORAL)
 
     # -- the robot --------------------------------------------------------
 
@@ -4789,8 +4817,14 @@ class BlobTest:
         self.close()
 
     def close(self):
-        # Before anything else: a window that closes while the ball is still
-        # rolling is the worst possible exit.
+        # The bridge goes FIRST. It reads the tracker on its own thread, and
+        # letting it run while the camera and the fleet are torn down beneath
+        # it is how a clean exit turns into a traceback from a daemon thread.
+        if self.bridge is not None:
+            self.bridge.stop()
+            self.bridge.join(timeout=1.0)
+        # Before anything else that matters: a window that closes while the
+        # ball is still rolling is the worst possible exit.
         self.disarm()
         self.log.close()
         self.cam.close()
@@ -4827,13 +4861,16 @@ def main(argv=None):
     p.add_argument("--robot", default=None,
                    help="connect this roster entry at startup instead of scanning")
     p.add_argument("--no-fleet", action="store_true")
+    p.add_argument("--rpc", action="store_true",
+                   help="publish position into the VLM framework's DataService "
+                        f"as robot {RPC_ROBOT_ID} (its RPC server must be up)")
     p.add_argument("--model", default=None,
                    help="a preset from llm/models.yaml, e.g. qwen3.5:4b. "
                         "Default qwen3.5:9b; omit the model entirely with none")
     a = p.parse_args(argv)
     size = tuple(int(v) for v in a.size.lower().split("x")) if a.size else None
     BlobTest(a.camera, size=size, exposure=a.exposure, code=a.robot,
-             with_fleet=not a.no_fleet, model=a.model).run()
+             with_fleet=not a.no_fleet, model=a.model, rpc=a.rpc).run()
     return 0
 
 
