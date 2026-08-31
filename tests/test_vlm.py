@@ -8,6 +8,7 @@ calibration file.
 """
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -420,3 +421,32 @@ def test_the_arena_is_resolved_once_and_then_held():
     first = bridge.arena
     app.homography.width, app.homography.height = 999.0, 999.0
     assert bridge.arena is first
+
+
+def test_a_HELD_bearing_carries_its_age_because_it_decays_into_a_fiction():
+    """Nothing here can tell that a stationary ball was lifted and set down
+    facing elsewhere -- a blob has no facing to check against. So the age goes
+    out and the consumer decides what it will still believe."""
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    got = Reading.of(FakeApp(travel=None), arena,
+                     last_theta=1.25, last_theta_at=100.0, now=142.0)
+    assert got.theta_age_s == pytest.approx(42.0)
+    assert got.as_pose()["theta_age_s"] == pytest.approx(42.0)
+
+
+def test_a_MEASURED_bearing_has_no_age():
+    got = Reading.of(FakeApp(travel=(90.0, 0.0, 12.0)), ArenaFrame(ARENA_W, ARENA_H),
+                     last_theta=0.1, last_theta_at=1.0, now=999.0)
+    assert got.theta_fresh is True
+    assert got.theta_age_s == 0.0
+
+
+def test_the_age_grows_across_publishes_while_the_ball_stays_still():
+    client = FakeClient()
+    app = FakeApp(travel=(90.0, 0.0, 12.0))
+    bridge = Bridge(app, robot_id=2, client=client)
+    bridge.publish_once()
+    app._travel = None
+    bridge.last_theta_at = time.time() - 7.0
+    poses = bridge.publish_once()
+    assert poses[2]["theta_age_s"] >= 7.0

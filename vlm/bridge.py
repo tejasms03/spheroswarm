@@ -104,14 +104,15 @@ class Reading:
     confidently at a position nothing has measured for a minute.
     """
 
-    def __init__(self, xy_px, theta_rad, theta_fresh, status):
+    def __init__(self, xy_px, theta_rad, theta_fresh, status, theta_age_s=0.0):
         self.xy_px = xy_px
         self.theta_rad = theta_rad
         self.theta_fresh = theta_fresh
+        self.theta_age_s = theta_age_s
         self.status = status
 
     @classmethod
-    def of(cls, app, arena, last_theta=None):
+    def of(cls, app, arena, last_theta=None, last_theta_at=None, now=None):
         """Read the bench, or None if it has nothing trustworthy to report."""
         if app.blob is None or not app.homography.ready:
             return None
@@ -138,10 +139,10 @@ class Reading:
         # than fitting the pixel history, because a projective transform
         # preserves neither bearings nor distances -- a direction fitted in
         # pixels is not the direction the ball is driving in.
+        now = time.time() if now is None else now
         readout = app.travel_readout()
         if readout is not None:
-            theta = math.radians(readout[0])
-            fresh = True
+            theta, fresh, age = math.radians(readout[0]), True, 0.0
         else:
             # At rest there is no travel direction. The last one is the best
             # estimate available and is what a differential-drive consumer
@@ -150,8 +151,17 @@ class Reading:
             # `pose['theta']` unconditionally and would raise.
             theta = last_theta if last_theta is not None else 0.0
             fresh = False
+            # HOW OLD it is, because a held bearing decays into a fiction.
+            # `zero_at_rest` says why in the bench's own words: a reference
+            # taken minutes ago, or before a reconnect, or before somebody
+            # picked the ball up, describes a relationship that no longer
+            # holds. Nothing here can tell that a stationary ball was lifted
+            # and set down facing elsewhere -- a blob has no facing to check it
+            # against -- so the age is published and the consumer decides what
+            # it will still believe.
+            age = 0.0 if last_theta_at is None else max(0.0, now - last_theta_at)
 
-        return cls(xy_px, theta, fresh, app.track.status)
+        return cls(xy_px, theta, fresh, app.track.status, age)
 
     def as_pose(self):
         """The dict shape `ArucoDetector.detect_pose_multicams` returns."""
@@ -163,6 +173,7 @@ class Reading:
             # wants to know whether the bearing is current can look, and
             # nothing that does not care will trip over an extra key.
             "theta_fresh": bool(self.theta_fresh),
+            "theta_age_s": round(float(self.theta_age_s), 2),
             "tracking": str(self.status),
         }
 
@@ -191,6 +202,7 @@ class Bridge(threading.Thread):
         self.errors = 0
         self.last_error = None
         self.last_theta = None
+        self.last_theta_at = None
 
     @property
     def arena(self):
@@ -253,7 +265,8 @@ class Bridge(threading.Thread):
         if client is None:
             return None
 
-        reading = Reading.of(self.app, self.arena, self.last_theta)
+        reading = Reading.of(self.app, self.arena,
+                             self.last_theta, self.last_theta_at)
         if reading is None:
             poses = {}
             self.skipped += 1
@@ -261,6 +274,7 @@ class Bridge(threading.Thread):
             poses = {self.robot_id: reading.as_pose()}
             if reading.theta_fresh:
                 self.last_theta = reading.theta_rad
+                self.last_theta_at = time.time()
             self.published += 1
 
         frame = self.app.frame
