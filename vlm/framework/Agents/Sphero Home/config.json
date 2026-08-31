@@ -1,0 +1,8 @@
+{
+  "name": "Sphero Home",
+  "model": "@vertexai/anthropic.claude-sonnet-5",
+  "callable_agents": [],
+  "metadata": {
+    "note": "is_path_feasable is deliberately absent: it routes through pp.feasibility_check, which needs SAM segmentation masks from the Tasks service, and Tasks is not run on this rig."
+  }
+}
