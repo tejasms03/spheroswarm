@@ -82,9 +82,10 @@ def main(argv=None):
             # nothing to say. In sim the usual cause is geometric rather than
             # optical: the fake camera does not cover the area robots spawn in.
             print("       the bench is publishing but its tracker has no lock.")
-            print("       in sim: the default 1280x720 frame covers only")
-            print("       139 x 78cm while robots spawn anywhere in the")
-            print("       110.8cm-tall workspace -- pass --size 1280x1020.")
+            print("       in sim: the fake camera sizes itself from")
+            print("       workspace.json, so a bench started BEFORE that fix")
+            print("       still has a 1280x720 frame that misses the bottom")
+            print("       32cm of the arena -- restart it (no --size needed).")
             print("       on hardware: the ball is unlit, out of frame, or the")
             print("       room lights have blown the frame out.")
 
