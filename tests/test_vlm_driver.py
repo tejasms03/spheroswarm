@@ -345,3 +345,76 @@ def test_arming_over_a_live_run_closes_the_old_one_first():
     # arm() closes the previous run (tests/test_fleet.py covers that side).
     assert app.armed is True
     assert drv.served == 2
+
+
+# -- calibrate = zero the aim, then probe the frame ---------------------------
+
+class ProbingApp(FakeApp):
+    """A bench whose `start_probe` can succeed or refuse."""
+
+    def __init__(self, starts=True, mirrored=False):
+        super().__init__()
+        self.probe = None
+        self.mirrored = mirrored
+        self._starts = starts
+        self.probes = 0
+
+    def start_probe(self):
+        self.probes += 1
+        if self._starts:
+            self.probe = {"i": 0, "rows": []}
+        else:
+            self.note = "needs a homography and a locked track"
+
+
+def a_prober(**kw):
+    app = ProbingApp(**kw)
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2, path_cls=FakePath)
+    return drv, app, FakeClient()
+
+
+def test_calibrate_runs_the_bench_s_own_probe():
+    """`start_probe` zeroes the aim at rest before driving, so the sequence is
+    one call rather than two."""
+    drv, app, client = a_prober()
+    client.Robot.requests.append({"want": "probe"})
+    drv.serve(client)
+    assert app.probes == 1
+    assert "probing" in drv.last_note
+
+
+def test_a_probe_the_bench_REFUSES_is_reported_not_swallowed():
+    drv, app, client = a_prober(starts=False)
+    client.Robot.requests.append({"want": "probe"})
+    drv.serve(client)
+    assert app.probe is None
+    assert "homography" in drv.last_note
+
+
+def test_a_MIRRORED_verdict_comes_back_when_the_probe_finishes():
+    """The one thing that has to reach whoever pressed the button: nothing on
+    this rig converges while the frame is a reflection."""
+    drv, app, client = a_prober(mirrored=True)
+    client.Robot.requests.append({"want": "probe"})
+    drv.serve(client)
+    app.probe = None                      # the bench finishes it in its own tick
+    drv.serve(client)
+    assert client.Robot.outcomes[-1]["outcome"] == "mirrored"
+
+
+def test_a_CLEAN_probe_says_so_too():
+    drv, app, client = a_prober(mirrored=False)
+    client.Robot.requests.append({"want": "probe"})
+    drv.serve(client)
+    app.probe = None
+    drv.serve(client)
+    assert client.Robot.outcomes[-1]["outcome"] == "probed"
+
+
+def test_the_probe_verdict_is_reported_once():
+    drv, app, client = a_prober()
+    client.Robot.requests.append({"want": "probe"})
+    drv.serve(client)
+    app.probe = None
+    drv.serve(client); drv.serve(client); drv.serve(client)
+    assert len(client.Robot.outcomes) == 1
