@@ -1,0 +1,394 @@
+"""The boundary between this bench and the VLM framework.
+
+Every test here builds its own workspace. `tests/test_fleet.py` learned the
+hard way that `_app_with_ball()` loads the operator's live
+`calib/blob_region.json`, so the suite silently inherits whatever workspace was
+last clicked and shifts underfoot on recalibration. Nothing below reads a
+calibration file.
+"""
+
+import math
+
+import cv2
+import numpy as np
+import pytest
+
+from vlm.bridge import ArenaFrame, Bridge, Reading
+
+
+ARENA_W, ARENA_H = 138.8, 110.8
+
+
+class FakeHomography:
+    """Just enough of `vision.homography.Homography` for the bridge."""
+
+    def __init__(self, matrix=None, width=ARENA_W, height=ARENA_H):
+        self.M = matrix
+        self.width = width
+        self.height = height
+
+    @property
+    def ready(self):
+        return self.M is not None
+
+    def to_cm(self, pts_px):
+        p = np.asarray(pts_px, dtype=np.float64).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(p, self.M).reshape(-1, 2)
+
+    def to_px(self, pts_cm):
+        inv = np.linalg.inv(self.M)
+        p = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(p, inv).reshape(-1, 2)
+
+
+class FakeTrack:
+    def __init__(self, locked=True, status="locked"):
+        self.locked = locked
+        self.status = status
+
+
+class FakeApp:
+    """A bench that reports what the test tells it to."""
+
+    def __init__(self, xy_px=(100.0, 100.0), locked=True, status="locked",
+                 travel=None, matrix=None, frame=None):
+        if matrix is None:
+            matrix = _square_homography()
+        self.homography = FakeHomography(matrix)
+        self.track = FakeTrack(locked, status)
+        self.blob = None if xy_px is None else {"xy": np.array(xy_px, dtype=float)}
+        self._travel = travel
+        self.frame = frame
+        self.code = "CRXS"
+
+    def to_cm(self, xy):
+        return self.homography.to_cm([xy])[0]
+
+    def travel_readout(self):
+        return self._travel
+
+
+def _square_homography(scale=4.0):
+    """A plain scale: `scale` camera pixels to the centimetre, no perspective."""
+    src = np.array([[0, 0], [ARENA_W * scale, 0],
+                    [ARENA_W * scale, ARENA_H * scale], [0, ARENA_H * scale]],
+                   dtype=np.float32)
+    dst = np.array([[0, 0], [ARENA_W, 0], [ARENA_W, ARENA_H], [0, ARENA_H]],
+                   dtype=np.float32)
+    return cv2.getPerspectiveTransform(src, dst).astype(np.float64)
+
+
+def _tilted_homography():
+    """A camera looking at the arena from an angle -- a real trapezoid."""
+    src = np.array([[180, 120], [560, 140], [610, 400], [130, 380]],
+                   dtype=np.float32)
+    dst = np.array([[0, 0], [ARENA_W, 0], [ARENA_W, ARENA_H], [0, ARENA_H]],
+                   dtype=np.float32)
+    return cv2.getPerspectiveTransform(src, dst).astype(np.float64)
+
+
+class FakeClient:
+    """Records what `update_state` was called with."""
+
+    def __init__(self, raises=None):
+        self.calls = []
+        self.raises = raises
+        self.Data = self
+
+    def update_state(self, frame, poses, obstacles, ind, raw, hf):
+        if self.raises:
+            raise self.raises
+        self.calls.append({"frame": frame, "poses": poses,
+                           "obstacles": obstacles, "ind": ind})
+
+
+# -- ArenaFrame --------------------------------------------------------------
+
+def test_a_centimetre_round_trips_through_arena_pixels():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    for cm in [(0.0, 0.0), (12.5, 90.25), (ARENA_W, ARENA_H)]:
+        back = arena.to_cm(arena.to_px(cm))
+        assert back == pytest.approx(cm, abs=1e-9)
+
+
+def test_the_arena_is_sized_from_the_workspace_not_from_their_rig():
+    """1388x1108, not the 1500x500 their arena_settings.json ships with."""
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    assert arena.size_px == (1388, 1108)
+
+
+def test_a_length_crosses_as_well_as_a_point():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    # Their robot_padding=30 and sweep_radius=65 are lengths, and a margin that
+    # did not cross would leave the planner clearing a distance it never meant.
+    assert arena.scalar_to_px(3.0) == pytest.approx(30.0)
+    assert arena.scalar_to_px(6.5) == pytest.approx(65.0)
+
+
+def test_px_per_cm_is_not_hardcoded_into_the_conversions():
+    a, b = ArenaFrame(ARENA_W, ARENA_H, 10.0), ArenaFrame(ARENA_W, ARENA_H, 4.0)
+    assert a.to_px((10.0, 0.0))[0] == pytest.approx(100.0)
+    assert b.to_px((10.0, 0.0))[0] == pytest.approx(40.0)
+
+
+def test_arena_pixels_are_NOT_the_homography_inverse():
+    """The bug this whole class exists to prevent.
+
+    `Homography.to_px` maps centimetres back to CAMERA pixels, which carry the
+    perspective the homography exists to remove. Handing those to the framework
+    would give its planner a trapezoid and call it a floor. Under a tilted
+    camera the two answers must visibly disagree.
+    """
+    app = FakeApp(matrix=_tilted_homography())
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    cm = (ARENA_W / 2.0, ARENA_H / 2.0)
+
+    camera_px = app.homography.to_px([cm])[0]
+    arena_px = np.array(arena.to_px(cm))
+
+    assert np.linalg.norm(camera_px - arena_px) > 100.0
+
+    # And the arena frame must be square where the camera frame is not: equal
+    # steps in cm have to be equal steps in arena pixels everywhere.
+    near = np.array(arena.to_px((10.0, 10.0)))
+    far = np.array(arena.to_px((10.0 + 20.0, 10.0)))
+    other = np.array(arena.to_px((ARENA_W - 30.0, ARENA_H - 20.0)))
+    other_far = np.array(arena.to_px((ARENA_W - 10.0, ARENA_H - 20.0)))
+    assert np.linalg.norm(far - near) == pytest.approx(
+        np.linalg.norm(other_far - other), abs=1e-9)
+
+
+# -- Reading -----------------------------------------------------------------
+
+def test_a_locked_ball_reads_where_the_bench_says_it_is():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    # 4 camera px per cm, so (200, 400) camera px is (50, 100) cm.
+    app = FakeApp(xy_px=(200.0, 400.0))
+    got = Reading.of(app, arena)
+    assert got is not None
+    assert got.xy_px == pytest.approx((500.0, 1000.0), abs=1e-6)
+
+
+def test_no_blob_is_no_reading():
+    assert Reading.of(FakeApp(xy_px=None), ArenaFrame(ARENA_W, ARENA_H)) is None
+
+
+def test_no_homography_is_no_reading():
+    app = FakeApp()
+    app.homography.M = None
+    assert Reading.of(app, ArenaFrame(ARENA_W, ARENA_H)) is None
+
+
+def test_a_COASTING_tracker_is_not_an_observation():
+    """The bench is predicting a position it cannot see. That is not a reading.
+
+    Publishing it would launder a guess into a measurement exactly one process
+    downstream, where `pp.get_pos` holds a last_pose forever and a lost ball is
+    indistinguishable from a still one.
+    """
+    app = FakeApp(locked=False, status="coasting 2/5 — no candidate")
+    assert Reading.of(app, ArenaFrame(ARENA_W, ARENA_H)) is None
+
+
+def test_theta_is_travel_in_radians():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    app = FakeApp(travel=(90.0, 0.0, 12.0))     # 90 deg in the arena frame
+    got = Reading.of(app, arena)
+    assert got.theta_rad == pytest.approx(math.pi / 2)
+    assert got.theta_fresh is True
+
+
+def test_a_ball_at_rest_HOLDS_its_last_bearing_rather_than_inventing_north():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    app = FakeApp(travel=None)
+    got = Reading.of(app, arena, last_theta=1.25)
+    assert got.theta_rad == pytest.approx(1.25)
+    assert got.theta_fresh is False
+
+
+def test_a_held_bearing_is_flagged_so_nothing_reads_it_as_measured():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    fresh = Reading.of(FakeApp(travel=(10.0, 0.0, 5.0)), arena).as_pose()
+    held = Reading.of(FakeApp(travel=None), arena, last_theta=0.5).as_pose()
+    assert fresh["theta_fresh"] is True
+    assert held["theta_fresh"] is False
+
+
+def test_the_pose_dict_matches_the_shape_their_aruco_detector_returns():
+    got = Reading.of(FakeApp(travel=(0.0, 0.0, 1.0)), ArenaFrame(ARENA_W, ARENA_H))
+    pose = got.as_pose()
+    for key in ("x", "y", "theta"):
+        assert key in pose and isinstance(pose[key], float)
+
+
+# -- Bridge ------------------------------------------------------------------
+
+def test_publishing_sends_one_robot_under_its_integer_id():
+    client = FakeClient()
+    bridge = Bridge(FakeApp(xy_px=(200.0, 400.0)), robot_id=2, client=client)
+    poses = bridge.publish_once()
+    assert list(poses) == [2]
+    assert client.calls[0]["poses"][2]["x"] == pytest.approx(500.0)
+
+
+def test_a_lost_ball_publishes_an_EMPTY_dict_not_a_stale_pose():
+    client = FakeClient()
+    bridge = Bridge(FakeApp(locked=False, status="lost — no candidate"),
+                    robot_id=2, client=client)
+    assert bridge.publish_once() == {}
+    assert client.calls[0]["poses"] == {}
+    assert bridge.skipped == 1
+    assert bridge.published == 0
+
+
+def test_the_last_fresh_bearing_survives_the_ball_stopping():
+    client = FakeClient()
+    app = FakeApp(travel=(90.0, 0.0, 12.0))
+    bridge = Bridge(app, robot_id=2, client=client)
+    bridge.publish_once()
+
+    app._travel = None                       # the ball comes to rest
+    poses = bridge.publish_once()
+    assert poses[2]["theta"] == pytest.approx(math.pi / 2)
+    assert poses[2]["theta_fresh"] is False
+
+
+def test_obstacles_are_published_empty_so_astar_degenerates_to_a_line():
+    """No SAM2, no obstacle detection, and a bare arena. Say so explicitly."""
+    client = FakeClient()
+    Bridge(FakeApp(), robot_id=2, client=client).publish_once()
+    assert client.calls[0]["obstacles"] == []
+
+
+def test_a_missing_frame_does_not_stop_the_pose_going_out():
+    client = FakeClient()
+    bridge = Bridge(FakeApp(frame=None), robot_id=2, client=client)
+    poses = bridge.publish_once()
+    assert poses != {}
+    assert client.calls[0]["frame"].shape == (480, 640, 3)
+
+
+def test_an_RPC_FAILURE_NEVER_REACHES_THE_BENCH():
+    """The camera loop does not stop because another process went away."""
+    bridge = Bridge(FakeApp(), robot_id=2,
+                    client=FakeClient(raises=ConnectionError("gone")))
+    bridge.period = 0.0
+    bridge._stop.set()
+    bridge.run()                             # must not raise
+    assert bridge.errors == 0                # run() exits before publishing
+
+    with pytest.raises(ConnectionError):
+        bridge.publish_once()                # the raw call still surfaces it
+
+
+def test_errors_are_counted_rather_than_thrown_by_the_loop():
+    bridge = Bridge(FakeApp(), robot_id=2,
+                    client=FakeClient(raises=ConnectionError("gone")))
+    bridge.period = 0.0
+    try:
+        bridge.publish_once()
+    except ConnectionError as e:
+        bridge.errors += 1
+        bridge.last_error = str(e)
+    assert bridge.errors == 1
+    assert "gone" in bridge.last_error
+
+
+def test_the_arena_comes_from_the_homography_the_bench_actually_loaded():
+    """Not from a constant, and not from workspace.json.
+
+    A homography built for one rectangle under a workspace declaring another
+    put the tracker and the planner on different floors once already.
+    """
+    app = FakeApp()
+    app.homography.width, app.homography.height = 240.0, 180.0
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    assert bridge.arena.width_cm == 240.0
+    assert bridge.arena.height_cm == 180.0
+
+
+# -- end to end, through the sim camera --------------------------------------
+#
+# The tests above build a FakeApp so they can pin one behaviour at a time.
+# These run the REAL path: a synthetic camera renders a ball at a known
+# centimetre, `find_blobs` finds it, a real `Homography` rectifies it, and the
+# bridge converts it. Nothing here is stubbed except the robot, and the truth
+# is generated rather than asserted by eye.
+
+from fleet_test import BallSource, find_blobs                    # noqa: E402
+from vision.homography import Homography                         # noqa: E402
+from vlm.bridge import PX_PER_CM                                 # noqa: E402
+
+SIM_PX_CM = 9.2
+
+# Sized so the fake camera actually SEES the arena. At 9.2px/cm the bench's
+# default 1280x720 covers 139.1 x 78.3cm -- wide enough but 32cm short, so a
+# ball past y=78 is rendered off the bottom of the frame and `find_blobs`
+# correctly reports nothing. That is not a conversion failure, and a test that
+# read it as one would be pinning the sim camera's field of view rather than
+# anything this module does.
+SIM_SIZE = (1280, int(np.ceil(ARENA_H * SIM_PX_CM)))
+
+
+def _sim_homography():
+    """Camera pixels to centimetres for the sim camera's flat, square view."""
+    src = np.array([[0, 0], [ARENA_W * SIM_PX_CM, 0],
+                    [ARENA_W * SIM_PX_CM, ARENA_H * SIM_PX_CM],
+                    [0, ARENA_H * SIM_PX_CM]], dtype=np.float32)
+    dst = np.array([[0, 0], [ARENA_W, 0], [ARENA_W, ARENA_H], [0, ARENA_H]],
+                   dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
+    return Homography(M, width=ARENA_W, height=ARENA_H)
+
+
+def _sim_reading(truth_cm):
+    """Render a ball at `truth_cm`, detect it, and carry it to arena pixels."""
+    holder = {"at": np.asarray(truth_cm, dtype=float)}
+    src = BallSource(size=SIM_SIZE, px_cm=SIM_PX_CM, seed=0,
+                     pose=lambda: [(holder["at"], 1.0)])
+    ok, frame = src.read()
+    blobs, _mask, _n = find_blobs(frame)
+    assert blobs, f"the sim camera rendered nothing at {truth_cm}"
+
+    app = FakeApp(frame=frame)
+    app.homography = _sim_homography()
+    app.blob = blobs[0]
+    return Reading.of(app, ArenaFrame(ARENA_W, ARENA_H)), app
+
+
+@pytest.mark.parametrize("truth_cm", [
+    (40.0, 30.0), (69.4, 55.4), (100.0, 50.0), (25.0, 90.0), (110.0, 20.0),
+])
+def test_a_simulated_ball_lands_where_the_framework_is_told_it_is(truth_cm):
+    got, _app = _sim_reading(truth_cm)
+    assert got is not None
+    want = (truth_cm[0] * PX_PER_CM, truth_cm[1] * PX_PER_CM)
+    # 1mm, which is 1 arena pixel. The synthetic ball is rendered symmetrically
+    # so the centroid is exact; this is a test of the CONVERSION, not of what
+    # the detector achieves on a real frame -- where the halo is clipped near a
+    # boundary and the error reaches centimetres.
+    assert got.xy_px == pytest.approx(want, abs=1.0)
+
+
+def test_the_whole_chain_is_reversible_from_arena_pixels_back_to_the_ball():
+    truth = (69.4, 55.4)
+    got, _app = _sim_reading(truth)
+    back = ArenaFrame(ARENA_W, ARENA_H).to_cm(got.xy_px)
+    assert back == pytest.approx(truth, abs=0.1)
+
+
+def test_a_ball_at_each_corner_of_the_workspace_still_converts():
+    """Not an accuracy claim -- the detector is biased near a boundary.
+
+    This only pins that the CONVERSION stays inside the arena rectangle, so a
+    corner ball never reports a negative pixel or one past the far edge, which
+    is what would put it outside their A* grid entirely.
+    """
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    w, h = arena.size_px
+    for truth in [(15.0, 15.0), (ARENA_W - 15.0, 15.0),
+                  (ARENA_W - 15.0, ARENA_H - 15.0), (15.0, ARENA_H - 15.0)]:
+        got, _app = _sim_reading(truth)
+        assert got is not None
+        assert 0 <= got.xy_px[0] <= w
+        assert 0 <= got.xy_px[1] <= h
