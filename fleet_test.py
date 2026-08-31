@@ -119,6 +119,16 @@ are on the dock, so this is tuned by watching rather than by guessing. On real
 hardware the number will differ; the two things to watch will not.
 """
 
+BRIGHT_PEAK = 200.0
+"""Peak value at which a blob is taken to contain an actual LED core.
+
+Not a detection threshold -- `V_MIN` is that, and it stays low so the halo
+survives as one component. This only ranks: a lamp pointed at a sensor clips,
+scenery does not. 200 rather than 255 because a ball at the far edge of the
+frame, or one whose LED has been dimmed a little, still cores well above
+anything reflected.
+"""
+
 MIN_AREA = 60
 MAX_AREA = 40000
 """Area gate, in pixels. The floor rejects sensor noise and a stray reflection;
@@ -255,8 +265,54 @@ def find_blobs(frame, v_min=V_MIN, min_area=MIN_AREA, max_area=MAX_AREA,
                     # mask has just made accurate.
                     "clipped_by_region": (detect is not None
                                           and touches_edge(labels, i, detect))})
-    out.sort(key=lambda b: -b["area"])
+    # LIT FIRST, then big. Sorting on area alone lets scenery win.
+    #
+    # A ball's LED core SATURATES -- it reads 255 at the centre because that is
+    # what a lamp pointed at a sensor does. Glare on a floor, a reflection, a
+    # lit patch of wall inside the grown mask: those are broad and dim. Area
+    # alone cannot tell them apart and the bigger one wins, so on two of the
+    # twenty-four saved frames that have blobs at all, the real ball was
+    # outranked -- area 1648 peak 209 beaten by area 4211 peak 57, and area
+    # 6278 peak 255 beaten by area 9897 peak 132.
+    #
+    # Conservative on purpose. When NOTHING is saturated -- the LED turned
+    # down, a dim frame -- every blob scores the same on this key and the order
+    # is exactly what it was before, largest first. It can only ever promote a
+    # blob that looks like a lamp over one that does not.
+    #
+    # Out-of-region blobs sort last regardless. `outside_region` is kept rather
+    # than discarded (see the comment above) precisely so it can be ranked
+    # instead of thrown away.
+    out.sort(key=lambda b: (b["outside_region"],
+                            -(b["peak"] >= BRIGHT_PEAK),
+                            -b["area"]))
     return out, mask, n - 1
+
+
+BLOWN_MEAN_V = 90.0
+"""Mean V above which a frame is taken to be lit rather than dark.
+
+Measured, not guessed. Across the saved frames a working one means 5 to 7 and
+the three blown ones mean 165 to 167 — two orders of magnitude apart, with
+nothing anywhere near the middle. Ninety sits in that gap with room on both
+sides, so it takes a genuinely lit room to trip and cannot fire on a frame the
+tracker could still have read.
+"""
+
+
+def frame_blown(frame):
+    """Is this frame washed out, rather than merely empty?
+
+    The distinction the tracker cannot otherwise make. `find_blobs` thresholds
+    at `V_MIN` and takes connected components; when the whole image is above
+    the threshold there is one component covering everything, it fails
+    `MAX_AREA`, and the honest answer is zero blobs. Identical, from the
+    outside, to a dark room with no ball in it.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    v = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
+    return float(v.mean()) >= BLOWN_MEAN_V
 
 
 def read_one(frame, v_min=V_MIN, min_area=MIN_AREA, max_area=MAX_AREA):
@@ -1572,6 +1628,7 @@ class BlobTest:
         self.blob = None
         self.others = []
         self.why = None
+        self.blown = False
         self.parts = 0
         self.history = deque(maxlen=JITTER_N)
         self.trail = deque(maxlen=90)
@@ -2082,6 +2139,18 @@ class BlobTest:
             self.blob = self.track.update(candidates)
         self.others = [b for b in candidates if b is not self.blob]
         self.why = None if self.blob is not None else self.track.status
+        # SAY WHEN THE ROOM IS LIT, rather than reporting a lost ball.
+        #
+        # Three saved frames from 29 Aug are entirely above threshold -- mean V
+        # 165 against a working frame's 5 -- and produce no blobs at all,
+        # because a mask that keeps everything separates nothing. The tracker
+        # was blind, not confused, and it said "no candidate" like any other
+        # miss. That sends a person looking for a ball that has rolled away
+        # when what happened is that somebody turned the lights on.
+        self.blown = self.blob is None and frame_blown(self.frame)
+        if self.blown:
+            self.why = ("the frame is BLOWN OUT — the room lights are on, or "
+                        "the exposure is too high. Nothing can be tracked")
         if self.blob is not None:
             if not self.blob.get("clipped_by_region"):
                 # Remembered only while the blob is WHOLE, because that is the
@@ -3810,7 +3879,15 @@ class BlobTest:
         if not self.homography.ready:
             out["blocked"] = "no homography — there are no centimetres to aim in"
         if pos is None:
-            out["warning_position"] = f"no position: {self.track.status}"
+            # `self.why` carries the blown-frame verdict when there is one, and
+            # the tracker's own status otherwise. An agent told the room is lit
+            # can say so and stop; one told "no candidate" retries a drive
+            # against a camera that cannot see anything at all.
+            out["warning_position"] = f"no position: {self.why or self.track.status}"
+        if getattr(self, "blown", False):
+            out["blocked"] = ("the camera frame is BLOWN OUT — the room lights "
+                              "are on, or the exposure is too high. Nothing "
+                              "can be tracked until that is fixed")
         return out
 
     def agent_bounds(self):

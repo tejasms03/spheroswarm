@@ -580,3 +580,44 @@ def test_the_sim_camera_covers_the_workspace_it_spawns_robots_into():
 def test_the_sim_frame_size_falls_back_rather_than_failing_to_start():
     from fleet_test import sim_frame_size
     assert sim_frame_size(px_cm=0.0) == (1280, 720) or sim_frame_size()[0] > 0
+
+
+# -- lighting and blob ranking ------------------------------------------------
+
+def test_a_blown_out_frame_is_named_rather_than_read_as_a_lost_ball():
+    """Three saved frames from 29 Aug mean V 165 against a working frame's 5,
+    and yield zero blobs: a mask that keeps everything separates nothing. From
+    outside that is identical to a dark room with no ball in it, which sends a
+    person hunting a ball that rolled away when someone turned the lights on."""
+    from fleet_test import frame_blown, BLOWN_MEAN_V
+    dark = np.full((80, 80, 3), 6, np.uint8)
+    lit = np.full((80, 80, 3), 165, np.uint8)
+    assert frame_blown(dark) is False
+    assert frame_blown(lit) is True
+    assert frame_blown(None) is False
+    assert 7 < BLOWN_MEAN_V < 165, "the threshold must sit in the measured gap"
+
+
+def test_a_SATURATED_blob_outranks_a_bigger_dimmer_one():
+    """Sorting on area alone let scenery win. On two of the twenty-four saved
+    frames with blobs the real ball was outranked: area 1648 peak 209 beaten by
+    area 4211 peak 57, and area 6278 peak 255 beaten by area 9897 peak 132."""
+    from fleet_test import find_blobs, BRIGHT_PEAK
+    frame = np.zeros((300, 400, 3), np.uint8)
+    cv2.circle(frame, (110, 150), 46, (60, 60, 60), -1)      # big, dim: glare
+    cv2.circle(frame, (300, 150), 26, (255, 255, 255), -1)   # small, lit: ball
+    blobs, _m, _n = find_blobs(frame)
+    assert len(blobs) == 2
+    assert blobs[0]["peak"] >= BRIGHT_PEAK
+    assert blobs[0]["area"] < blobs[1]["area"], "the lit one must win on peak"
+
+
+def test_with_NOTHING_saturated_the_order_is_unchanged_largest_first():
+    """Conservative on purpose: a dimmed LED must not reshuffle the ranking."""
+    from fleet_test import find_blobs
+    frame = np.zeros((300, 400, 3), np.uint8)
+    cv2.circle(frame, (110, 150), 46, (60, 60, 60), -1)
+    cv2.circle(frame, (300, 150), 26, (90, 90, 90), -1)
+    blobs, _m, _n = find_blobs(frame)
+    assert [b["area"] for b in blobs] == sorted(
+        (b["area"] for b in blobs), reverse=True)
