@@ -30,6 +30,7 @@ class Driver:
 
         self.attached = False
         self.was_armed = False
+        self.was_probing = False
         self.served = 0
         self.refused = 0
         self.last_note = ""
@@ -89,6 +90,7 @@ class Driver:
             self.attached = True
 
         self.report_finished(client)
+        self.report_probe(client)
 
         request = client.Robot.take_request(self.robot_id)
         if request is not None:
@@ -122,10 +124,47 @@ class Driver:
             self.app.disarm("stopped by the framework")
             self.last_note = "stopped"
             return "stopped"
+        if want == "probe":
+            return self.probe()
         if want != "drive":
             self.last_note = f"unknown request {want!r}"
             return None
         return self.drive(client)
+
+    def probe(self):
+        """Zero the aim and probe the frame, via the bench's own routine.
+
+        `start_probe` disarms, zeroes at rest, then drives each cardinal
+        heading through `drive_raw` and reads back where the ball actually
+        went. Its refusals -- nothing connected, no homography, no lock -- are
+        left to it: they print in the bench window, which is where somebody
+        running a calibration is looking.
+        """
+        self.app.start_probe()
+        if getattr(self.app, "probe", None) is None:
+            self.last_note = getattr(self.app, "note", "") or "probe refused"
+            return None
+        # Marked HERE, not left to the next tick's `report_probe`. That runs at
+        # the top of `serve`, before the request is obeyed, so it would read
+        # False on the tick the probe starts and the finish would never be seen
+        # as a transition. `drive` sets `was_armed` for the same reason.
+        self.was_probing = True
+        self.last_note = "probing the frame"
+        return self.last_note
+
+    def report_probe(self, client):
+        """Say how the probe ended, once, on the tick it finishes."""
+        probing = getattr(self.app, "probe", None) is not None
+        if self.was_probing and not probing:
+            mirrored = bool(getattr(self.app, "mirrored", False))
+            client.Robot.set_outcome(
+                self.robot_id,
+                "mirrored" if mirrored else "probed",
+                getattr(self.app, "note", "") or
+                ("the frame is MIRRORED — flip an axis and probe again; "
+                 "nothing will converge until this is clean" if mirrored
+                 else "the frame is a rotation, which is what it should be"))
+        self.was_probing = probing
 
     def drive(self, client):
         """Build the bench's own Path from their waypoints, and arm."""

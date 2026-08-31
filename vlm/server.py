@@ -54,6 +54,52 @@ def roster_name(code):
     return code
 
 
+class Tasks:
+    """A stub, so the UI's Calibrate button says why rather than throwing 500.
+
+    Their real `Tasks` builds a `VLDetector` that imports moondream and
+    connects to a hardcoded lab address, which is why it is not registered
+    here. But `backend/server.py:368` calls `rpc_client.Tasks.calibrate(...)`
+    from the Calibrate button, and an unregistered service raises inside the
+    RPC worker: FastAPI turns that into an HTML 500 and the React frontend
+    fails parsing it as JSON, so the user sees
+
+        Unexpected token 'I', "Internal S"... is not valid JSON
+
+    which says nothing about what went wrong. Answering with a sentence costs
+    nothing and puts the reason on screen.
+    """
+
+    def _set_server_reference(self, server_instance):
+        self.server = server_instance
+
+    def calibrate(self, obstacle_prompt=None):
+        """REPURPOSED: the calibration this rig actually needs.
+
+        Theirs segments obstacles, which needs SAM2 and a lit room while the
+        ball tracker needs it dark, and the arena is bare anyway. What this rig
+        genuinely has to establish before it can drive is the relationship
+        between the ball's own compass and the camera's frame -- `start_probe`
+        zeroes the aim at rest and then drives each cardinal heading to measure
+        where the ball actually went.
+
+        The prompt is ignored. It named an obstacle class; there is nothing
+        here for it to mean.
+        """
+        if self.server is None or not hasattr(self.server, "Robot"):
+            return "No robot service is registered."
+        robots = getattr(self.server.Robot, "id_list", [])
+        if not robots:
+            return "No robot on this rig to calibrate."
+        return self.server.Robot.request_calibrate(robots[0])
+
+    def __getattr__(self, name):
+        def refuse(*_a, **_k):
+            return (f"Tasks.{name} is not available on this rig — SAM2 object "
+                    f"detection is not running.")
+        return refuse
+
+
 def build(port=5555, framework=None, robot_id=2, name=None, code="CRXS"):
     """The configured server, not yet running. Returned so tests can drive it."""
     name = name or roster_name(code)
@@ -77,6 +123,8 @@ def build(port=5555, framework=None, robot_id=2, name=None, code="CRXS"):
     server.register_class(
         SpheroRobot(id_list=(robot_id,), names=[name], codes={robot_id: code}),
         class_name="Robot")
+    # Registered only so the UI gets a sentence instead of a 500. See `Tasks`.
+    server.register_class(Tasks(), class_name="Tasks")
     return server
 
 

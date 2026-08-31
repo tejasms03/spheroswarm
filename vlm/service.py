@@ -221,6 +221,27 @@ class SpheroRobot:
             self._outcomes.pop(rid, None)
         return f"Started controller thread for robot {rid}"
 
+    def request_calibrate(self, robot_id):
+        """Ask the bench to zero the aim and probe the frame.
+
+        What the dashboard's Calibrate button now means on this rig. Theirs
+        segments obstacles; ours answers the question no amount of reading the
+        source can: which way this ball's compass runs relative to this camera.
+        `start_probe` zeroes the aim itself before driving, so this is one
+        request rather than two.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc first.")
+        with self._lock:
+            self._requests[rid] = {"want": "probe", "at": time.time()}
+            self._outcomes.pop(rid, None)
+        return ("Zeroing the aim and probing the frame — watch the bench "
+                "window. This drives the ball in four directions.")
+
     def request_stop(self, robot_id):
         rid = int(robot_id)
         with self._lock:
