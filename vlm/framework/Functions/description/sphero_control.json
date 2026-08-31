@@ -210,5 +210,30 @@
         "y"
       ]
     }
+  },
+  {
+    "name": "set_flow",
+    "description": "Drives a curve you describe with a short expression, instead of listing its points. Use this for shapes a waypoint list says badly -- a figure eight, a spiral, a lissajous, a rose -- and for a 'flow' or 'pattern' request.\n\nWrite Python that assigns a list of (x, y) to `points`, in ARENA PIXELS. Available names: cx, cy (the arena centre, 694 and 554), width, height, xmin, xmax, ymin, ymax, and maths including sin, cos, pi, sqrt. No imports, no attribute access, no while loops, one second.\n\nFigure eight around the centre:\n  points = [(cx + 400*sin(2*pi*i/64), cy + 200*sin(4*pi*i/64)) for i in range(64)]\n\nSpiral outwards:\n  points = [(cx + 4*i*cos(i/6), cy + 4*i*sin(i/6)) for i in range(80)]\n\nEvery point must stay 100 pixels inside the arena or the whole curve is refused -- the ball has width and reads its own position badly near a wall. With closed=true (the default) it repeats until stopped and never arrives; with closed=false it drives the curve once and arrives.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "expression": {
+          "type": "string",
+          "description": "Python assigning a list of (x, y) arena-pixel points to `points`."
+        },
+        "closed": {
+          "type": "boolean",
+          "description": "True to loop the curve until stopped (default), false to drive it once."
+        }
+      },
+      "required": [
+        "robot_id",
+        "expression"
+      ]
+    }
   }
 ]

@@ -469,3 +469,82 @@ def test_a_refused_orbit_reports_like_any_other_refusal():
     drv.serve(client)
     assert client.Robot.outcomes[-1]["outcome"] == "refused"
     assert "mirrored" in client.Robot.outcomes[-1]["reason"]
+
+
+# -- flow: a curve described rather than enumerated ---------------------------
+
+class FlowApp(FakeApp):
+    def __init__(self, refuses=None):
+        super().__init__()
+        self._refuses = refuses
+
+    def agent_check(self, points):
+        return self._refuses
+
+
+def a_flower(refuses=None):
+    app = FlowApp(refuses)
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2, path_cls=FakePath)
+    return drv, app, FakeClient()
+
+
+EIGHT = ("points = [(cx + 400*sin(2*pi*i/64), cy + 200*sin(4*pi*i/64)) "
+         "for i in range(64)]")
+
+
+def test_a_figure_eight_becomes_a_closed_path_in_centimetres():
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "expression": EIGHT,
+                                  "closed": True})
+    drv.serve(client)
+    assert app.path is not None
+    assert app.path.closed is True
+    assert len(app.path.pts) == 64
+    xs = [p[0] for p in app.path.pts]
+    # 400px either side of a 1388px-wide arena, converted at 10px/cm.
+    assert max(xs) - min(xs) == pytest.approx(80.0, abs=1.0)
+
+
+def test_an_OPEN_curve_drives_once_instead_of_looping():
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "expression": EIGHT,
+                                  "closed": False})
+    drv.serve(client)
+    assert app.path.closed is False
+
+
+def test_a_curve_that_leaves_the_ARENA_is_refused_by_the_bench_s_own_rule():
+    """Not a second copy of the boundary rule -- `agent_check` refuses a goal
+    the ball can only reach by shoving, and a curve is only as safe as its
+    worst point."""
+    drv, app, client = a_flower(refuses="refused: too close to the edge")
+    client.Robot.requests.append({"want": "flow", "expression": EIGHT,
+                                  "closed": True})
+    drv.serve(client)
+    assert app.armed is False
+    assert "too close" in client.Robot.outcomes[-1]["reason"]
+
+
+def test_a_BROKEN_expression_is_reported_not_raised():
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "closed": True,
+                                  "expression": "points = [(1, 2), (oops, 4)]"})
+    drv.serve(client)
+    assert app.armed is False
+    assert client.Robot.outcomes[-1]["outcome"] == "refused"
+
+
+def test_an_expression_that_assigns_NOTHING_is_refused():
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "closed": True,
+                                  "expression": "x = 1"})
+    drv.serve(client)
+    assert "never assigned `points`" in client.Robot.outcomes[-1]["reason"]
+
+
+def test_a_single_point_is_not_a_curve():
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "closed": True,
+                                  "expression": "points = [(694, 554)]"})
+    drv.serve(client)
+    assert "at least two points" in client.Robot.outcomes[-1]["reason"]

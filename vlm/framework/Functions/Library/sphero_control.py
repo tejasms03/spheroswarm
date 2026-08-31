@@ -148,3 +148,29 @@ def follow(robot_id: int, x: float, y: float) -> str:
     supply the target.
     """
     return client.Robot.set_follow_target(int(robot_id), float(x), float(y))
+
+
+def set_flow(robot_id: int, expression: str, closed: bool = True) -> str:
+    """Drive a curve you DESCRIBE, instead of listing its points.
+
+    For shapes a waypoint list says badly: a figure eight, a spiral, a
+    lissajous, a rose. Write a short Python expression that assigns a list of
+    (x, y) to `points`, in arena pixels.
+
+    Available names: cx, cy (arena centre), width, height, xmin, xmax, ymin,
+    ymax, and a small maths allowlist including sin, cos, pi, sqrt. No
+    imports, no attribute access, no `while`, one second.
+
+    Figure eight around the centre:
+      points = [(cx + 400*sin(2*pi*i/64), cy + 200*sin(4*pi*i/64))
+                for i in range(64)]
+
+    Spiral outwards:
+      points = [(cx + 4*i*cos(i/6), cy + 4*i*sin(i/6)) for i in range(80)]
+
+    With closed=True (the default) it repeats until stopped; call
+    stop_robot_thread to end it. With closed=False it drives the curve once
+    and arrives.
+    """
+    return client.Robot.request_flow(int(robot_id), str(expression),
+                                     bool(closed))
