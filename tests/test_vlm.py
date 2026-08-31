@@ -266,7 +266,10 @@ def test_a_missing_frame_does_not_stop_the_pose_going_out():
     bridge = Bridge(FakeApp(frame=None), robot_id=2, client=client)
     poses = bridge.publish_once()
     assert poses != {}
-    assert client.calls[0]["frame"].shape == (480, 640, 3)
+    # Arena-sized, not their 480x640 default: the placeholder still has to give
+    # their planner a grid the poses fit inside.
+    sent = client.calls[0]["frame"]
+    assert (sent.shape[1], sent.shape[0]) == bridge.arena.size_px
 
 
 def test_an_RPC_FAILURE_NEVER_REACHES_THE_BENCH():
@@ -450,3 +453,57 @@ def test_the_age_grows_across_publishes_while_the_ball_stays_still():
     bridge.last_theta_at = time.time() - 7.0
     poses = bridge.publish_once()
     assert poses[2]["theta_age_s"] >= 7.0
+
+
+# -- the frame their PLANNER sizes its grid from -------------------------------
+
+def test_the_published_frame_is_the_ARENA_size_not_the_camera_size():
+    """`PlanningClient._get_planner` takes the A* grid size from
+    `frame.shape[:2]`, and with no arena_corners in DataService it takes the
+    arena rectangle from the frame bounds too. A 1280x1020 grid under poses
+    running to 1388x1108 puts a ball at the far edge off the map."""
+    client = FakeClient()
+    app = FakeApp(frame=np.zeros((1020, 1280, 3), np.uint8))
+    app.homography = _sim_homography()
+    bridge = Bridge(app, robot_id=2, arena=ArenaFrame(ARENA_W, ARENA_H),
+                    client=client)
+    bridge.publish_once()
+    sent = client.calls[0]["frame"]
+    assert (sent.shape[1], sent.shape[0]) == bridge.arena.size_px
+
+
+def test_the_warp_puts_the_ball_where_the_pose_says_it_is():
+    """The frame and the coordinates have to agree, or their planner draws one
+    world and steers in another."""
+    truth = (69.4, 55.4)
+    got, app = _sim_reading(truth)
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    warped = arena.warp(app.frame, app.homography)
+
+    v = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)[:, :, 2]
+    ys, xs = np.nonzero(v > 20)
+    assert len(xs), "the ball vanished in the warp"
+    centre = (float(xs.mean()), float(ys.mean()))
+    assert centre == pytest.approx(got.xy_px, abs=6.0)
+
+
+def test_the_scale_is_composed_onto_the_homography_not_applied_after_it():
+    """Two transforms kept in step is how this project already lost an
+    afternoon to a drawn robot landing where its blob was not."""
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    hom = _sim_homography()
+    M = arena.matrix_from(hom)
+
+    camera_px = np.array([[[69.4 * SIM_PX_CM, 55.4 * SIM_PX_CM]]], np.float64)
+    one_step = cv2.perspectiveTransform(camera_px, M).reshape(2)
+    two_step = np.array(arena.to_px(hom.to_cm(camera_px.reshape(1, 2))[0]))
+    assert one_step == pytest.approx(two_step, abs=1e-6)
+
+
+def test_no_frame_still_publishes_an_arena_sized_placeholder():
+    client = FakeClient()
+    bridge = Bridge(FakeApp(frame=None), robot_id=2,
+                    arena=ArenaFrame(ARENA_W, ARENA_H), client=client)
+    bridge.publish_once()
+    sent = client.calls[0]["frame"]
+    assert (sent.shape[1], sent.shape[0]) == (1388, 1108)
