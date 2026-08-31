@@ -242,6 +242,28 @@ class SpheroRobot:
         return ("Zeroing the aim and probing the frame — watch the bench "
                 "window. This drives the ball in four directions.")
 
+    def request_orbit(self, robot_id, x, y, radius):
+        """Ask the bench to drive a real CIRCLE around a point.
+
+        `trace_targets` can only express a list of waypoints, so an agent asked
+        to orbit approximates one with a polygon -- which ends, and whose
+        corners the lookahead cuts. The bench has `Path.circle`, and a CLOSED
+        path repeats until it is stopped, which is what orbiting means.
+        """
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc before asking anything to drive.")
+        with self._lock:
+            self._requests[rid] = {"want": "orbit", "at": time.time(),
+                                   "centre": [float(x), float(y)],
+                                   "radius": float(radius)}
+            self._outcomes.pop(rid, None)
+        return (f"Orbiting ({x:.0f}, {y:.0f}) at radius {radius:.0f}px. This "
+                f"REPEATS until you call stop_robot_thread — it never arrives.")
+
     def request_stop(self, robot_id):
         rid = int(robot_id)
         with self._lock:

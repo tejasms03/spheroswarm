@@ -90,5 +90,36 @@
         "robot_id"
       ]
     }
+  },
+  {
+    "name": "orbit",
+    "description": "Drives a real circle around a point, repeating until stopped. Use this whenever the ask is to orbit, circle, go around, or loop -- NOT trace_targets, which can only express a list of waypoints and so turns a circle into a polygon with corners.\n\nThis never arrives and wait_for_robot will time out on it. Call stop_robot_thread to end it.\n\nKeep the whole circle inside the arena: the centre plus the radius must stay at least 100 pixels from every edge.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "x": {
+          "type": "number",
+          "description": "Centre x in arena pixels. The arena is 1388 wide."
+        },
+        "y": {
+          "type": "number",
+          "description": "Centre y in arena pixels. The arena is 1108 tall."
+        },
+        "radius": {
+          "type": "number",
+          "description": "Radius in arena pixels. 10 pixels is 1cm."
+        }
+      },
+      "required": [
+        "robot_id",
+        "x",
+        "y",
+        "radius"
+      ]
+    }
   }
 ]

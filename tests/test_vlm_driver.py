@@ -418,3 +418,54 @@ def test_the_probe_verdict_is_reported_once():
     app.probe = None
     drv.serve(client); drv.serve(client); drv.serve(client)
     assert len(client.Robot.outcomes) == 1
+
+
+# -- orbit: a real circle, not a polygon --------------------------------------
+
+class CirclePath(FakePath):
+    @classmethod
+    def circle(cls, centre, radius, n=48):
+        got = cls([centre], closed=True, kind="circle")
+        got.centre, got.radius = centre, radius
+        return got
+
+
+def an_orbiter():
+    app = FakeApp()
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2,
+                 path_cls=CirclePath)
+    return drv, app, FakeClient()
+
+
+def test_orbit_builds_a_CIRCLE_not_a_string_of_waypoints():
+    """`trace_targets` can only express waypoints, so an agent asked to orbit
+    through it produces a polygon: corners the lookahead cuts, and it ends
+    instead of repeating."""
+    drv, app, client = an_orbiter()
+    client.Robot.requests.append({"want": "orbit", "centre": [694, 554],
+                                  "radius": 300})
+    drv.serve(client)
+    assert app.path.kind == "circle"
+    assert app.path.closed is True
+    assert app.armed is True
+
+
+def test_the_orbit_is_converted_from_arena_pixels_to_centimetres():
+    drv, app, client = an_orbiter()
+    client.Robot.requests.append({"want": "orbit", "centre": [694, 554],
+                                  "radius": 300})
+    drv.serve(client)
+    assert app.path.centre == pytest.approx([69.4, 55.4], abs=0.01)
+    assert app.path.radius == pytest.approx(30.0, abs=0.01)
+
+
+def test_a_refused_orbit_reports_like_any_other_refusal():
+    app = FakeApp(arms=False)
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2,
+                 path_cls=CirclePath)
+    client = FakeClient()
+    client.Robot.requests.append({"want": "orbit", "centre": [694, 554],
+                                  "radius": 300})
+    drv.serve(client)
+    assert client.Robot.outcomes[-1]["outcome"] == "refused"
+    assert "mirrored" in client.Robot.outcomes[-1]["reason"]
