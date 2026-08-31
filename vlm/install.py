@@ -51,6 +51,23 @@ def pairs(root):
     return sorted(out)
 
 
+CONVERTER = "Functions/Library/Agent/Multi/tool_converter.py"
+CONVERTER_WANT = "_lower_types"
+CONVERTER_FIX = """\
+    edit {path}, at the end of the parameters block:
+
+      +  _lower_types(params)
+
+    plus a `_lower_types` helper that lowercases every schema "type" at any
+    depth. Their descriptors are written in Gemini's style ("OBJECT",
+    "INTEGER"), which Vertex accepts for Gemini and Anthropic rejects:
+
+      400 tools.0.custom.input_schema.type: Input should be 'object'
+
+    So every agent works on Gemini and every one fails the moment the gateway
+    routes to Claude.\
+"""
+
 GEMINI = "Functions/Library/Agent/gemini.py"
 GEMINI_WANT = "VLM_AGENT_MODEL"
 GEMINI_FIX = """\
@@ -96,6 +113,15 @@ def report(root, check_only):
               f"{'' if pointed else '  (still defaults to Gemini)'}")
         if not pointed:
             print("\n" + GEMINI_FIX.format(path=GEMINI))
+
+    conv = os.path.join(root, CONVERTER)
+    if os.path.isfile(conv):
+        with open(conv) as f:
+            patched = CONVERTER_WANT in f.read()
+        print(f"  {'ok' if patched else 'THEIRS':8} {CONVERTER}"
+              f"{'' if patched else '  (uppercase schema types break Claude)'}")
+        if not patched:
+            print("\n" + CONVERTER_FIX.format(path=CONVERTER))
 
     if check_only and (missing or stale):
         print(f"\n{missing} missing, {stale} differing. "

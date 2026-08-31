@@ -124,7 +124,7 @@ its own stitcher would have produced.
 
 ## 4. Bugs in THEIR code, found on the way
 
-Worth sending upstream. None are our doing and all four are live.
+Worth sending upstream. None are our doing and all five are live.
 
 1. **The RPC layer is broken on cbor2 6.x.** Version 6 changed the `tag_hook`
    signature to pass the `CBORTag` first; `rpc_system.py:69` expects 5.x's
@@ -138,7 +138,16 @@ Worth sending upstream. None are our doing and all four are live.
 3. **`planning.py:309` treats radians as degrees** —
    `math.radians(float(s_theta_deg))` on a value their ArUco detector produces
    in radians. Dead in `trace_targets`, **live in `pick_and_drop`**.
-4. **`pp.py:721` calls a dict.** `c.Robot.path_list()[id]` cannot work over RPC:
+4. **Uppercase JSON Schema types break every agent on Claude.** The
+   descriptors in `Functions/description/` are written in Gemini's style
+   (`"OBJECT"`, `"INTEGER"`). Vertex accepts that for Gemini models and
+   Anthropic rejects it: `400 tools.0.custom.input_schema.type: Input should
+   be 'object'`. So every agent works on Gemini and every one fails the moment
+   the gateway routes to Claude, with an error naming a tool index rather than
+   the file it came from. Patched in `Multi/tool_converter.py` with a
+   `_lower_types(params)` that normalises at any depth — one place instead of
+   twenty JSON files. `vlm.install --check` reports whether it is still there.
+5. **`pp.py:721` calls a dict.** `c.Robot.path_list()[id]` cannot work over RPC:
    the proxy turns every name into a call and the server calls the attribute.
    Ours is a method, so that line does what it plainly means.
 
@@ -197,7 +206,13 @@ Worth sending upstream. None are our doing and all four are live.
   route asking for a pause is driven straight through and says so.
 - **`is_path_feasable` is excluded from the agent** — it routes through
   `pp.feasibility_check`, which needs SAM masks from the `Tasks` service.
-- **The agent layer has not been run against a live model.** The gateway is
+- ~~The agent layer has not been run against a live model.~~ **It has.**
+  Claude Sonnet 5, through their React dashboard, called `trace_targets` ->
+  `exec_robot_create_thread` -> `wait_for_robot` in three iterations and drove
+  the sim ball home: `{'arrived': True, 'outcome': 'arrived'}`. 13.6k tokens,
+  12.8s. Needs NYU VPN, and the backend needs `PORTKEY_API_KEY` in ITS
+  environment -- `set -a && . ~/.spheroswarm.env && set +a` before launching it.
+- **Old note:** The gateway is
   NYU-internal, so it needs VPN. `gemini.py` now defaults to
   `@vertexai/anthropic.claude-sonnet-5`, overridable with `VLM_AGENT_MODEL`.
 - **One robot only**, by choice. `RPC_ROBOT_ID = 2`, matching the id their own
