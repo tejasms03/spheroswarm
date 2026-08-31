@@ -1671,11 +1671,30 @@ class BlobTest:
             self.homography.width = self.homography.height = 0.0
             self.say(f"sim: using a {px_cm:.1f} px/cm scale, not calib/", DIM)
 
-        saved = config.load("blob_region")
-        if saved and len(saved.get("corners", [])) == 4:
-            self.corners = [np.array(p, dtype=float) for p in saved["corners"]]
-            self.say("workspace loaded from calib/blob_region.json — "
-                     "press x to clear")
+        if self.sim:
+            # The saved WORKSPACE belongs to a real camera too, and the same
+            # argument that replaces the homography in sim applies to it.
+            # `calib/blob_region.json` here is a quad at x 342..866, y 272..688
+            # -- clicked on a 1280x720 view of an actual floor. The fake camera
+            # is 1277x1020 and draws the ball wherever the simulated robot is,
+            # so a ball at x=121 is simply outside the mask and `find_blobs`
+            # returns nothing. Wherever the robot spawned outside that box, the
+            # tracker reported no lock and it read as a robot that never
+            # connected.
+            #
+            # The frame's own rectangle is the honest workspace: it is exactly
+            # the area the fake camera can see, and it matches `workspace.json`
+            # because `sim_frame_size` measured it from there.
+            w, h = sim_frame_size()
+            self.corners = [np.array(p, dtype=float) for p in
+                            ((0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1))]
+            self.say("sim: workspace is the whole frame, not calib/", DIM)
+        else:
+            saved = config.load("blob_region")
+            if saved and len(saved.get("corners", [])) == 4:
+                self.corners = [np.array(p, dtype=float) for p in saved["corners"]]
+                self.say("workspace loaded from calib/blob_region.json — "
+                         "press x to clear")
 
         self.sliders, self.buttons = [], []
         self.build_dock()
