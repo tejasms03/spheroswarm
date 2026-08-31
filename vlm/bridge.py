@@ -188,7 +188,8 @@ class Bridge(threading.Thread):
     other window is empty.
     """
 
-    def __init__(self, app, robot_id=2, arena=None, hz=20.0, client=None):
+    def __init__(self, app, robot_id=2, arena=None, hz=20.0, client=None,
+                 drive=True):
         super().__init__(daemon=True, name="vlm-bridge")
         self.app = app
         self.robot_id = int(robot_id)
@@ -203,6 +204,13 @@ class Bridge(threading.Thread):
         self.last_error = None
         self.last_theta = None
         self.last_theta_at = None
+
+        # The command half, served on THIS thread with THIS client. `RPCClient`
+        # holds a single ZMQ REQ socket and it is not thread-safe, so a second
+        # thread polling for drive requests would interleave sends and receives
+        # on the same socket. One thread does both.
+        self._drive = bool(drive)
+        self.driver = None
 
     @property
     def arena(self):
@@ -244,6 +252,11 @@ class Bridge(threading.Thread):
 
     def stop(self):
         self._stop.set()
+        # Tell the service nothing is behind it any more, so a drive request
+        # arriving after the bench has gone is refused rather than queued for a
+        # robot that is not there.
+        if self.driver is not None:
+            self.driver.close(self._client)
 
     def run(self):
         if self.connect() is None:
