@@ -3765,6 +3765,16 @@ class BlobTest:
             if held[key]:
                 want += np.asarray(direction, dtype=float)
         n = float(np.linalg.norm(want))
+        if n >= 1e-9 and not h.connected:
+            # SAY IT, rather than commanding a link that is not there.
+            # `h is None` was the only guard, and a roster entry whose kind is
+            # `real` always produces a handle -- it just never connects if the
+            # ball is off, out of range, or simply not present, which is every
+            # run in sim. `set_velocity` on it returns quietly and the keys do
+            # nothing, so the bench looks broken rather than unconnected.
+            self.say(f"{self.code} is not connected — press b to scan, or "
+                     f"run a sim robot with --robot SYRX", SUN)
+            return False
         if n < 1e-9:
             if self.manual:
                 # Released: stop, once. A key-up that only stops COMMANDING
