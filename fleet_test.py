@@ -1269,6 +1269,34 @@ own blindness.
 
 # -- the camera ------------------------------------------------------------
 
+SIM_PX_CM = 9.2
+"""What `BallSource` draws at, and what the sim homography is built from."""
+
+
+def sim_frame_size(px_cm=SIM_PX_CM):
+    """A fake camera big enough to SEE the workspace it spawns robots into.
+
+    The default was a fixed 1280x720, which at 9.2px/cm covers 139 x 78cm --
+    wide enough for the arena and 32cm short of it. Robots are placed anywhere
+    in `workspace.json`, so roughly one run in four started with the ball below
+    the bottom of the frame: present, moving, driveable, and invisible. The
+    tracker reported no lock and it read as "the robot never connected".
+
+    Measured rather than assumed, and it falls back to the old size if the
+    workspace cannot be read -- a fake camera is not worth failing to start over.
+    """
+    try:
+        from workspace.space import Workspace
+        ws = Workspace.load()
+        lo, hi = np.asarray(ws.bounds_cm).min(0), np.asarray(ws.bounds_cm).max(0)
+        w, h = float(hi[0] - lo[0]), float(hi[1] - lo[1])
+        if w > 1.0 and h > 1.0:
+            return (int(np.ceil(w * px_cm)), int(np.ceil(h * px_cm)))
+    except Exception:
+        pass
+    return (1280, 720)
+
+
 class Camera(threading.Thread):
     """Frames on their own thread; a blocking read on the render thread is a
     frozen window, and a frozen window during bring-up reads as a crash."""
@@ -1279,7 +1307,8 @@ class Camera(threading.Thread):
         self.error = None
         try:
             if str(spec) in ("sim", "ball"):
-                self.source = BallSource(leds=leds, pose=pose)
+                self.source = BallSource(leds=leds, pose=pose,
+                                         size=size or sim_frame_size())
             else:
                 from vision.synthetic import open_source
                 self.source = open_source(spec, size=size)
@@ -1554,6 +1583,9 @@ class BlobTest:
         self.fleet = None
         self.code = code
         self.marker = CYAN
+        # Set before `build_fleet`, which advises differently in sim: scanning
+        # is Bluetooth and can never find a simulated robot.
+        self.sim = str(spec) in ("sim", "ball")
         if with_fleet:
             self.build_fleet()
 
@@ -1627,7 +1659,13 @@ class BlobTest:
             return
         if not self.code:
             self.fleet = Fleet()
-            self.say("press b to scan for a ball, then click it to connect")
+            # Scanning is BLE. In sim it can never find anything, and pointing
+            # someone at it there is pointing them at a dead end.
+            if self.sim:
+                self.say("sim: no robot — restart with --robot SYRX "
+                         "(scanning is Bluetooth only)", SUN)
+            else:
+                self.say("press b to scan for a ball, then click it to connect")
             return
         try:
             from fleet.roster import Roster
