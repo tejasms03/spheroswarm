@@ -2358,6 +2358,23 @@ class BlobTest:
             self.frame, self.v_min, self.min_area, self.max_area,
             region=self.region if self.corners is not None else None,
             grow_px=self.grow_px())
+        # NOTHING OUTSIDE THE CLICKED CORNERS, once there is anything inside.
+        #
+        # Detection still runs on the GROWN region -- that is what keeps a ball
+        # at the boundary from having its halo cut and its centroid dragged
+        # inward, which was worth 3 to 7cm of error. But the band that grown
+        # mask admits is scenery: a lit floor, a cabinet, a reflection. Ranking
+        # already put those last; this stops them being reported at all, so the
+        # count in the dock and the blobs drawn on the frame are the arena's
+        # and not the room's.
+        #
+        # Only when something inside exists. A ball that has rolled out of the
+        # workspace is still the ball, and dropping the last sight of it leaves
+        # nothing to steer back in -- `outside_region` is kept rather than
+        # discarded for exactly that reason.
+        inside = [b for b in candidates if not b["outside_region"]]
+        if inside:
+            candidates = inside
         if not fresh:
             return
         self.assign(candidates)
