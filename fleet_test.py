@@ -926,10 +926,28 @@ class Path:
         # it was measured on -- a new path is a new run and starts unlocked.
         self.s = None
         self._self_gap = None
+        # Whether this route is to be driven FROM ITS START, rather than from
+        # whichever part of it the ball happens to be nearest. See `restart`.
+        self.anchor = False
+        self.launched = False
 
     def restart(self):
-        """Forget the progress made, so the next fix re-locks from anywhere."""
-        self.s = None
+        """Forget the progress made, so the next fix re-locks from anywhere.
+
+        Unless the route is ANCHORED, in which case progress starts at zero and
+        the run begins at the beginning.
+
+        The default is right for a goal: a drive to a point should pick up from
+        wherever the ball is. It is wrong for a SHAPE. A figure eight, a rose,
+        an explicit trajectory -- these were asked for as a whole, and locking
+        on to the nearest point means a ball that happens to be sitting near
+        the middle starts halfway round and the first half is never driven at
+        all. The shape that gets drawn is not the shape that was asked for, and
+        nothing reports a problem because the follower is doing exactly what it
+        was told.
+        """
+        self.s = 0.0 if self.anchor else None
+        self.launched = False
 
     @classmethod
     def point(cls, p):
@@ -1131,7 +1149,14 @@ class Path:
                           key=lambda r: r[1])
         else:
             got = search(max(lo, 0.0), min(hi, self.length))
-        if got[1] > self.RELOCK_CM:
+        # An ANCHORED route does not re-lock. The re-lock exists for a ball
+        # picked up and put down somewhere else, and it recognises that case by
+        # the ball being far from where progress says it is -- which is also
+        # exactly true at the start of an anchored run, when the ball has not
+        # reached the beginning of the shape yet. Left in, it fires on the
+        # first frame and sends the run back to nearest-point, which is the
+        # behaviour being avoided.
+        if got[1] > self.RELOCK_CM and not self.anchor:
             far = search(0.0, None)
             if far[1] < got[1]:
                 return far
@@ -1217,7 +1242,24 @@ def pursue(path, pos, lookahead, speed, goal_tol=ARRIVE_CM, radius=0.0,
     # progress yet and locks on from wherever the ball happens to be, which is
     # what lets a run start with the ball anywhere near the route.
     s, off = path.project(pos, near=path.s if ratchet else None)
-    if ratchet:
+    if ratchet and path.anchor and not path.launched:
+        # HELD AT THE BEGINNING until the ball actually reaches it.
+        #
+        # Anchoring the arc position to zero is not enough on its own: the
+        # forward window is tens of centimetres wide, so the first projection
+        # of a ball parked elsewhere slides straight down it and the run starts
+        # forty centimetres in regardless. Pinning `s` here keeps the lookahead
+        # target at the start of the shape, which is what steers the ball
+        # there -- and once it arrives the ratchet takes over with nothing
+        # skipped.
+        reach = max(float(lookahead), path.MIN_FWD_CM)
+        if float(np.linalg.norm(np.asarray(pos, dtype=float)
+                                - path.at(0.0))) <= reach:
+            path.launched = True
+            path.s = s
+        else:
+            path.s = s = 0.0
+    elif ratchet:
         # PROGRESS DOES NOT REWIND, and the window alone did not guarantee it.
         #
         # `BACK_CM` lets the projection settle a couple of centimetres behind

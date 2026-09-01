@@ -170,7 +170,8 @@ class Driver:
         """
         centre = self.arena.to_cm(request["centre"])
         radius = self.arena.to_cm((request["radius"], 0.0))[0]
-        self.app.path = self.Path.circle(np.asarray(centre, float), radius)
+        self.app.path = self.anchored(
+            self.Path.circle(np.asarray(centre, float), radius))
         self.app._arm_source = "vlm"
         self.app.arm()
         if not self.app.armed:
@@ -302,8 +303,8 @@ class Driver:
             client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
 
-        self.app.path = self.Path(points, closed=bool(request.get("closed")),
-                                  kind="flow")
+        self.app.path = self.anchored(
+            self.Path(points, closed=bool(request.get("closed")), kind="flow"))
         self.app._arm_source = "vlm"
         self.app.arm()
         if not self.app.armed:
@@ -346,6 +347,20 @@ class Driver:
                 f"aim inside x {lo[0]:.0f}..{hi[0]:.0f}, "
                 f"y {lo[1]:.0f}..{hi[1]:.0f}")
 
+    @staticmethod
+    def anchored(path):
+        """Drive this route from its START, not from the nearest bit of it.
+
+        Pure pursuit locks on to the closest point when a run begins, which is
+        what lets a goal be driven from wherever the ball happens to be. For a
+        shape it is wrong: a ball sitting near the middle of a figure eight
+        starts halfway round, the first half never gets driven, and nothing
+        reports a fault because the follower did exactly what it was told.
+        """
+        path.anchor = True
+        path.restart()
+        return path
+
     def report_probe(self, client):
         """Say how the probe ended, once, on the tick it finishes."""
         probing = getattr(self.app, "probe", None) is not None
@@ -373,8 +388,11 @@ class Driver:
         # A single waypoint is a GOAL, not a path. `Path.point` exists for
         # exactly this and behaves differently from a one-element polyline,
         # which has no length for the lookahead to run along.
+        # A single waypoint is a goal and starts from wherever the ball is;
+        # a list of them is a SHAPE and starts at its own beginning.
         self.app.path = (self.Path.point(points[0]) if len(points) == 1
-                         else self.Path([np.asarray(p, float) for p in points]))
+                         else self.anchored(
+                             self.Path([np.asarray(p, float) for p in points])))
 
         self.app._arm_source = "vlm"
         self.app.arm()

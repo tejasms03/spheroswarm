@@ -25,6 +25,11 @@ class FakePath:
         self.closed = closed
         self.kind = kind
         self.length = 100.0
+        self.anchor = False
+        self.s = None
+
+    def restart(self):
+        self.s = 0.0 if self.anchor else None
 
     @classmethod
     def point(cls, p):
@@ -574,3 +579,40 @@ def test_a_refusal_is_restated_in_the_units_the_agent_WRITES_in():
     said = client.Robot.outcomes[-1]["reason"]
     assert "ARENA PIXELS" in said
     assert "x 100..1288" in said and "y 100..1008" in said
+
+
+# -- a shape starts at its start ----------------------------------------------
+
+def test_a_described_SHAPE_is_driven_from_its_beginning():
+    """Pure pursuit locks on to the nearest point when a run starts, which is
+    right for a goal and wrong for a shape. A ball parked near the middle of a
+    figure eight would start halfway round, the first half would never be
+    driven, and nothing would report a fault — the follower did as it was told.
+    """
+    drv, app, client = a_flower()
+    client.Robot.requests.append({"want": "flow", "expression": EIGHT,
+                                  "closed": True})
+    drv.serve(client)
+    assert app.path.anchor is True
+
+
+def test_an_orbit_and_a_trajectory_are_anchored_too():
+    drv, app, client = an_orbiter()
+    client.Robot.requests.append({"want": "orbit", "centre": [694, 554],
+                                  "radius": 300})
+    drv.serve(client)
+    assert app.path.anchor is True
+
+    drv, app, client = a_driver(path=A_PATH_PX)
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    assert app.path.anchor is True
+
+
+def test_a_single_GOAL_is_not_anchored():
+    """A drive to one point should pick up from wherever the ball is."""
+    drv, app, client = a_driver(path=[[400, 300, 0.0, 0]])
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    assert app.path.kind == "point"
+    assert getattr(app.path, "anchor", False) is False
