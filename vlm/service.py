@@ -53,6 +53,7 @@ class SpheroRobot:
         self._courses = {}
         self._requests = {}
         self._outcomes = {}
+        self._arena = {}
 
         # Set by the bench when it attaches. Until then every drive request is
         # refused rather than queued: a path accepted by a service with nothing
@@ -362,6 +363,26 @@ class SpheroRobot:
         return ("Evaluating the curve and driving it." +
                 (" This REPEATS until you call stop_robot_thread."
                  if closed else ""))
+
+    # -- what the arena actually is -----------------------------------------
+
+    def set_arena(self, arena):
+        """Told by the bench, because only the bench knows.
+
+        The arena is four corners a person clicked, mapped through a
+        homography. It changes whenever either is redone, so anything that
+        writes its size into a prompt is writing a number that goes stale
+        silently -- which is exactly what happened: an agent kept orbiting
+        (694, 554) after a recalibration moved the centre to (712, 613).
+        """
+        with self._lock:
+            self._arena = dict(arena or {})
+        return True
+
+    def get_arena(self):
+        """Size, centre and safe bounds, in arena pixels. Empty until told."""
+        with self._lock:
+            return dict(self._arena)
 
     def request_stop(self, robot_id):
         rid = int(robot_id)

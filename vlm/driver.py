@@ -99,6 +99,7 @@ class Driver:
             return None
         if not self.attached:
             client.Robot.attach()
+            client.Robot.set_arena(self.arena_facts())
             self.attached = True
 
         self.report_finished(client)
@@ -358,6 +359,32 @@ class Driver:
         return (f"{refusal} — IN ARENA PIXELS, which is what these tools take: "
                 f"aim inside x {lo[0]:.0f}..{hi[0]:.0f}, "
                 f"y {lo[1]:.0f}..{hi[1]:.0f}")
+
+    def arena_facts(self):
+        """What the arena IS, for anything that would otherwise guess.
+
+        Published once on attach rather than written into a prompt. The arena
+        is a clicked quad through a homography and moves whenever either is
+        redone; a literal in a description is a number that goes stale without
+        saying so.
+        """
+        w, h = self.arena.size_px
+        margin = 100.0
+        try:
+            margin = max(margin, self.arena.scalar_to_px(
+                self.app.goal_margin_cm()))
+        except Exception:
+            pass
+        return {
+            "width": w, "height": h,
+            "centre": [round(w / 2.0, 1), round(h / 2.0, 1)],
+            "px_per_cm": self.arena.px_per_cm,
+            "width_cm": round(self.arena.width_cm, 1),
+            "height_cm": round(self.arena.height_cm, 1),
+            "safe": [round(margin, 1), round(margin, 1),
+                     round(w - margin, 1), round(h - margin, 1)],
+            "margin": round(margin, 1),
+        }
 
     @staticmethod
     def anchored(path):

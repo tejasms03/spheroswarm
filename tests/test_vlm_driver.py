@@ -83,6 +83,7 @@ class FakeRobot:
         self.requests = []
         self.courses = []
         self.outcomes = []
+        self.arena = None
         self.attached = False
 
     def attach(self):
@@ -104,6 +105,10 @@ class FakeRobot:
 
     def set_outcome(self, rid, outcome, reason=None):
         self.outcomes.append({"outcome": outcome, "reason": reason})
+        return True
+
+    def set_arena(self, facts):
+        self.arena = dict(facts)
         return True
 
 
@@ -639,3 +644,35 @@ def test_an_app_whose_module_has_no_Path_falls_back():
     import fleet_test
     drv = Driver(FakeApp(), ArenaFrame(ARENA_W, ARENA_H), robot_id=2)
     assert drv.Path is fleet_test.Path
+
+
+# -- the arena is asked for, not memorised -------------------------------------
+
+def test_the_arena_is_published_on_attach():
+    """Anything that writes the arena into a prompt writes a number that goes
+    stale silently. It already did: a re-click moved the centre from (694, 554)
+    to (712, 613) and the agent kept orbiting the old one."""
+    drv, app, client = a_driver()
+    client.Robot.arena = None
+    drv.serve(client)
+    facts = client.Robot.arena
+    assert facts["width"] == 1388 and facts["height"] == 1108
+    assert facts["centre"] == [694.0, 554.0]
+
+
+def test_the_published_centre_MOVES_when_the_arena_does():
+    app = FakeApp()
+    drv = Driver(app, ArenaFrame(142.5, 122.7, origin_cm=(-33.3, -31.8)),
+                 robot_id=2, path_cls=FakePath)
+    client = FakeClient()
+    drv.serve(client)
+    assert client.Robot.arena["centre"] == [712.5, 613.5]
+
+
+def test_the_safe_box_is_inset_on_every_side():
+    drv, _app, client = a_driver()
+    drv.serve(client)
+    f = client.Robot.arena
+    x0, y0, x1, y1 = f["safe"]
+    assert x0 > 0 and y0 > 0
+    assert x1 < f["width"] and y1 < f["height"]
