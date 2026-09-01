@@ -838,3 +838,54 @@ def test_the_window_never_shrinks_below_a_few_frames_of_travel():
     from fleet_test import Path
     tight = _rose(6.0, 7)
     assert tight.fwd_window >= Path.MIN_FWD_CM
+
+
+def test_an_ANCHORED_path_starts_at_its_start_not_the_nearest_point():
+    """A ball parked mid-shape would otherwise begin halfway round."""
+    from fleet_test import Path, pursue
+    path = _figure_eight()
+    path.anchor = True
+    path.restart()
+    pursue(path, path.at(path.length * 0.5), lookahead=8.0, speed=20.0)
+    assert path.s == pytest.approx(0.0, abs=1.0)
+
+
+def test_an_UNANCHORED_path_still_picks_up_from_where_the_ball_is():
+    """The default, and right for a goal."""
+    from fleet_test import pursue
+    path = _figure_eight()
+    pursue(path, path.at(path.length * 0.5), lookahead=8.0, speed=20.0)
+    assert path.s > path.length * 0.3
+
+
+def test_an_anchored_run_does_not_relock_before_it_reaches_the_start():
+    """The re-lock recognises a ball picked up and moved by it being far from
+    where progress says it is — which is also exactly true at the start of an
+    anchored run, before the ball has driven to the beginning."""
+    from fleet_test import Path, pursue
+    path = _figure_eight()
+    path.anchor = True
+    path.restart()
+    far = path.at(path.length * 0.5) + np.array([50.0, 50.0])
+    pursue(path, far, lookahead=8.0, speed=20.0)
+    assert path.s == pytest.approx(0.0, abs=1.0)
+
+
+def test_a_shape_started_from_OFF_PATH_still_gets_driven_whole():
+    """The end-to-end version: park the ball at the far side of a figure eight,
+    let the controller drive, and require every part of the loop to be
+    covered. Unanchored, the run begins wherever the ball happens to be and
+    the first stretch is simply never driven."""
+    from fleet_test import pursue
+    path = _figure_eight()
+    path.anchor = True
+    path.restart()
+    pos = path.at(path.length * 0.5) + np.array([40.0, 40.0])
+    seen = set()
+    for _ in range(600):
+        v, _t, _done, _n = pursue(path, pos, lookahead=8.0, speed=25.0)
+        pos = pos + np.asarray(v, dtype=float) * 0.08
+        if path.launched:
+            seen.add(int(path.s // 10))
+    assert path.launched, "it never reached the start"
+    assert len(seen) == int(path.length // 10) + 1, "part of the shape was skipped"
