@@ -676,3 +676,21 @@ def test_the_safe_box_is_inset_on_every_side():
     x0, y0, x1, y1 = f["safe"]
     assert x0 > 0 and y0 > 0
     assert x1 < f["width"] and y1 < f["height"]
+
+
+def test_the_arena_says_how_BIG_an_orbit_can_be():
+    """Without it the agent has only "10 pixels is 1cm" to reason from and
+    picks something timid — asked to orbit, it drew circles a tenth of the
+    arena across, which is not what anybody means by orbiting."""
+    drv, _app, client = a_driver()
+    drv.serve(client)
+    f = client.Robot.arena
+    cx, cy = f["centre"]
+    r = f["max_radius"]
+    x0, y0, x1, y1 = f["safe"]
+    assert r > 0
+    # The circle it describes must fit inside the safe box on every side.
+    assert cx - r >= x0 - 0.05 and cx + r <= x1 + 0.05
+    assert cy - r >= y0 - 0.05 and cy + r <= y1 + 0.05
+    # And it must be a real orbit, not a token one.
+    assert 2 * r > 0.5 * min(f["width"], f["height"])

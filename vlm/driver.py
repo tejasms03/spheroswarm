@@ -375,9 +375,17 @@ class Driver:
                 self.app.goal_margin_cm()))
         except Exception:
             pass
+        cx, cy = w / 2.0, h / 2.0
+        # THE BIGGEST CIRCLE THAT FITS, from the centre to the nearest safe
+        # edge. Without it the agent has only "10 pixels is 1cm" to go on and
+        # picks something timid -- asked to orbit, it drew circles a tenth of
+        # the arena across, which is not what anybody means by orbiting.
+        max_radius = max(0.0, min(cx - margin, cy - margin,
+                                  (w - margin) - cx, (h - margin) - cy))
         return {
             "width": w, "height": h,
-            "centre": [round(w / 2.0, 1), round(h / 2.0, 1)],
+            "centre": [round(cx, 1), round(cy, 1)],
+            "max_radius": round(max_radius, 1),
             "px_per_cm": self.arena.px_per_cm,
             "width_cm": round(self.arena.width_cm, 1),
             "height_cm": round(self.arena.height_cm, 1),

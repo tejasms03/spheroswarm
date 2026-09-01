@@ -111,7 +111,7 @@
         },
         "radius": {
           "type": "number",
-          "description": "Radius in arena pixels. 10 pixels is 1cm."
+          "description": "Radius in arena pixels (10 pixels is 1cm). If the user did not ask for a particular size, use about 80% of the 'max_radius' that get_arena reports -- an orbit is meant to go round the arena, not trace a small circle in the middle of it. Never exceed max_radius: the whole circle must stay inside 'safe'."
         }
       },
       "required": [
@@ -238,7 +238,7 @@
   },
   {
     "name": "get_arena",
-    "description": "Returns the arena's real size, centre and safe bounds in arena pixels. ALWAYS call this before placing any coordinate, and never assume the arena's dimensions or centre: it is four corners somebody clicked mapped through a camera calibration, and it changes whenever either is redone. It already has -- a re-click moved the centre from (694, 554) to (712, 613).\n\nReturns width, height, centre, px_per_cm, width_cm, height_cm, and 'safe' as [x_min, y_min, x_max, y_max]. Keep every point of every path inside 'safe' or the drive is refused: the ball has width and reads its own position badly near a wall.\n\nReturns {\"known\": false, \"reason\": ...} when the bench has not reported yet.",
+    "description": "Returns the arena's real size, centre and safe bounds in arena pixels. ALWAYS call this before placing any coordinate, and never assume the arena's dimensions or centre: it is four corners somebody clicked mapped through a camera calibration, and it changes whenever either is redone. It already has -- a re-click moved the centre from (694, 554) to (712, 613).\n\nReturns width, height, centre, max_radius, px_per_cm, width_cm, height_cm, and 'safe' as [x_min, y_min, x_max, y_max]. Keep every point of every path inside 'safe' or the drive is refused: the ball has width and reads its own position badly near a wall.\n\nReturns {\"known\": false, \"reason\": ...} when the bench has not reported yet.\n\n'max_radius' is the largest circle that fits from the centre without leaving 'safe'. Use about 80% of it for an unqualified 'orbit'.",
     "parameters": {
       "type": "object",
       "properties": {
