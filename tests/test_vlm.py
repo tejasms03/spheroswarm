@@ -64,12 +64,18 @@ class FakeApp:
         # Read by the driver on every tick, because publishing also serves.
         self.armed = False
         self.fleet = None
+        # What `agent_bounds()` reports, in cm: the clicked workspace.
+        self.bounds = [0.0, 0.0, ARENA_W, ARENA_H]
 
     def to_cm(self, xy):
         return self.homography.to_cm([xy])[0]
 
     def travel_readout(self):
         return self._travel
+
+    def agent_bounds(self):
+        """The clicked workspace in cm, as the bench reports it."""
+        return self.bounds
 
 
 def _square_homography(scale=4.0):
@@ -328,17 +334,49 @@ def test_errors_are_counted_rather_than_thrown_by_the_loop():
     assert "gone" in bridge.last_error
 
 
-def test_the_arena_comes_from_the_homography_the_bench_actually_loaded():
-    """Not from a constant, and not from workspace.json.
+def test_the_arena_is_the_workspace_someone_CLICKED():
+    """Not the homography's own rectangle, and the two are different things.
 
-    A homography built for one rectangle under a workspace declaring another
-    put the tracker and the planner on different floors once already.
+    The homography records the quad it was CALIBRATED against, with its origin
+    wherever that quad sat. The workspace is four corners clicked afterwards.
+    On this rig they disagree badly: the clicked arena runs cm x -33.3..109.2,
+    y -31.8..90.9 — an extent of 142.5 x 122.7 and an origin a third of a metre
+    from zero — against a homography declaring 138.8 x 110.8 from (0, 0).
+
+    Publishing against the homography's rectangle put a ball at cm (-30, 90) at
+    arena pixel (-300, 900), off their map entirely, and started the warp well
+    inside the arena, which is the offset crop their UI was showing.
     """
     app = FakeApp()
-    app.homography.width, app.homography.height = 240.0, 180.0
+    app.homography.width, app.homography.height = 240.0, 180.0   # ignored
+    app.bounds = [-33.3, -31.8, 109.2, 90.9]
     bridge = Bridge(app, robot_id=2, client=FakeClient())
-    assert bridge.arena.width_cm == 240.0
-    assert bridge.arena.height_cm == 180.0
+    assert bridge.arena.width_cm == pytest.approx(142.5)
+    assert bridge.arena.height_cm == pytest.approx(122.7)
+    assert tuple(bridge.arena.origin_cm) == pytest.approx((-33.3, -31.8))
+
+
+def test_the_arena_ORIGIN_puts_every_clicked_corner_on_the_map():
+    """The whole point: no negative pixels, nothing past the far edge."""
+    app = FakeApp()
+    app.bounds = [-33.3, -31.8, 109.2, 90.9]
+    arena = Bridge(app, robot_id=2, client=FakeClient()).arena
+    w, h = arena.size_px
+    for cm in [(-33.3, -31.8), (109.2, 90.9), (-30.0, 90.9), (108.4, -31.8)]:
+        x, y = arena.to_px(cm)
+        assert 0.0 <= x <= w and 0.0 <= y <= h, f"{cm} -> ({x}, {y})"
+
+
+def test_the_warp_uses_the_same_origin_as_the_conversion():
+    """One matrix cannot disagree with itself; two transforms can."""
+    app = FakeApp()
+    app.bounds = [-33.3, -31.8, 109.2, 90.9]
+    arena = Bridge(app, robot_id=2, client=FakeClient()).arena
+    M = arena.matrix_from(app.homography)
+    cam = np.array([[[200.0, 400.0]]], np.float64)
+    one_step = cv2.perspectiveTransform(cam, M).reshape(2)
+    two_step = np.array(arena.to_px(app.homography.to_cm(cam.reshape(1, 2))[0]))
+    assert one_step == pytest.approx(two_step, abs=1e-6)
 
 
 # -- end to end, through the sim camera --------------------------------------
@@ -440,6 +478,7 @@ def test_the_sim_bench_gets_its_arena_from_what_the_camera_SEES():
     app.homography = Homography(
         [[1.0 / 9.2, 0.0, 0.0], [0.0, 1.0 / 9.2, 0.0], [0.0, 0.0, 1.0]])
     app.homography.width = app.homography.height = 0.0
+    app.bounds = None                    # nobody has clicked the corners
 
     bridge = Bridge(app, robot_id=2, client=FakeClient())
     assert bridge.arena.width_cm == pytest.approx(1279 / 9.2, abs=0.2)
@@ -688,13 +727,14 @@ def test_the_PLACEHOLDER_arena_is_never_latched():
     app = FakeApp(frame=None)
     app.homography.M = None                       # nothing to measure from
     app.homography.width = app.homography.height = 0.0
+    app.bounds = None                             # and no workspace clicked
     bridge = Bridge(app, robot_id=2, client=FakeClient())
     assert bridge.arena.width_cm == 200.0         # the placeholder, used once
     assert bridge._arena is None, "the placeholder must not be cached"
 
-    # A frame arrives and the homography starts working: the arena corrects.
+    # The corners get clicked and the arena corrects itself.
     app.homography.M = _square_homography()
-    app.homography.width, app.homography.height = ARENA_W, ARENA_H
+    app.bounds = [0.0, 0.0, ARENA_W, ARENA_H]
     assert bridge.arena.width_cm == pytest.approx(ARENA_W)
     assert bridge._arena is not None, "a measurement IS cached"
 
@@ -889,3 +929,94 @@ def test_a_shape_started_from_OFF_PATH_still_gets_driven_whole():
             seen.add(int(path.s // 10))
     assert path.launched, "it never reached the start"
     assert len(seen) == int(path.length // 10) + 1, "part of the shape was skipped"
+
+
+# -- aligning once, before pursuit ---------------------------------------------
+
+def test_align_is_a_third_style_and_pursuit_is_still_the_default():
+    from fleet_test import STYLES
+    assert STYLES[0] == "pursuit"
+    assert "align" in STYLES and "turn-go" in STYLES
+
+
+def test_align_hands_over_to_pursuit_and_does_not_come_back():
+    """The difference from turn-go, which is the whole point.
+
+    Pure pursuit's steering gain rises as the lookahead shortens, so a ball
+    that starts badly aimed swings wide before it settles — and on a drawn
+    shape that opening arc IS the deviation, printed into the first stretch of
+    the route. `turn-go` removes it but pays a crawl at every direction change
+    after; `align` pays once.
+    """
+    import fleet_test as ft
+
+    class Bench:
+        style = "align"
+        aligned = False
+        turning = 1.0
+        drive_note = ""
+        turn_and_go = ft.BlobTest.turn_and_go
+        travel_readout = staticmethod(lambda: (0.0, None, 20.0))
+
+    b = Bench()
+    # Pointing the way it is already travelling: the turn resolves at once.
+    v = b.turn_and_go(np.array([20.0, 0.0]))
+    assert b.turning is None, "the turn should have been confirmed"
+    assert np.linalg.norm(v) > 0
+
+
+# -- the escape goes somewhere there is floor ----------------------------------
+
+class _Escaper:
+    """Just enough bench for `into_free_space`."""
+
+    def __init__(self, pos_cm, box=(0.0, 0.0, 138.8, 110.8), margin=10.0):
+        import fleet_test as ft
+        self.into_free_space = ft.BlobTest.into_free_space.__get__(self)
+        self._box, self._margin = box, margin
+        self.blob = {"xy": np.array(pos_cm, dtype=float)}
+        self.homography = type("H", (), {"ready": True})()
+
+    def agent_bounds(self):
+        return list(self._box)
+
+    def goal_margin_cm(self):
+        return self._margin
+
+    def to_cm(self, xy):
+        return np.asarray(xy, dtype=float)
+
+
+def test_in_open_floor_the_escape_is_left_alone():
+    """Reversing the last command encodes the one thing actually known — what
+    the ball was pushing against. Away from a wall there is nothing to add."""
+    e = _Escaper((69.0, 55.0))
+    got = e.into_free_space(np.array([1.0, 0.0]))
+    assert got == pytest.approx([1.0, 0.0])
+
+
+def test_an_escape_INTO_a_wall_is_turned_round():
+    e = _Escaper((3.0, 55.0))                      # hard against the left edge
+    got = e.into_free_space(np.array([-1.0, 0.0]))  # pointing further left
+    assert got[0] > 0.9, "it must be sent back into the arena"
+
+
+def test_an_escape_already_heading_inward_is_reinforced_not_fought():
+    e = _Escaper((3.0, 55.0))
+    got = e.into_free_space(np.array([1.0, 0.0]))
+    assert got == pytest.approx([1.0, 0.0])
+
+
+def test_a_CORNER_bisects_both_normals():
+    """The case reversing the command cannot handle: back off one wall and you
+    run along it into the other."""
+    e = _Escaper((3.0, 3.0))                       # top-left corner
+    got = e.into_free_space(np.array([-1.0, 0.0]))
+    assert got[0] > 0.3 and got[1] > 0.3, "it should head into the arena"
+
+
+def test_no_workspace_means_the_old_rule_stands():
+    e = _Escaper((3.0, 55.0))
+    e.agent_bounds = lambda: None
+    got = e.into_free_space(np.array([-1.0, 0.0]))
+    assert got == pytest.approx([-1.0, 0.0])

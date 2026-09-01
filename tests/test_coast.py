@@ -560,7 +560,7 @@ def test_zeroing_happens_at_rest_and_measures_nothing():
     camera is there to supply."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.zero_at_rest)
     assert "aim_zero(0.0)" in src
     assert "heading_offset = 0.0" in src
@@ -575,7 +575,7 @@ def test_every_move_zeroes_before_it_drives():
     """
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert "zero_at_rest" in inspect.getsource(blob_test.BlobTest.arm)
 
 
@@ -594,7 +594,7 @@ def test_the_heading_correction_is_the_fleet_estimator_not_a_second_loop():
     """
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.drive)
     assert "observe_heading" in src
     assert not hasattr(blob_test.BlobTest, "retune_aim")
@@ -606,7 +606,7 @@ def test_the_correction_can_be_switched_off_to_isolate_the_follower():
     one."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.cycle_aim)
     assert "heading_tracking" in src
     assert set(blob_test.AIM_MODES) == {"off", "on"}
@@ -618,7 +618,7 @@ def test_one_definition_of_the_compass_convention():
     quantity that circles whatever you correct instead of failing plainly."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.travel_readout)
     assert "velocity_to_command" in src
     assert "90.0 - deg" not in src
@@ -687,7 +687,7 @@ def test_a_dropped_frame_does_not_stop_the_motors():
     """
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.drive)
     assert "DRIVE_ON_PREDICTION" in src
     assert 0 < blob_test.DRIVE_ON_PREDICTION <= 6
@@ -699,7 +699,7 @@ def test_the_commanded_direction_is_rate_limited():
     follow every twitch."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert "slew" in inspect.getsource(blob_test.BlobTest.drive)
     assert blob_test.SLEW_DEG_S > 0
 
@@ -709,7 +709,7 @@ def test_slew_limits_the_turn_but_never_the_speed():
     back; only the direction's rate is limited."""
     import types
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     app = types.SimpleNamespace(_slew_at=None, _slew_deg=None,
                                 slew=blob_test.BlobTest.slew)
     v = np.array([20.0, 0.0])
@@ -731,7 +731,7 @@ def test_turn_and_go_crawls_rather_than_turning_in_place():
     trust. Crawling keeps just enough travel for the camera to confirm which
     way it now points before speed is committed.
     """
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert 0 < blob_test.TURN_SPEED_CM_S < 10
     assert blob_test.TURN_SPEED_CM_S >= 1.0
 
@@ -739,22 +739,23 @@ def test_turn_and_go_crawls_rather_than_turning_in_place():
 def test_the_return_to_turning_band_is_wide():
     """Narrow it and every small correction becomes a stop-and-turn, which
     gives back the smoothness the mode exists to provide."""
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert blob_test.RETURN_DEG > blob_test.TURN_OK_DEG
     assert blob_test.RETURN_DEG >= 30.0
 
 
 def test_a_turn_that_will_not_converge_gives_up_and_drives():
     """Pointed roughly right and moving beats stopped and correct."""
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert 0 < blob_test.TURN_MAX_S <= 10
 
 
-def test_both_styles_exist_and_pursuit_is_the_default():
+def test_the_three_styles_exist_and_pursuit_is_the_default():
     """Pursuit is the only sane choice for a line, circle or scribble; turn-go
-    is the better one for point-to-point. Neither replaces the other."""
-    import fleet_test as blob_test
-    assert set(blob_test.STYLES) == {"pursuit", "turn-go"}
+    is the better one for point-to-point. `align` replaces neither: it points
+    the ball ONCE, before pursuit starts, and hands over for good."""
+    import coast_test as blob_test
+    assert set(blob_test.STYLES) == {"pursuit", "align", "turn-go"}
     assert blob_test.STYLES[0] == "pursuit"
 
 
@@ -765,7 +766,7 @@ def test_arrival_radius_is_a_knob_not_a_constant():
     while a run is going wrong rather than only between runs."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert "goal_tol" in inspect.getsource(blob_test.BlobTest.build_track)
     assert blob_test.ARRIVE_CM > 0
 
@@ -775,7 +776,7 @@ def test_the_default_radius_is_scaled_to_the_ball():
     on it; asking for much better is asking the controller to satisfy a test
     its own size may not permit."""
     from vision.shots import BALL_CM
-    import fleet_test as blob_test
+    import coast_test as blob_test
     assert blob_test.ARRIVE_CM < BALL_CM
     assert blob_test.ARRIVE_CM > BALL_CM / 2.0
 
@@ -885,7 +886,7 @@ def test_nothing_here_measures_latency_itself():
     controller -- see the heading correction."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.plant_constants)
     assert "MOTION_PATH" in src
 
@@ -901,7 +902,7 @@ def test_drawing_a_path_does_not_shadow_the_view_rectangle():
     """
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.draw_view)
     body = src[src.index("arrival radius"):]
     assert "\n                r = " not in body
@@ -984,7 +985,7 @@ def test_flipping_is_button_only_not_bound_to_a_key():
     exposure controls."""
     import inspect
 
-    import fleet_test as blob_test
+    import coast_test as blob_test
     src = inspect.getsource(blob_test.BlobTest.key)
     assert "flip_axis" not in src
 
@@ -996,7 +997,7 @@ def test_the_app_constructs_and_both_tabs_build():
     import os
 
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-    import fleet_test as blob_test
+    import coast_test as blob_test
     app = blob_test.BlobTest("sim", with_fleet=False)
     try:
         for tab in ("robot", "track"):
@@ -1117,7 +1118,7 @@ def test_the_fine_corrector_refuses_the_error_the_bootstrap_exists_for():
     past 90 degrees either. So a frame error between those and 180 has nothing
     handling it, and the symptom is a ball driving confidently away.
     """
-    import fleet_test as m
+    import coast_test as m
     assert m.AIM_MAX_STEP_DEG < 90.0
     assert m.BOOTSTRAP_CM > 0 and m.BOOTSTRAP_GROW_CM > 0
 
@@ -1128,7 +1129,7 @@ def test_the_check_measures_the_gap_not_a_bearing():
     the goal, just slowly."""
     import inspect
 
-    import fleet_test as m
+    import coast_test as m
     src = inspect.getsource(m.BlobTest.step_bootstrap)
     assert 'b["gap0"]' in src and "BOOTSTRAP_GROW_CM" in src
 
@@ -1138,7 +1139,7 @@ def test_it_corrects_by_the_measured_error_not_a_flat_180():
     would leave anything between 90 and 180 still diverging."""
     import inspect
 
-    import fleet_test as m
+    import coast_test as m
     src = inspect.getsource(m.BlobTest.step_bootstrap)
     assert "velocity_to_command" in src
     assert "180.0" in src           # only as the wrap, not as the correction
@@ -1150,7 +1151,7 @@ def test_the_check_runs_once_per_run():
     oscillate, and there is nothing here to damp it."""
     import inspect
 
-    import fleet_test as m
+    import coast_test as m
     src = inspect.getsource(m.BlobTest.step_bootstrap)
     assert "self.bootstrap = None" in src
 
@@ -1160,7 +1161,7 @@ def test_a_closed_path_is_left_alone():
     meaning for it."""
     import inspect
 
-    import fleet_test as m
+    import coast_test as m
     assert 'gap0"] is None' in inspect.getsource(m.BlobTest.step_bootstrap)
 
 
@@ -1170,7 +1171,7 @@ def _app_with_ball():
     import os
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     import time
-    import fleet_test as F
+    import coast_test as F
     from fleet.manager import Fleet
     from fleet.roster import RobotEntry
     app = F.BlobTest("sim", with_fleet=False)
@@ -1196,7 +1197,7 @@ def test_the_model_cannot_reconfigure_the_rig():
     reason: a model may say where a robot goes, not connect one, flip the
     arena frame, zero the aim or write calibration. Those leave the setup
     wrong in ways nothing downstream detects."""
-    import fleet_test as F
+    import coast_test as F
     names = {t["name"] for t in F.AGENT_TOOLS}
     for forbidden in ("connect", "disconnect", "flip_axis", "zero", "probe",
                       "save_calib", "set_led", "scan"):
@@ -1250,7 +1251,7 @@ def test_the_call_cap_is_held_by_the_app_not_the_model():
     """A loop whose exit the model controls is how a ball drives in circles
     for ten minutes while somebody reads the transcript."""
     from llm.stub import replies
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         log = app.agent_run("wander",
@@ -1335,7 +1336,7 @@ def test_opening_the_box_mid_drive_releases_the_keys():
     rolling while you type at it."""
     import inspect
 
-    import fleet_test as F
+    import coast_test as F
     src = inspect.getsource(F.BlobTest.manual_drive)
     assert "self.typing" in src
     assert "h.stop()" in src
@@ -1345,7 +1346,7 @@ def test_the_model_is_a_flag_not_an_edit():
     """Comparing a 4B against a 9B on the same rig should not need the source
     changed between runs -- that is how the two get compared under quietly
     different conditions."""
-    import fleet_test as F
+    import coast_test as F
     app = F.BlobTest("sim", with_fleet=False, model="qwen3.5:4b")
     try:
         assert app.agent_model == "qwen3.5:4b"
@@ -1356,7 +1357,7 @@ def test_the_model_is_a_flag_not_an_edit():
 def test_an_unknown_preset_does_not_stop_the_app():
     """This is a bench tool for a camera and a ball. A language model is
     something it can use when one is running, never a dependency."""
-    import fleet_test as F
+    import coast_test as F
     app = F.BlobTest("sim", with_fleet=False, model="no-such-model")
     try:
         assert app.agent_client is None
@@ -1376,7 +1377,7 @@ def test_the_jump_gate_is_sized_from_the_rig_not_a_constant():
     """
     import time
 
-    import fleet_test as F
+    import coast_test as F
     app = F.BlobTest("sim", with_fleet=False)
     try:
         for _ in range(30):
@@ -1400,7 +1401,7 @@ def test_the_advice_needs_no_dropped_frame_margin():
     one-frame number and doubling it for dropouts would be counting twice."""
     import inspect
 
-    import fleet_test as F
+    import coast_test as F
     assert "misses" in inspect.getsource(F.Track.update)
     assert "DROPPED" in inspect.getsource(F.BlobTest.jump_advice)
 
@@ -1410,7 +1411,7 @@ def test_the_advice_needs_no_dropped_frame_margin():
 def _loop_path():
     """A scribble that finishes near where it started -- the shape that
     separates a correct taper from a plausible one."""
-    import fleet_test as F
+    import coast_test as F
     pts = [(20, 20), (90, 20), (90, 60), (30, 60), (30, 26), (26, 22)]
     return F.Path([np.array(p, dtype=float) for p in pts], kind="freehand")
 
@@ -1427,7 +1428,7 @@ def test_it_slows_into_the_end_of_a_freehand_path():
     ratchet doing its job. Giving each probe its own path asks the question
     each was written to ask.
     """
-    import fleet_test as F
+    import coast_test as F
     fast = np.linalg.norm(F.pursue(_loop_path(), np.array([60.0, 20.0]), 15, 25,
                                    goal_tol=6, coast_s=0.5, min_speed=8)[0])
     slow = np.linalg.norm(F.pursue(_loop_path(), np.array([29.0, 27.0]), 15, 25,
@@ -1445,7 +1446,7 @@ def test_it_does_NOT_crawl_at_the_start_of_a_path_that_loops_back():
     crawl every lap. Arriving needs both inside the radius, so the distance
     still to cover is the LARGER.
     """
-    import fleet_test as F
+    import coast_test as F
     path = _loop_path()
     start = np.array([22.0, 22.0])
     arc_left = path.length - path.project(start)[0]
@@ -1460,7 +1461,7 @@ def test_it_does_NOT_crawl_at_the_start_of_a_path_that_loops_back():
 def test_arrival_still_needs_both_measures():
     """Being beside the endpoint is not arriving if the path has not been
     driven; the taper and the arrival test agree about that."""
-    import fleet_test as F
+    import coast_test as F
     assert not F.pursue(_loop_path(), np.array([22.0, 22.0]), 15, 25,
                         goal_tol=6)[2]
     assert F.pursue(_loop_path(), np.array([26.5, 22.5]), 15, 25, goal_tol=6)[2]
@@ -1480,7 +1481,7 @@ def test_a_commanded_but_motionless_ball_is_called_out():
     """
     import time
 
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     saved = F.UNSTICK_TRIES
     try:
@@ -1510,7 +1511,7 @@ def test_a_commanded_but_motionless_ball_is_called_out():
 def test_the_stall_report_waits_before_accusing():
     """This rig takes most of a second to get going. Calling a stall inside
     that would flag every normal start."""
-    import fleet_test as F
+    import coast_test as F
     assert F.STALL_AFTER_S >= 1.0
 
 
@@ -1551,7 +1552,7 @@ def test_goals_are_held_clear_of_the_boundary_by_the_ball_s_radius():
 
 
 def test_the_margin_accounts_for_the_ball_not_just_a_constant():
-    import fleet_test as F
+    import coast_test as F
     from vision.shots import BALL_CM
     app = _app_with_ball()
     try:
@@ -1570,7 +1571,7 @@ def test_a_stuck_ball_backs_off_and_then_gives_up():
     """
     import time
 
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         h = app.fleet.handles["BALL1"]
@@ -1629,13 +1630,13 @@ def test_the_log_groups_rows_into_runs_and_records_how_each_ended():
     behaves worse than the other; `run_outcome` is blank until the last row of
     a run, because while a run is happening nothing knows how it ends.
     """
-    import fleet_test as F
+    import coast_test as F
     for c in ("run_id", "run_source", "run_outcome"):
         assert c in F.RunLog.COLUMNS
 
 
 def test_an_agent_run_is_labelled_differently_from_a_button_run():
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         hh, w = app.frame.shape[:2]
@@ -1660,7 +1661,7 @@ def test_outcomes_separate_arriving_from_giving_up():
     different things and the log has to tell them apart."""
     import inspect
 
-    import fleet_test as F
+    import coast_test as F
     src = inspect.getsource(F.BlobTest.disarm)
     for word in ("arrived", "stuck", "lost", "halted"):
         assert word in src
@@ -1673,7 +1674,7 @@ def test_the_speed_burst_is_only_for_escapes():
     with a wall gets more."""
     import inspect
 
-    import fleet_test as F
+    import coast_test as F
     assert not hasattr(F.BlobTest, "kick")
     assert "KICK_SPEED_CM_S" in inspect.getsource(F.BlobTest.start_unstick)
     assert "KICK_SPEED_CM_S" not in inspect.getsource(F.BlobTest.drive)
@@ -1685,7 +1686,7 @@ def test_the_taper_floor_never_exceeds_what_was_asked_for(commanded):
     It is not there to overrule the slider -- and unclamped it did: at a
     commanded 10cm/s a floor of 12 made the ball speed UP on its final
     approach, worst at exactly the low settings this rig is driven at."""
-    import fleet_test as F
+    import coast_test as F
     goal = F.Path.point([100.0, 100.0])
     for gap in (30.0, 12.0, 6.0, 2.0, 0.5):
         v, _, done, _ = F.pursue(goal, np.array([100.0 - gap - 6.0, 100.0]),
@@ -1713,7 +1714,7 @@ def test_a_retracing_path_aims_the_lookahead_BACKWARDS_near_its_turn():
     what pure pursuit cannot do, so the patrol is built from one-way legs
     instead. This test exists so that nobody rebuilds it the obvious way.
     """
-    import fleet_test as F
+    import coast_test as F
     out_and_back = F.Path([np.array([5.0, -15.0]), np.array([112.0, -15.0]),
                            np.array([5.0, -15.0])])
     for x in (100.0, 104.0, 108.0, 111.0):
@@ -1736,7 +1737,7 @@ def test_a_patrol_leg_always_aims_the_lookahead_FORWARD():
     the way to the end -- where the run arrives, and the patrol swaps the ends
     and drives the next leg.
     """
-    import fleet_test as F
+    import coast_test as F
     leg = F.Path.line(np.array([5.0, -15.0]), np.array([112.0, -15.0]))
     seen = []
     for x in np.arange(20.0, 112.0, 2.0):
@@ -1755,7 +1756,7 @@ def test_a_ball_may_not_skip_to_the_far_leg_of_a_retracing_path():
     read as being at the start, even though the returning leg passes through
     exactly the same point.
     """
-    import fleet_test as F
+    import coast_test as F
     p = F.Path([np.array([0.0, 0.0]), np.array([100.0, 0.0]),
                 np.array([0.0, 0.0])])
     s0, _ = p.project(np.array([10.0, 0.0]))          # no progress yet
@@ -1773,7 +1774,7 @@ def test_the_ratchet_relocks_when_the_ball_is_moved():
     would drive it back toward a place it is no longer near. Past
     `RELOCK_CM` the search goes global again.
     """
-    import fleet_test as F
+    import coast_test as F
     p = F.Path([np.array([0.0, 0.0]), np.array([200.0, 0.0])])
     p.s = 190.0
     s, off = p.project(np.array([10.0, 0.0]), near=p.s)
@@ -1789,7 +1790,7 @@ def test_a_patrol_turns_round_at_each_end_instead_of_stopping():
     than on a hardware run because the thing that was broken was the decision,
     not the driving.
     """
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         a, b = np.array([10.0, 40.0]), np.array([90.0, 40.0])
@@ -1813,7 +1814,7 @@ def test_drawing_a_new_route_ends_the_patrol():
     point-to-point drive into an endless one, and the symptom -- a ball that
     will not stop -- looks nothing like its cause.
     """
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         app.start_patrol(np.array([10.0, 40.0]), np.array([90.0, 40.0]))
@@ -1832,7 +1833,7 @@ def test_the_log_records_the_route_and_not_merely_its_kind():
     makes that read directly.
     """
     import csv
-    import fleet_test as F
+    import coast_test as F
     app = _app_with_ball()
     try:
         assert "path_pts" in F.RunLog.COLUMNS
