@@ -174,3 +174,25 @@ def set_flow(robot_id: int, expression: str, closed: bool = True) -> str:
     """
     return client.Robot.request_flow(int(robot_id), str(expression),
                                      bool(closed))
+
+
+def get_arena(robot_id: int = 2) -> dict:
+    """The arena's real size, centre and safe bounds, in arena pixels.
+
+    CALL THIS BEFORE PLACING ANY COORDINATE. The arena is four corners
+    somebody clicked, mapped through a camera calibration, and it changes
+    whenever either is redone — so any figure written into a prompt goes
+    stale silently. It has already: a re-click moved the centre from
+    (694, 554) to (712, 613) and an agent kept orbiting the old one.
+
+    Returns width, height, centre, px_per_cm, width_cm, height_cm, and
+    `safe` as [x_min, y_min, x_max, y_max] — keep every point inside `safe`
+    or the drive is refused.
+    """
+    got = client.Robot.get_arena()
+    if not got:
+        return {"known": False,
+                "reason": "the bench has not reported the arena yet — it is "
+                          "not running, or not started with --rpc"}
+    got["known"] = True
+    return got

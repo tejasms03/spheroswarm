@@ -1,5 +1,9 @@
 [
   {
+    "library": "sphero_control",
+    "name": "get_arena"
+  },
+  {
     "library": "planning",
     "name": "trace_targets"
   },

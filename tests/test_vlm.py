@@ -104,6 +104,7 @@ class FakeRobot:
 
     def __init__(self):
         self.attached = False
+        self.arena = None
 
     def attach(self):
         self.attached = True
@@ -120,6 +121,12 @@ class FakeRobot:
         return None
 
     def set_outcome(self, rid, outcome, reason=None):
+        return True
+
+    def set_arena(self, facts):
+        # Published on attach, so the agent asks what the arena is rather than
+        # carrying a number that goes stale on recalibration.
+        self.arena = dict(facts)
         return True
 
 
