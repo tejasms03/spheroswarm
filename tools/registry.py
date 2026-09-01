@@ -6,7 +6,7 @@ robots and remember arrangements. It does not get to reconfigure the rig.
 """
 
 from . import (convenience, expression, generate, library, motion, movement,
-               sensing, timing)
+               sensing, sequence, timing)
 
 POINT = {
     "type": "array",
@@ -398,6 +398,7 @@ TOOLS = [
         },
         "fn": lambda ctx, **kw: convenience.mirror(ctx, **kw),
     },
+    sequence.SCHEMA,
 ]
 
 BY_NAME = {t["name"]: t for t in TOOLS}
@@ -413,6 +414,12 @@ CORE_TOOLS = (
     "move_to", "compute_points", "transform", "stop", "wait_until_settled",
     "set_led", "save_formation", "recall_formation", "list_formations",
     "delete_formation", "get_state", "describe_scene",
+    # CORE rather than triggered, because the commands that need it most need
+    # not mention motion at all. "form up, split, layer, trail, then converge"
+    # contains no trigger word, and a routine that cannot reach `run_sequence`
+    # spends one call per phase and stops halfway -- which is the exact failure
+    # the tool was written for.
+    "run_sequence",
 )
 
 # word -> extra tools that word implies

@@ -42,7 +42,7 @@ def test_schema_subset_is_chosen_from_the_command():
     from tools.registry import CORE_TOOLS
 
     full = {t["name"] for t in schemas()}
-    assert len(full) == 22
+    assert len(full) == 23
 
     plain = {t["name"] for t in schemas("form a circle")}
     assert plain == set(CORE_TOOLS)
@@ -84,7 +84,8 @@ def test_schemas_are_serialisable_and_complete():
         "wait_until_settled", "set_led", "save_formation", "recall_formation",
         "list_formations", "delete_formation", "compute_points",
         "set_path", "set_flow", "follow", "motion_control",
-        "swap", "displace", "nudge", "gather", "spread", "mirror"}
+        "swap", "displace", "nudge", "gather", "spread", "mirror",
+        "run_sequence"}
     for t in s:
         assert t["description"] and t["parameters"]["type"] == "object"
         assert "fn" not in t

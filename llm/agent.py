@@ -219,6 +219,15 @@ class SwarmAgent:
         self.sim_lock = sim_lock or threading.RLock()
         self.history = []                  # [{"role": ..., "content": ...}]
         self._cancel = threading.Event()
+        # Put cancellation where a TOOL can see it. `cancel()` sets this Event
+        # and `_check_cancel` reads it between tool calls, which is enough for
+        # every tool that returns promptly -- but `run_sequence` executes a
+        # whole routine inside ONE call and has to check between its own steps.
+        # Without this it reads `ctx.cancel_event` as absent, decides nothing
+        # is driving, and runs a sixteen-step routine to the end after STOP was
+        # pressed. That is precisely the runaway `MAX_TOOL_CALLS` exists to
+        # prevent, reintroduced by the tool written to work around it.
+        setattr(ctx, "cancel_event", self._cancel)
 
     # -- cancellation ------------------------------------------------------
 
