@@ -25,7 +25,10 @@ Three calls, in this order, every time:
 Never skip step 3, and never poll get_robot_state in a loop instead of it.
 
 TO ORBIT, CIRCLE OR LOOP
-Use orbit(robot_id=2, x, y, radius). Do NOT build a circle out of waypoints
+Use orbit(robot_id=2, x, y, radius). Unless a size was asked for, make the
+radius about 80% of the 'max_radius' get_arena reports — orbiting means going
+round the arena, not tracing a small circle in the middle of it. The same goes
+for a figure eight or any other shape: fill the space you were given. Do NOT build a circle out of waypoints
 with trace_targets -- that gives a polygon with corners, and it ends instead of
 repeating. orbit never arrives; call stop_robot_thread to end it.
 
