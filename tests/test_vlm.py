@@ -661,3 +661,37 @@ def test_a_CLOSED_path_may_still_wrap_to_zero():
     ring.s = ring.length - 1.0
     pursue(ring, np.array([30.0, 0.0]), lookahead=15.0, speed=20.0)
     assert ring.s < ring.length / 2.0
+
+
+def test_the_PLACEHOLDER_arena_is_never_latched():
+    """The fault that refused a correct figure eight.
+
+    On the first tick the sim homography declares no rectangle and no frame has
+    arrived, so `_workspace_cm` returns the 200x200 placeholder. Caching that
+    made every later conversion wrong with nothing able to correct it: a curve
+    written for the real 1388x1109 arena was scaled into a fictional 2000x2000
+    one and its first points landed at (104, 104) in an arena 110cm tall. The
+    refusal was right; the arena was not.
+    """
+    app = FakeApp(frame=None)
+    app.homography.M = None                       # nothing to measure from
+    app.homography.width = app.homography.height = 0.0
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    assert bridge.arena.width_cm == 200.0         # the placeholder, used once
+    assert bridge._arena is None, "the placeholder must not be cached"
+
+    # A frame arrives and the homography starts working: the arena corrects.
+    app.homography.M = _square_homography()
+    app.homography.width, app.homography.height = ARENA_W, ARENA_H
+    assert bridge.arena.width_cm == pytest.approx(ARENA_W)
+    assert bridge._arena is not None, "a measurement IS cached"
+
+
+def test_a_measured_arena_is_still_held_once_it_is_known():
+    """Only the placeholder is refused caching. A rectangle that changed under
+    a running planner would move every published position silently."""
+    app = FakeApp(frame=np.zeros((1020, 1280, 3), np.uint8))
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    first = bridge.arena
+    app.homography.width, app.homography.height = 999.0, 999.0
+    assert bridge.arena is first

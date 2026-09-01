@@ -548,3 +548,29 @@ def test_a_single_point_is_not_a_curve():
                                   "expression": "points = [(694, 554)]"})
     drv.serve(client)
     assert "at least two points" in client.Robot.outcomes[-1]["reason"]
+
+
+def test_a_refusal_is_restated_in_the_units_the_agent_WRITES_in():
+    """`agent_check` speaks centimetres; every tool speaks arena pixels.
+
+    An agent handed "aim inside x 10..129" after submitting a curve spanning
+    294 to 1094 read it as a rig fault and stopped — the right call on the
+    information it had, and the information was in the wrong units.
+    """
+    class Bounded(FlowApp):
+        def agent_bounds(self):
+            return [0.0, 0.0, ARENA_W, ARENA_H]
+
+        def goal_margin_cm(self):
+            return 10.0
+
+    app = Bounded("refused: (104, 104) is too close to the edge. "
+                  "Aim inside x 10..129, y 10..101")
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2, path_cls=FakePath)
+    client = FakeClient()
+    client.Robot.requests.append({"want": "flow", "expression": EIGHT,
+                                  "closed": True})
+    drv.serve(client)
+    said = client.Robot.outcomes[-1]["reason"]
+    assert "ARENA PIXELS" in said
+    assert "x 100..1288" in said and "y 100..1008" in said

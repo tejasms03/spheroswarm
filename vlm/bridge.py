@@ -263,8 +263,20 @@ class Bridge(threading.Thread):
         would move every published position without anything downstream being
         told the units had shifted.
         """
+        w, h, measured = _workspace_cm(self.app)
         if self._arena is None:
-            self._arena = ArenaFrame(*_workspace_cm(self.app))
+            # NOT CACHED UNTIL IT IS A MEASUREMENT. The fallback is
+            # `vision.config.ARENA_CM`, a 200x200 placeholder, and on the very
+            # first tick it is what you get: the sim homography declares no
+            # rectangle and no frame has arrived yet. Latching that made every
+            # later conversion wrong in a way nothing could correct -- a figure
+            # eight written for the real 1388x1109 arena was scaled into a
+            # fictional 2000x2000 one, and its first points landed at (104,104)
+            # in an arena only 110cm tall. The refusal was right; the arena was
+            # not.
+            if not measured:
+                return ArenaFrame(w, h)
+            self._arena = ArenaFrame(w, h)
         return self._arena
 
     def connect(self):
@@ -353,7 +365,7 @@ class Bridge(threading.Thread):
 
 
 def _workspace_cm(app):
-    """The arena rectangle in cm, preferring the calibration actually loaded.
+    """The arena rectangle in cm, and whether it was actually MEASURED.
 
     The homography records the rectangle it was BUILT for, and `workspace.json`
     records the one the planner believes in. They are supposed to agree --
@@ -365,7 +377,7 @@ def _workspace_cm(app):
     """
     h = app.homography
     if h is not None and getattr(h, "width", None) and getattr(h, "height", None):
-        return float(h.width), float(h.height)
+        return float(h.width), float(h.height), True
 
     # No declared rectangle. In sim that is the normal case rather than a
     # fault: the bench throws away the saved calibration and substitutes the
@@ -379,9 +391,10 @@ def _workspace_cm(app):
         corners = [(0, 0), (cols - 1, 0), (cols - 1, rows - 1), (0, rows - 1)]
         cm = np.asarray(h.to_cm(corners), dtype=float)
         return (float(cm[:, 0].max() - cm[:, 0].min()),
-                float(cm[:, 1].max() - cm[:, 1].min()))
+                float(cm[:, 1].max() - cm[:, 1].min()), True)
 
     # Nothing to go on. 200x200 is `vision.config.ARENA_CM`, and it is a
     # placeholder rather than a measurement -- a bridge reporting into it is
-    # reporting into a floor nobody has calibrated.
-    return 200.0, 200.0
+    # reporting into a floor nobody has calibrated. The third value says so,
+    # and `Bridge.arena` refuses to cache it.
+    return 200.0, 200.0, False
