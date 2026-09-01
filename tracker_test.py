@@ -42,7 +42,8 @@ import pygame
 
 from fleet.heading import DEFAULT_MAX_TURN
 from fleet.sim_handle import SimRobot
-from swarm.trace import RollPlant, SpeedMap, heading_vector, wrap180
+from swarm.trace import (DEFAULT_YAW_RATE, RollPlant, SpeedMap,
+                         heading_vector, wrap180)
 from ui.theme import (CHALK, CORAL, CYAN, DIM, GAP, GREY, INK, MINT, PAD,
                       PANEL, RULE, SUN, Button, Slider, card, section)
 from vision.dots import read_all
@@ -114,7 +115,8 @@ class Drifter:
     SKID_AWAY = (55.0, 115.0)       # deg between where it points and where it goes
     SKID_MIN_CM_S = 16.0            # a slide slow enough to miss is not a demo
 
-    def __init__(self, code, tag, ws, speeds, seed, yaw_rate=180.0):
+    def __init__(self, code, tag, ws, speeds, seed,
+                 yaw_rate=DEFAULT_YAW_RATE):
         self.code, self.tag = code, tag
         self.rng = np.random.default_rng(seed)
         self.robot = SimRobot(code, code, tag, workspace=ws, seed=seed,
@@ -279,7 +281,8 @@ class Drifter:
 class LiveArena:
     """The balls, a cached backdrop, and the three ways of reading a frame."""
 
-    def __init__(self, ws, n=5, px_cm=PX_CM, seed=1, yaw_rate=180.0):
+    def __init__(self, ws, n=5, px_cm=PX_CM, seed=1,
+                 yaw_rate=DEFAULT_YAW_RATE):
         self.ws, self.px_cm = ws, px_cm
         # 1.0 renders a 7.4cm shell at whatever `px_cm` says. Lower it and the
         # balls shrink while the floor stays put -- the same view a camera

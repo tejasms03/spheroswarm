@@ -42,7 +42,8 @@ import pygame
 
 from fleet.sim_handle import SimRobot, from_motion
 from swarm.pd import Polyline
-from swarm.trace import (Camera, Drive, Program, RollFollower, SpeedMap,
+from swarm.trace import (DEFAULT_YAW_RATE, Camera, Drive, Program,
+                         RollFollower, SpeedMap,
                          compile_path, format_plan, heading_vector, simplify,
                          steps_from_log)
 from ui.theme import (CHALK, CORAL, CYAN, DIM, GAP, INK, LED_RGB, MINT, PAD,
@@ -150,7 +151,7 @@ class TraceApp:
         self.path_speed = 20
         self.lookahead = 18
         self.cmd_hz = 6
-        self.yaw_rate = 720 if perfect else 180
+        self.yaw_rate = 720 if perfect else int(DEFAULT_YAW_RATE)
         self.aim_error = 0
         self.noise_mm = 0 if perfect else 3
         self.deadband = self.truth.min_moving_byte
