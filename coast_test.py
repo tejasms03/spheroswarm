@@ -3970,10 +3970,28 @@ class BlobTest:
         touching a key disarms it. Two things steering one ball is how a
         controller gets blamed for a person's input.
         """
+        # THE KEYS ARE READ FIRST, so every refusal below can say whether a
+        # key was even held. This routine used to have four early returns and
+        # only one of them spoke; the other three left a pressed key doing
+        # nothing with nothing on screen, which reads as a broken bench. Three
+        # separate sessions have now been spent finding out which gate it was.
+        held = pygame.key.get_pressed()
+        want = np.zeros(2)
+        for key, direction in self.MANUAL_KEYS.items():
+            if held[key]:
+                want += np.asarray(direction, dtype=float)
+        n = float(np.linalg.norm(want))
+        pressed = n >= 1e-9
+
         if self.tab != "robot":
+            if pressed:
+                self.say("manual drive is on the ROBOT tab — press tab", DIM)
             return False
         h = self.fleet.handles.get(self.code) if (self.fleet and self.code) else None
         if h is None:
+            if pressed:
+                self.say("no robot selected — start with --robot SYRX, "
+                         "or press b to scan", SUN)
             return False
         if self.typing:
             # THE KEYBOARD IS NOT ALWAYS READ THROUGH `key`. This polls
@@ -3989,13 +4007,7 @@ class BlobTest:
                 self.manual = False
                 self.cmd_v = None
             return False
-        held = pygame.key.get_pressed()
-        want = np.zeros(2)
-        for key, direction in self.MANUAL_KEYS.items():
-            if held[key]:
-                want += np.asarray(direction, dtype=float)
-        n = float(np.linalg.norm(want))
-        if n >= 1e-9 and not h.connected:
+        if pressed and not h.connected:
             # SAY IT, rather than commanding a link that is not there.
             # `h is None` was the only guard, and a roster entry whose kind is
             # `real` always produces a handle -- it just never connects if the
