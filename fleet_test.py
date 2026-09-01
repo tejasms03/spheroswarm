@@ -2270,7 +2270,16 @@ class BlobTest:
         self.say(msg + ("  — now darken the room" if lock and ok else ""),
                  MINT if ok else CORAL)
 
-    def manual(self):
+    def camera_manual(self):
+        """Ask the CAMERA about its manual controls.
+
+        Named apart from `self.manual`, which is a boolean saying whether a
+        person is driving by hand. They collided: the attribute is set in
+        `__init__` and so shadowed this method by the time `build_dock` bound
+        it, leaving the TRACK tab's "manual" button holding `False` as its
+        callback. Clicking it raised `'bool' object is not callable` out of
+        `Button.hit` and took the whole window down.
+        """
         src = self.cam.source
         if src is None or not hasattr(src, "manual"):
             self.say("this source has no manual controls", DIM)
@@ -2525,7 +2534,7 @@ class BlobTest:
         bw = (w - 12) // 3
         rows = ((("lock", lambda: self.exposure_mode(True), MINT),
                  ("auto", lambda: self.exposure_mode(False), None),
-                 ("manual", self.manual, None)),
+                 ("manual", self.camera_manual, None)),
                 (("save", self.save_frame, CYAN),
                  ("mask", self.toggle_view, None),
                  ("pause", self.toggle_pause, None)),
@@ -3983,8 +3992,13 @@ class BlobTest:
             # ball is off, out of range, or simply not present, which is every
             # run in sim. `set_velocity` on it returns quietly and the keys do
             # nothing, so the bench looks broken rather than unconnected.
-            self.say(f"{self.code} is not connected — press b to scan, or "
-                     f"run a sim robot with --robot SYRX", SUN)
+            # Said ONCE per spell, not once per frame. `say` prints as well
+            # as drawing, so a held key filled the terminal with the same line
+            # sixty times a second and buried everything else.
+            note = (f"{self.code} is not connected — press b to scan, or "
+                    f"run a sim robot with --robot SYRX")
+            if self.note != note:
+                self.say(note, SUN)
             return False
         if n < 1e-9:
             if self.manual:

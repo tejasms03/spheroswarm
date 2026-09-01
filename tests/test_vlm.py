@@ -1027,3 +1027,28 @@ def test_no_workspace_means_the_old_rule_stands():
     e.agent_bounds = lambda: None
     got = e.into_free_space(np.array([-1.0, 0.0]))
     assert got == pytest.approx([-1.0, 0.0])
+
+
+def test_no_dock_button_has_a_non_callable_callback():
+    """A `TypeError: 'bool' object is not callable` out of `Button.hit` takes
+    the whole window down mid-session.
+
+    `self.manual` was both a boolean — set in `__init__`, meaning a person is
+    driving by hand — and a method that asks the camera about its manual
+    controls. The attribute shadowed the method by the time `build_dock` bound
+    it, so the TRACK tab's "manual" button had always held `False`.
+    """
+    import inspect
+    for mod_name in ("fleet_test", "coast_test"):
+        mod = __import__(mod_name)
+        app = mod.BlobTest
+        methods = {n for n, _ in inspect.getmembers(app, inspect.isfunction)}
+        # Every name assigned a plain attribute in __init__ must not also be a
+        # method, or binding it in the dock captures the attribute.
+        src = inspect.getsource(app.__init__)
+        assigned = {line.split("=")[0].strip()[len("self."):]
+                    for line in src.splitlines()
+                    if line.strip().startswith("self.") and "=" in line
+                    and "(" not in line.split("=")[0]}
+        clash = {n for n in assigned & methods}
+        assert not clash, f"{mod_name}: attribute shadows method: {sorted(clash)}"
