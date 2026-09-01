@@ -298,8 +298,8 @@ class Driver:
         bad = self.app.agent_check(points)
         if bad:
             self.refused += 1
-            self.last_note = bad
-            client.Robot.set_outcome(self.robot_id, "refused", bad)
+            self.last_note = self.in_pixels(bad)
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
 
         self.app.path = self.Path(points, closed=bool(request.get("closed")),
@@ -315,6 +315,36 @@ class Driver:
         self.was_armed = True
         self.last_note = f"driving a {len(points)}-point curve"
         return self.last_note
+
+    def in_pixels(self, refusal):
+        """Restate a centimetre refusal in the units the caller wrote in.
+
+        `agent_check` is the bench's own boundary rule and it speaks
+        centimetres, because that is what the bench thinks in. Every tool the
+        agent has speaks ARENA PIXELS. Handing back "aim inside x 10..129"
+        after being given a curve spanning 294 to 1094 reads as a rig fault
+        rather than an instruction -- an agent said so in as many words, and
+        stopped rather than retry, which was the right call on the information
+        it had.
+
+        The centimetre wording is kept and the pixel bounds appended, because
+        the numbers a person reads in the bench window are centimetres and the
+        numbers the agent must aim in are pixels. Both are true; only one is
+        actionable from where the agent sits.
+        """
+        bounds = getattr(self.app, "agent_bounds", None)
+        margin = getattr(self.app, "goal_margin_cm", None)
+        if bounds is None or margin is None:
+            return refusal
+        box = bounds()
+        if not box:
+            return refusal
+        m = margin()
+        lo = self.arena.to_px((box[0] + m, box[1] + m))
+        hi = self.arena.to_px((box[2] - m, box[3] - m))
+        return (f"{refusal} — IN ARENA PIXELS, which is what these tools take: "
+                f"aim inside x {lo[0]:.0f}..{hi[0]:.0f}, "
+                f"y {lo[1]:.0f}..{hi[1]:.0f}")
 
     def report_probe(self, client):
         """Say how the probe ended, once, on the tick it finishes."""
