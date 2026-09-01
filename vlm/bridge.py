@@ -59,10 +59,20 @@ class ArenaFrame:
     only chooses units.
     """
 
-    def __init__(self, width_cm, height_cm, px_per_cm=PX_PER_CM):
+    def __init__(self, width_cm, height_cm, px_per_cm=PX_PER_CM,
+                 origin_cm=(0.0, 0.0)):
         self.width_cm = float(width_cm)
         self.height_cm = float(height_cm)
         self.px_per_cm = float(px_per_cm)
+        # WHERE THE ARENA STARTS, in centimetres. Not assumed to be (0, 0),
+        # because the workspace is four corners a person clicked and the
+        # homography's own origin is wherever ITS calibration quad happened to
+        # sit. On this rig they differ by a third of a metre: the clicked
+        # arena runs x -33.3..109.2, y -31.8..90.9. Taking (0, 0) as the corner
+        # put a ball at cm (-30, 90) at arena pixel (-300, 900) -- off the map
+        # -- and started the warp a third of a metre inside the arena, which is
+        # the offset crop the framework's UI was showing.
+        self.origin_cm = np.asarray(origin_cm, dtype=float)
 
     @property
     def size_px(self):
@@ -77,12 +87,14 @@ class ArenaFrame:
         return [(0, 0), (0, h - 1), (w - 1, h - 1), (w - 1, 0)]
 
     def to_px(self, xy_cm):
-        x, y = xy_cm
-        return (float(x) * self.px_per_cm, float(y) * self.px_per_cm)
+        x = (float(xy_cm[0]) - self.origin_cm[0]) * self.px_per_cm
+        y = (float(xy_cm[1]) - self.origin_cm[1]) * self.px_per_cm
+        return (x, y)
 
     def to_cm(self, xy_px):
-        x, y = xy_px
-        return (float(x) / self.px_per_cm, float(y) / self.px_per_cm)
+        x = float(xy_px[0]) / self.px_per_cm + self.origin_cm[0]
+        y = float(xy_px[1]) / self.px_per_cm + self.origin_cm[1]
+        return (x, y)
 
     def scalar_to_px(self, cm):
         """A length, not a point. Radii and margins have to cross too."""
@@ -97,8 +109,13 @@ class ArenaFrame:
         `Homography.nudge_cm` says so in as many words. One matrix cannot
         disagree with itself.
         """
-        S = np.array([[self.px_per_cm, 0.0, 0.0],
-                      [0.0, self.px_per_cm, 0.0],
+        # Translate to the arena's own origin BEFORE scaling, so the warp and
+        # `to_px` agree. Composed into one matrix for the reason `nudge_cm`
+        # gives: two transforms that must be kept in step is how this project
+        # already lost an afternoon.
+        k, o = self.px_per_cm, self.origin_cm
+        S = np.array([[k, 0.0, -k * o[0]],
+                      [0.0, k, -k * o[1]],
                       [0.0, 0.0, 1.0]], dtype=np.float64)
         return S @ np.asarray(homography.M, dtype=np.float64)
 
@@ -263,7 +280,8 @@ class Bridge(threading.Thread):
         would move every published position without anything downstream being
         told the units had shifted.
         """
-        w, h, measured = _workspace_cm(self.app)
+        w, h, origin, provisional = _workspace_cm(self.app)
+        measured = not provisional
         if self._arena is None:
             # NOT CACHED UNTIL IT IS A MEASUREMENT. The fallback is
             # `vision.config.ARENA_CM`, a 200x200 placeholder, and on the very
@@ -275,8 +293,8 @@ class Bridge(threading.Thread):
             # in an arena only 110cm tall. The refusal was right; the arena was
             # not.
             if not measured:
-                return ArenaFrame(w, h)
-            self._arena = ArenaFrame(w, h)
+                return ArenaFrame(w, h, origin_cm=origin)
+            self._arena = ArenaFrame(w, h, origin_cm=origin)
         return self._arena
 
     def connect(self):
@@ -365,36 +383,50 @@ class Bridge(threading.Thread):
 
 
 def _workspace_cm(app):
-    """The arena rectangle in cm, and whether it was actually MEASURED.
+    """(width, height, origin) in cm — THE ARENA THE OPERATOR CLICKED.
 
-    The homography records the rectangle it was BUILT for, and `workspace.json`
-    records the one the planner believes in. They are supposed to agree --
-    `Homography.matches` exists because they have disagreed before, and a
-    homography saying 200x200 under a 240x180 workspace put the tracker and the
-    planner on different floors with nothing complaining. Reading the
-    homography here keeps this boundary tied to the same rectangle the
-    centimetres it is converting were measured in.
+    From `app.agent_bounds()`, which is the bounding box of the workspace
+    corners mapped through the homography. Deliberately NOT the homography's
+    own `width`/`height`.
+
+    Those two are different things and on this rig they disagree badly. The
+    homography records the rectangle it was CALIBRATED against — 138.8 x 110.8
+    with its origin wherever that calibration quad sat. The workspace is four
+    corners a person clicked afterwards, and here they land at cm x -33.3..109.2,
+    y -31.8..90.9: an extent of 142.5 x 122.7 and an origin a third of a metre
+    from zero. Publishing against the homography's rectangle put a ball at cm
+    (-30, 90) at arena pixel (-300, 900), which is off their map entirely, and
+    started the warp well inside the arena — the offset crop their UI showed.
+
+    The tracked workspace is the one that matters, because it is the region the
+    mask cuts, the region `agent_check` refuses goals outside, and the region a
+    ball can actually be in.
     """
-    h = app.homography
-    if h is not None and getattr(h, "width", None) and getattr(h, "height", None):
-        return float(h.width), float(h.height), True
+    box = None
+    try:
+        box = app.agent_bounds()
+    except Exception:
+        box = None
+    if box:
+        x0, y0, x1, y1 = (float(v) for v in box)
+        if x1 - x0 > 1.0 and y1 - y0 > 1.0:
+            return x1 - x0, y1 - y0, (x0, y0), False
 
-    # No declared rectangle. In sim that is the normal case rather than a
-    # fault: the bench throws away the saved calibration and substitutes the
-    # exact scale the fake camera draws at, which is a real mapping that simply
-    # does not know how big the arena is. What the camera SEES is then the only
-    # honest answer, so map the frame's own corners through the homography and
-    # take the box they land in.
+    # No workspace clicked. Fall back to what the camera can see, mapped
+    # through the homography — honest about extent, and it at least cannot put
+    # the ball outside the frame it came from.
+    h = getattr(app, "homography", None)
     frame = getattr(app, "frame", None)
     if h is not None and getattr(h, "ready", False) and frame is not None:
         rows, cols = frame.shape[0], frame.shape[1]
         corners = [(0, 0), (cols - 1, 0), (cols - 1, rows - 1), (0, rows - 1)]
         cm = np.asarray(h.to_cm(corners), dtype=float)
-        return (float(cm[:, 0].max() - cm[:, 0].min()),
-                float(cm[:, 1].max() - cm[:, 1].min()), True)
+        lo, hi = cm.min(0), cm.max(0)
+        return (float(hi[0] - lo[0]), float(hi[1] - lo[1]),
+                (float(lo[0]), float(lo[1])), False)
 
-    # Nothing to go on. 200x200 is `vision.config.ARENA_CM`, and it is a
-    # placeholder rather than a measurement -- a bridge reporting into it is
-    # reporting into a floor nobody has calibrated. The third value says so,
-    # and `Bridge.arena` refuses to cache it.
-    return 200.0, 200.0, False
+    # Nothing to go on. 200x200 is `vision.config.ARENA_CM`, a placeholder
+    # rather than a measurement — a bridge reporting into it is reporting into
+    # a floor nobody has calibrated.
+    # PROVISIONAL. Used so the tick has something, never kept.
+    return 200.0, 200.0, (0.0, 0.0), True

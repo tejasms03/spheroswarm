@@ -616,3 +616,26 @@ def test_a_single_GOAL_is_not_anchored():
     drv.serve(client)
     assert app.path.kind == "point"
     assert getattr(app.path, "anchor", False) is False
+
+
+def test_the_path_class_comes_from_the_app_s_own_module():
+    """The bench is forked. Handing a `fleet_test.Path` to a `coast_test`
+    controller works only while the two happen to agree, and they are meant to
+    diverge — that is what the fork is for."""
+    import coast_test
+    import fleet_test
+
+    class OnCoast:
+        pass
+    OnCoast.__module__ = "coast_test"
+    drv = Driver(OnCoast(), ArenaFrame(ARENA_W, ARENA_H), robot_id=2)
+    assert drv.Path is coast_test.Path
+    assert drv.Path is not fleet_test.Path
+
+
+def test_an_app_whose_module_has_no_Path_falls_back():
+    """An app is not always a bench: the end-to-end test drives a stand-in
+    defined in the test module, which has no `Path` and does not need one."""
+    import fleet_test
+    drv = Driver(FakeApp(), ArenaFrame(ARENA_W, ARENA_H), robot_id=2)
+    assert drv.Path is fleet_test.Path

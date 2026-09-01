@@ -44,8 +44,20 @@ class Driver:
         rather than starting a pygame window to check an arithmetic conversion.
         """
         if self._path_cls is None:
+            # From the APP'S OWN module where it has one, not `fleet_test` by
+            # name. The bench is forked -- `coast_test.py` is a copy kept
+            # deliberately -- and handing a `fleet_test.Path` to a `coast_test`
+            # controller works only for as long as the two happen to agree.
+            # They are meant to diverge; that is what the fork is for.
+            #
+            # Falling back rather than insisting, because an app is not always
+            # a bench: the end-to-end test drives a stand-in defined in the
+            # test module, which has no `Path` of its own and does not need
+            # one.
+            import sys
             from fleet_test import Path
-            self._path_cls = Path
+            own = sys.modules.get(type(self.app).__module__)
+            self._path_cls = getattr(own, "Path", Path)
         return self._path_cls
 
     # -- conversion ----------------------------------------------------------

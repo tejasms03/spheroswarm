@@ -750,11 +750,17 @@ def test_a_turn_that_will_not_converge_gives_up_and_drives():
     assert 0 < blob_test.TURN_MAX_S <= 10
 
 
-def test_both_styles_exist_and_pursuit_is_the_default():
+def test_the_three_styles_exist_and_pursuit_is_the_default():
     """Pursuit is the only sane choice for a line, circle or scribble; turn-go
-    is the better one for point-to-point. Neither replaces the other."""
+    is the better one for point-to-point. Neither replaces the other, and
+    `align` replaces neither: it points the ball ONCE, before pursuit starts,
+    and hands over for good. Pure pursuit's steering gain rises as the
+    lookahead shortens, so a badly aimed start swings wide before it settles,
+    and on a drawn shape that opening arc is deviation printed into the route.
+    turn-go removes it and pays a crawl at every later direction change;
+    align pays once."""
     import fleet_test as blob_test
-    assert set(blob_test.STYLES) == {"pursuit", "turn-go"}
+    assert set(blob_test.STYLES) == {"pursuit", "align", "turn-go"}
     assert blob_test.STYLES[0] == "pursuit"
 
 

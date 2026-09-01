@@ -442,7 +442,20 @@ the goal is, by any physical reading, on it. Tighten it below the tracker's
 accuracy and no amount of driving will ever satisfy it.
 """
 
-STYLES = ("pursuit", "turn-go")
+STYLES = ("pursuit", "align", "turn-go")
+"""How a run is driven.
+
+`pursuit` steers continuously from the first frame. `turn-go` alternates
+between crawling to point and driving, for the whole run. `align` is the
+one-shot: point the ball once, before pursuit starts, then hand over and never
+turn again.
+
+The difference matters because the two costs are different. Pure pursuit's
+steering gain rises as the lookahead shortens, so a ball that starts badly
+aimed swings wide before it settles -- and on a drawn shape that opening arc IS
+the deviation, printed into the first stretch of the route. `turn-go` removes
+it but pays a crawl at every direction change thereafter, which on a figure
+eight is most of them. `align` pays once."""
 """How the follower gets to the target.
 
 `pursuit` steers continuously toward a point ahead on the path -- one smooth
@@ -1832,6 +1845,7 @@ class BlobTest:
         self._slew_at = None
         self._slew_deg = None
         self.style = "pursuit"
+        self.aligned = False
         self.turning = None
         self.goal_tol = ARRIVE_CM
         self.plant = None
@@ -2803,7 +2817,9 @@ class BlobTest:
         self.last_outcome, self.last_note = None, ""   # this run's verdict
         # Every run begins by pointing the ball, because at the moment of
         # arming it is stationary and facing wherever it last stopped.
-        self.turning = time.perf_counter() if self.style == "turn-go" else None
+        self.turning = (time.perf_counter()
+                        if self.style in ("turn-go", "align") else None)
+        self.aligned = False
         self.say(f"driving {self.code} at {self.speed} cm/s — STOP or esc to halt",
                  MINT)
 
@@ -3464,6 +3480,8 @@ class BlobTest:
         n = float(np.linalg.norm(away))
         if n < 1e-6:
             return
+        away = self.into_free_space(away / n)
+        n = 1.0
         self.unstick = {"at": time.perf_counter(),
                         # Off a wall at KICK speed, not at the slider's. The
                         # slider is set for approaching a goal; breaking
@@ -3476,6 +3494,61 @@ class BlobTest:
         self._still_since = None
         self.say(f"stuck — backing off (try {tries + 1} of {UNSTICK_TRIES})",
                  SUN)
+
+    def into_free_space(self, away):
+        """Bend an escape away from the boundary it would otherwise run into.
+
+        Reversing the last command encodes the one thing actually known -- what
+        the ball was pushing against -- and needs no map. What it cannot know
+        is the rest of the arena. In a CORNER the reverse of a command into one
+        wall runs along it and into the other, and with the aim off the
+        commanded direction is not the travelled one anyway, so the reverse can
+        point somewhere the ball was never going.
+
+        The workspace is known exactly, so the inward normal near a boundary is
+        not a guess. Adding it fixes both cases at once: where the escape
+        already heads inward it is reinforced, where it heads out it is turned
+        round, and in a corner both normals apply and the sum bisects them.
+
+        Only near an edge. In open floor there is no normal to add and the
+        reverse-the-command rule stands untouched.
+        """
+        away = np.asarray(away, dtype=float)
+        box = self.agent_bounds()
+        if box is None or self.blob is None or not self.homography.ready:
+            return away
+        pos = np.asarray(self.to_cm(self.blob["xy"]), dtype=float)
+        margin = self.goal_margin_cm()
+
+        # PER AXIS, because each wall is its own constraint and summing them
+        # into one vector loses that. At a corner the inward normals are (1,0)
+        # and (0,1); their sum is a single diagonal, and adding that to an
+        # escape pointing hard along -x still leaves x negative -- the ball
+        # drives into the left wall at a slight angle instead of straight at
+        # it, which is not an escape.
+        push = np.zeros(2)
+        out = away.copy()
+        for axis, (lo, hi) in enumerate(((box[0], box[2]), (box[1], box[3]))):
+            if pos[axis] - lo < margin:
+                push[axis] += 1.0
+                out[axis] = max(out[axis], 0.0)     # never further into it
+            if hi - pos[axis] < margin:
+                push[axis] -= 1.0
+                out[axis] = min(out[axis], 0.0)
+        mag = float(np.linalg.norm(push))
+        if mag < 1e-9:
+            return away                     # open floor: nothing to bend
+
+        n = float(np.linalg.norm(out))
+        if n > 1e-6:
+            # Something of the original escape survives -- along the wall
+            # rather than into it, which is still the direction that knows
+            # what the ball was pushing against.
+            return out / n
+        # It pointed squarely out of the arena and nothing is left of it. The
+        # inward normal is all there is, and driving into the boundary is the
+        # one direction already known to be useless.
+        return push / mag
 
     def step_unstick(self, h):
         """Drive the escape. Returns True while it owns the wheels."""
@@ -3525,7 +3598,9 @@ class BlobTest:
         # the one starting: a ball that has just stopped is pointing back the
         # way it came, which is the case `turn-go` exists for.
         self.coasting = None
-        self.turning = time.perf_counter() if self.style == "turn-go" else None
+        self.turning = (time.perf_counter()
+                        if self.style in ("turn-go", "align") else None)
+        self.aligned = False
         self.drive_note = f"patrol leg {p['legs']}"
         return True
 
@@ -4585,8 +4660,16 @@ class BlobTest:
             h.stop()
             self.disarm("arrived — stopped")
             return
-        if self.style == "turn-go":
+        if self.style == "turn-go" or (self.style == "align"
+                                       and not self.aligned):
             v = self.turn_and_go(v)
+            # `turn_and_go` clears `self.turning` when the camera confirms the
+            # ball is creeping the right way. Under `align` that is the whole
+            # job: hand over to plain pursuit and do not come back, however far
+            # the bearing wanders later.
+            if self.style == "align" and self.turning is None:
+                self.aligned = True
+                self.drive_note = "aligned — pursuing"
         if self.stall_report() is not None:
             tries = (self.unstick or {}).get("tries", 0)
             if tries < UNSTICK_TRIES:
