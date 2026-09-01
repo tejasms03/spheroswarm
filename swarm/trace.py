@@ -39,7 +39,26 @@ import numpy as np
 from fleet.handle import MAX_SPEED
 from swarm.pd import Polyline, dedupe
 
-DEFAULT_YAW_RATE = 180.0        # deg/s the drive assembly can swing through
+DEFAULT_YAW_RATE = 360.0        # deg/s the drive assembly can swing through
+"""Doubled from 180, on measurement rather than feel.
+
+Swept against a wave path at 20cm/s, RMS tracking error came out 15.09cm at
+45deg/s, 3.81 at 90, 3.20 at 180, 2.83 at 360 and 3.13 at 720 -- so 360 is the
+floor of that curve and 720 is past it, where the loop starts ringing against
+the motor lag it cannot out-run.
+
+Two things set the shape. Below about 180 the limit is geometric: the tightest
+circle the ball can hold is v/omega, which at 45deg/s is 25cm against a path
+bending at 6cm, so it physically cannot follow and no tuning helps. Above that,
+a turn simply takes `angle/omega` seconds during which the ball drives a course
+between the old command and the new one, and that error falls as 1/omega.
+
+STILL NOT MEASURED ON A BALL. This is the rate at which the plant is ASSUMED to
+swing, and `compile_path` sizes every yaw step by it -- so if a real assembly
+turns at 90deg/s, every planned corner gets half the time it needs and every
+leg after it starts late. `calib.py`'s manual-drive slider carries a different
+guess (150) for the same quantity. One stopwatch on a commanded 180deg turn
+settles both."""
 DEFAULT_CMD_HZ = 6.0            # roll commands per second the link will carry
 DEFAULT_FIX_SIGMA = 0.35        # cm, tracker noise; measured 0.31-0.34
 DEFAULT_FIX_HZ = 30.0
