@@ -1030,11 +1030,22 @@ class Path:
             return search(0.0, None)
         lo, hi = float(near) - self.BACK_CM, float(near) + self.FWD_CM
         if self.closed:
-            # A lap boundary is not a wall. Wrapping the window would need the
-            # search to run in two pieces, and a closed path is a ring where
-            # "ahead" always exists -- so the window simply runs past the end
-            # and the arc positions are taken modulo the length.
-            got = search(lo, hi) if hi <= self.length else search(0.0, None)
+            # A lap boundary is not a wall, and it is not an excuse to give up
+            # the window either. Falling back to a global search whenever the
+            # window ran past the end is what let a SELF-CROSSING route cut
+            # itself short: a figure eight passes through its own centre, so at
+            # the crossing both branches are equidistant and the nearest-point
+            # search takes whichever wins on float noise. The ball then leaves
+            # along the wrong lobe and the shape collapses to one loop.
+            #
+            # Wrapping costs one extra search. The window is a ring arc, so
+            # when it runs off either end it is simply two pieces.
+            got = search(max(lo, 0.0), min(hi, self.length))
+            if hi > self.length:
+                got = min(got, search(0.0, hi - self.length), key=lambda r: r[1])
+            if lo < 0.0:
+                got = min(got, search(self.length + lo, self.length),
+                          key=lambda r: r[1])
         else:
             got = search(max(lo, 0.0), min(hi, self.length))
         if got[1] > self.RELOCK_CM:
@@ -1151,7 +1162,26 @@ def pursue(path, pos, lookahead, speed, goal_tol=ARRIVE_CM, radius=0.0,
         #
         # `path.s` is None until the first fix of a run, which is what lets a
         # run start with the ball anywhere near the route.
-        if path.s is None or path.closed or s < path.s - path.BACK_CM:
+        if path.s is None:
+            path.s = s
+        elif path.closed:
+            # FORWARD ONLY, ROUND THE RING. `max` cannot express this -- an
+            # orbit's arc position has to fall back to zero at the lap
+            # boundary, and that is indistinguishable from a jump backwards
+            # unless it is measured the short way round. A step within
+            # `FWD_CM` is ordinary progress, wrap included; anything larger is
+            # the route meeting itself and is refused, so a figure eight stays
+            # on the lobe it is driving.
+            #
+            # Unless the ball is genuinely nowhere near where progress says it
+            # is, which is the closed-path form of a re-lock: insisting on the
+            # old arc position would steer at a place it has left.
+            step = (s - path.s) % path.length
+            stale = float(np.linalg.norm(np.asarray(pos, dtype=float)
+                                         - path.at(path.s)))
+            if step <= path.FWD_CM or stale > path.RELOCK_CM:
+                path.s = s
+        elif s < path.s - path.BACK_CM:
             path.s = s
         else:
             path.s = max(path.s, s)

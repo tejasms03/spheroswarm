@@ -653,14 +653,26 @@ def test_a_ball_PICKED_UP_may_still_relock_backwards():
     assert path.s < 60.0, "a moved ball must be allowed to re-lock"
 
 
-def test_a_CLOSED_path_may_still_wrap_to_zero():
-    """An orbit's arc position has to return to zero at the lap boundary."""
+def test_a_CLOSED_path_CROSSES_the_lap_boundary_and_keeps_going():
+    """An orbit must not stall at the seam.
+
+    Not asserted as "s returns to zero": at the seam arc 0 and arc `length`
+    are the SAME POINT, so which of the two a tie resolves to is arbitrary and
+    means nothing. What matters is that a ball driven past the seam keeps
+    making progress rather than sticking to the end of the lap.
+    """
     from fleet_test import Path, pursue
     ring = Path.circle(np.array([0.0, 0.0]), 30.0)
-    pursue(ring, np.array([30.0, 0.0]), lookahead=15.0, speed=20.0)
-    ring.s = ring.length - 1.0
-    pursue(ring, np.array([30.0, 0.0]), lookahead=15.0, speed=20.0)
-    assert ring.s < ring.length / 2.0
+    ring.s = ring.length - 4.0
+    seen = []
+    for i in range(12):
+        # Round the ring, straight through the seam.
+        ang = math.radians(-12.0 + i * 6.0)
+        pursue(ring, np.array([30.0 * math.cos(ang), 30.0 * math.sin(ang)]),
+               lookahead=15.0, speed=20.0)
+        seen.append(ring.s)
+    assert max(seen) > ring.length * 0.2, "it stalled at the seam"
+    assert min(seen) < ring.length * 0.2, "it never reached the seam"
 
 
 def test_the_PLACEHOLDER_arena_is_never_latched():
@@ -695,3 +707,65 @@ def test_a_measured_arena_is_still_held_once_it_is_known():
     first = bridge.arena
     app.homography.width, app.homography.height = 999.0, 999.0
     assert bridge.arena is first
+
+
+# -- a closed path that crosses itself ----------------------------------------
+
+def _figure_eight(closed=True):
+    from fleet_test import Path
+    pts = [np.array([40 * math.sin(2 * math.pi * i / 64),
+                     20 * math.sin(4 * math.pi * i / 64)]) for i in range(64)]
+    return Path(pts, closed=closed, kind="flow")
+
+
+def test_a_figure_eight_does_not_cut_across_its_own_crossing():
+    """The fault: a self-crossing route collapsing to one loop.
+
+    At the centre both lobes pass through the same point, so a nearest-point
+    search is deciding between two equidistant branches on float noise. The
+    ball leaves along the wrong one and the shape is halved.
+    """
+    from fleet_test import pursue
+    path = _figure_eight()
+    centre = np.array([0.0, 0.0])
+
+    # Progress a quarter of the way round, then put the ball on the crossing.
+    path.s = path.length * 0.25
+    before = path.s
+    pursue(path, centre, lookahead=8.0, speed=20.0)
+    step = (path.s - before) % path.length
+    assert step <= path.FWD_CM, "progress jumped across the loop"
+
+
+def test_progress_round_a_closed_path_only_goes_FORWARDS():
+    from fleet_test import pursue
+    path = _figure_eight()
+    seen, prev = [], None
+    for i in range(200):
+        pursue(path, path.at((i * path.length / 100.0) % path.length),
+               lookahead=8.0, speed=20.0)
+        if prev is not None:
+            assert (path.s - prev) % path.length <= path.FWD_CM
+        prev = path.s
+        seen.append(path.s)
+    assert max(seen) > path.length * 0.9, "it never got round"
+
+
+def test_the_lap_boundary_is_still_allowed_to_wrap():
+    """Forward-only cannot be `max`: an orbit's arc position has to fall back
+    to zero at the end of a lap, and that is a backwards jump unless it is
+    measured the short way round."""
+    from fleet_test import pursue
+    path = _figure_eight()
+    path.s = path.length - 2.0
+    pursue(path, path.at(1.0), lookahead=8.0, speed=20.0)
+    assert path.s < path.length * 0.5, "the lap did not wrap"
+
+
+def test_a_ball_moved_ACROSS_a_closed_path_may_still_relock():
+    from fleet_test import pursue
+    path = _figure_eight()
+    path.s = 0.0
+    far = path.at(path.length * 0.5) + np.array([60.0, 60.0])
+    pursue(path, far, lookahead=8.0, speed=20.0)
+    assert path.s != 0.0, "a ball nowhere near its progress must re-lock"
