@@ -925,6 +925,7 @@ class Path:
         # path and not on the app because it is only meaningful for the path
         # it was measured on -- a new path is a new run and starts unlocked.
         self.s = None
+        self._self_gap = None
 
     def restart(self):
         """Forget the progress made, so the next fix re-locks from anywhere."""
@@ -967,7 +968,89 @@ class Path:
 
     FWD_CM = 80.0
     """How far ahead it may jump in one frame. Comfortably more than a frame
-    of travel at any speed this rig reaches, and far less than a lap."""
+    of travel at any speed this rig reaches, and far less than a lap.
+
+    A CEILING, not the window itself — see `fwd_window`. "Far less than a lap"
+    is the wrong measure for a route that meets itself before it finishes one."""
+
+    SELF_CROSS_RATIO = 3.0
+    """How many `SELF_TOUCH_CM` of path must separate two points before they
+    count as a crossing rather than the two sides of a corner."""
+
+    MIN_FWD_CM = 12.0
+    """The window never shrinks below this, whatever the shape.
+
+    Several frames of travel at the speeds this rig drives at, so the ratchet
+    can always keep up with the ball it is following."""
+
+    SELF_TOUCH_CM = 8.0
+    """Spatial distance at which two parts of a route count as the same place.
+
+    A little over the ball's 7.3cm width, because that is when the follower
+    genuinely cannot tell which branch it is on from position alone."""
+
+    @property
+    def self_gap(self):
+        """Shortest arc length between two points of this path that MEET.
+
+        Infinite for a route that never approaches itself, which is most of
+        them. Measured once and kept: it is a property of the shape.
+        """
+        if self._self_gap is None:
+            self._self_gap = self._measure_self_gap()
+        return self._self_gap
+
+    def _measure_self_gap(self):
+        """O(n^2) over the samples, once. n is at most a couple of hundred.
+
+        Pairs closer than `SELF_TOUCH_CM` ALONG the path are skipped, because
+        every point is near its own neighbours and that is not a crossing.
+        What is being looked for is the opposite: far apart in arc, close in
+        space.
+        """
+        ring, cum, length = self.ring, self.cum, self.length
+        best = float("inf")
+        for i in range(len(ring)):
+            for j in range(i + 1, len(ring)):
+                arc = float(abs(cum[j] - cum[i]))
+                if self.closed:
+                    arc = min(arc, length - arc)
+                # A CORNER IS NOT A CROSSING. At the apex of a lobe the
+                # route turns hard, so samples a few centimetres apart in arc
+                # are also a few centimetres apart in space -- and taking that
+                # as a self-approach measured every rose at 8cm, collapsed the
+                # window to 4cm, and left the follower unable to keep up with a
+                # moving ball. What distinguishes the two is the RATIO: at a
+                # corner the arc is a small multiple of the chord, and at a
+                # crossing the path leaves and comes back, so it is many times
+                # it.
+                if arc <= self.SELF_CROSS_RATIO * self.SELF_TOUCH_CM:
+                    continue
+                if float(np.linalg.norm(ring[j] - ring[i])) <= self.SELF_TOUCH_CM:
+                    best = min(best, arc)
+        return best
+
+    @property
+    def fwd_window(self):
+        """How far ahead the ratchet may actually look on THIS path.
+
+        Capped at half the distance to where the route next meets itself. An
+        n-lobed rose has every lobe passing through the origin, so successive
+        crossings are `length / n` apart -- and once that is under `FWD_CM` the
+        window spans the next lobe's crossing, the two are equidistant at the
+        centre, and a fraction of a millimetre of tracker noise decides which
+        one the ball leaves on. Measured with 3mm of noise: a 40cm rose (89cm
+        between crossings) never skipped in 300 frames, while 15, 20, 25 and
+        30cm roses (33 to 67cm) skipped 10, 9, 12 and 4 times.
+
+        Half rather than all of it, so the window cannot reach a crossing even
+        from immediately after the previous one.
+        """
+        # Floored as well as capped. A window smaller than a frame of travel
+        # cannot follow a moving ball at all: it falls behind, the projection
+        # lands outside it every frame, and the re-lock that exists for a ball
+        # picked up off the floor starts firing on ordinary driving.
+        return max(min(self.FWD_CM, 0.5 * self.self_gap), self.MIN_FWD_CM)
 
     RELOCK_CM = 40.0
     """Off-path distance at which the ratchet gives up and searches globally.
@@ -1028,7 +1111,7 @@ class Path:
 
         if near is None:
             return search(0.0, None)
-        lo, hi = float(near) - self.BACK_CM, float(near) + self.FWD_CM
+        lo, hi = float(near) - self.BACK_CM, float(near) + self.fwd_window
         if self.closed:
             # A lap boundary is not a wall, and it is not an excuse to give up
             # the window either. Falling back to a global search whenever the
@@ -1179,7 +1262,7 @@ def pursue(path, pos, lookahead, speed, goal_tol=ARRIVE_CM, radius=0.0,
             step = (s - path.s) % path.length
             stale = float(np.linalg.norm(np.asarray(pos, dtype=float)
                                          - path.at(path.s)))
-            if step <= path.FWD_CM or stale > path.RELOCK_CM:
+            if step <= path.fwd_window or stale > path.RELOCK_CM:
                 path.s = s
         elif s < path.s - path.BACK_CM:
             path.s = s
