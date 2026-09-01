@@ -28,6 +28,36 @@ from rpc_system import RPCClient
 client = RPCClient()
 
 
+def _confirm(robot_id: int, posted: str, timeout_s: float = 4.0) -> str:
+    """Wait for the BENCH to accept or refuse, then say which.
+
+    Every drive tool here posts a request to a blackboard and returns at once,
+    so what it returns is a receipt, not an outcome. The bench picks the
+    request up on its next tick and can still refuse it -- a mirrored frame, no
+    tracker lock, a curve that leaves the arena, no aim established. Returning
+    the receipt reported a robot "looping continuously" while it sat still and
+    nothing had been drawn, which is the same lie as reporting `arrived` for a
+    drive that merely stopped.
+
+    So: poll until the bench marks the robot moving, or writes a verdict, or
+    the wait runs out. A few seconds at twenty ticks a second is generous.
+    """
+    rid = int(robot_id)
+    until = time.time() + max(0.5, float(timeout_s))
+    while time.time() < until:
+        outcome = client.Robot.get_outcome(rid)
+        if outcome:
+            return (f"REFUSED — {outcome.get('reason') or outcome.get('outcome')}"
+                    if outcome.get("outcome") == "refused"
+                    else f"{outcome.get('outcome')}: {outcome.get('reason', '')}")
+        if client.Robot.get_state(rid) == "moving":
+            return posted
+        time.sleep(0.1)
+    return (f"{posted}\n\nBUT THE BENCH HAS NOT PICKED IT UP after "
+            f"{timeout_s:.0f}s — it may not be running with --rpc. Nothing is "
+            f"moving; do not report this as started.")
+
+
 def exec_robot_create_thread(robot_id: int, robot_padding: int = 30) -> str:
     """Drive the path already generated for this robot.
 
@@ -36,7 +66,12 @@ def exec_robot_create_thread(robot_id: int, robot_padding: int = 30) -> str:
     robot. Accepted rather than removed so an agent copying the call shape
     from `controller` does not fail on an unexpected argument.
     """
-    return client.Robot.request_drive(int(robot_id))
+    said = client.Robot.request_drive(int(robot_id))
+    if 'No robot is attached' in said or "doesn't exist" in said \
+            or 'Generate path first' in said or 'needs at least' in said \
+            or 'required' in said:
+        return said
+    return _confirm(robot_id, said)
 
 
 def stop_robot_thread(robot_id: int, join_timeout: float = 5.0) -> str:
@@ -108,8 +143,13 @@ def orbit(robot_id: int, x: float, y: float, radius: float) -> str:
 
     This never arrives. Call stop_robot_thread to end it.
     """
-    return client.Robot.request_orbit(int(robot_id), float(x), float(y),
+    said = client.Robot.request_orbit(int(robot_id), float(x), float(y),
                                       float(radius))
+    if 'No robot is attached' in said or "doesn't exist" in said \
+            or 'Generate path first' in said or 'needs at least' in said \
+            or 'required' in said:
+        return said
+    return _confirm(robot_id, said)
 
 
 def patrol(robot_id: int, x1: float, y1: float, x2: float, y2: float) -> str:
@@ -123,8 +163,13 @@ def patrol(robot_id: int, x1: float, y1: float, x2: float, y2: float) -> str:
 
     This never arrives. Call stop_robot_thread to end it.
     """
-    return client.Robot.request_patrol(int(robot_id), float(x1), float(y1),
+    said = client.Robot.request_patrol(int(robot_id), float(x1), float(y1),
                                        float(x2), float(y2))
+    if 'No robot is attached' in said or "doesn't exist" in said \
+            or 'Generate path first' in said or 'needs at least' in said \
+            or 'required' in said:
+        return said
+    return _confirm(robot_id, said)
 
 
 def set_trajectory(robot_id: int, points: list) -> str:
@@ -133,7 +178,12 @@ def set_trajectory(robot_id: int, points: list) -> str:
     `trace_targets` runs A* and may move a goal it judges unreachable; this
     drives exactly the shape given. Use it when the shape itself matters.
     """
-    return client.Robot.request_trajectory(int(robot_id), points)
+    said = client.Robot.request_trajectory(int(robot_id), points)
+    if 'No robot is attached' in said or "doesn't exist" in said \
+            or 'Generate path first' in said or 'needs at least' in said \
+            or 'required' in said:
+        return said
+    return _confirm(robot_id, said)
 
 
 def follow(robot_id: int, x: float, y: float) -> str:
@@ -172,8 +222,13 @@ def set_flow(robot_id: int, expression: str, closed: bool = True) -> str:
     stop_robot_thread to end it. With closed=False it drives the curve once
     and arrives.
     """
-    return client.Robot.request_flow(int(robot_id), str(expression),
+    said = client.Robot.request_flow(int(robot_id), str(expression),
                                      bool(closed))
+    if 'No robot is attached' in said or "doesn't exist" in said \
+            or 'Generate path first' in said or 'needs at least' in said \
+            or 'required' in said:
+        return said
+    return _confirm(robot_id, said)
 
 
 def get_arena(robot_id: int = 2) -> dict:

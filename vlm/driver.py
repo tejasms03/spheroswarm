@@ -193,6 +193,7 @@ class Driver:
             client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
         self.served += 1
+        client.Robot.set_state(self.robot_id, "moving")
         self.was_armed = True
         self.last_note = f"orbiting r={radius:.0f}cm"
         return self.last_note
@@ -218,6 +219,7 @@ class Driver:
             client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
         self.served += 1
+        client.Robot.set_state(self.robot_id, "moving")
         self.was_armed = True
         self.last_note = "patrolling"
         return self.last_note
@@ -244,6 +246,7 @@ class Driver:
             client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
         self.served += 1
+        client.Robot.set_state(self.robot_id, "moving")
         self.was_armed = True
         self.last_note = "following"
         return self.last_note
@@ -326,6 +329,7 @@ class Driver:
             client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
             return None
         self.served += 1
+        client.Robot.set_state(self.robot_id, "moving")
         self.was_armed = True
         self.last_note = f"driving a {len(points)}-point curve"
         return self.last_note
@@ -454,6 +458,7 @@ class Driver:
             return None
 
         self.served += 1
+        client.Robot.set_state(self.robot_id, "moving")
         self.was_armed = True
         self.last_note = f"driving {self.app.path.length:.0f} cm"
         if self.wants_delay(path_px):

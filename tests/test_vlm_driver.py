@@ -83,6 +83,7 @@ class FakeRobot:
         self.requests = []
         self.courses = []
         self.outcomes = []
+        self.states = {}
         self.arena = None
         self.attached = False
 
@@ -109,6 +110,10 @@ class FakeRobot:
 
     def set_arena(self, facts):
         self.arena = dict(facts)
+        return True
+
+    def set_state(self, rid, state):
+        self.states[rid] = state
         return True
 
 
@@ -694,3 +699,22 @@ def test_the_arena_says_how_BIG_an_orbit_can_be():
     assert cy - r >= y0 - 0.05 and cy + r <= y1 + 0.05
     # And it must be a real orbit, not a token one.
     assert 2 * r > 0.5 * min(f["width"], f["height"])
+
+
+def test_an_ACCEPTED_request_marks_the_robot_moving():
+    """The signal that lets a caller tell a request the bench took from one it
+    then refused. Without it every drive tool returns a receipt, and the agent
+    reported a robot 'looping continuously' while it sat still."""
+    drv, app, client = a_driver(path=A_PATH_PX)
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    assert app.armed is True
+    assert client.Robot.states.get(2) == "moving"
+
+
+def test_a_REFUSED_request_does_not():
+    drv, app, client = a_driver(path=A_PATH_PX, arms=False)
+    client.Robot.requests.append({"want": "drive"})
+    drv.serve(client)
+    assert client.Robot.states.get(2) != "moving"
+    assert client.Robot.outcomes[-1]["outcome"] == "refused"
