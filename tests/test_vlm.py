@@ -1052,3 +1052,26 @@ def test_no_dock_button_has_a_non_callable_callback():
                     and "(" not in line.split("=")[0]}
         clash = {n for n in assigned & methods}
         assert not clash, f"{mod_name}: attribute shadows method: {sorted(clash)}"
+
+
+def test_brightness_OUTSIDE_the_clicked_corners_is_not_reported():
+    """Detection still runs on the grown region — that is what stops a ball at
+    the boundary having its halo cut and its centroid dragged inward, worth 3
+    to 7cm. But the band the grown mask admits is scenery, and it should not be
+    counted or drawn as if it were in the arena."""
+    from fleet_test import find_blobs, roi_mask
+    frame = np.zeros((400, 600, 3), np.uint8)
+    cv2.circle(frame, (300, 200), 22, (255, 255, 255), -1)   # in the arena
+    # Just outside the corners but inside the grown band — the only place
+    # scenery can be detected at all, since the grow is one halo radius.
+    cv2.circle(frame, (468, 200), 14, (255, 255, 255), -1)
+    corners = [np.array(p, float) for p in
+               ((150, 100), (450, 100), (450, 320), (150, 320))]
+    blobs, _m, _n = find_blobs(frame, region=roi_mask(frame.shape, corners),
+                               grow_px=36)
+    outside = [b for b in blobs if b["outside_region"]]
+    assert outside, "the fixture needs a blob outside to be worth testing"
+    inside = [b for b in blobs if not b["outside_region"]]
+    assert len(inside) == 1
+    # The bench keeps only the inside ones once any exist.
+    assert inside[0]["xy"][0] == pytest.approx(300, abs=3)
