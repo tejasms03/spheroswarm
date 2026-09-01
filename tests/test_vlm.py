@@ -769,3 +769,72 @@ def test_a_ball_moved_ACROSS_a_closed_path_may_still_relock():
     far = path.at(path.length * 0.5) + np.array([60.0, 60.0])
     pursue(path, far, lookahead=8.0, speed=20.0)
     assert path.s != 0.0, "a ball nowhere near its progress must re-lock"
+
+
+# -- routes that meet themselves more than twice ------------------------------
+
+def _rose(radius=25.0, lobes=3, n=96):
+    from fleet_test import Path
+    pts = [np.array([radius * math.cos(lobes * t) * math.cos(t),
+                     radius * math.cos(lobes * t) * math.sin(t)])
+           for t in [math.pi * i / n for i in range(n)]]
+    return Path(pts, closed=True, kind="flow")
+
+
+def _skips(path, noise=0.3, frames=300, seed=0):
+    from fleet_test import pursue
+    rng = np.random.default_rng(seed)
+    skips, prev = 0, None
+    for step in range(frames):
+        pos = path.at((step * path.length / 150.0) % path.length)
+        pursue(path, pos + rng.normal(0, noise, 2), lookahead=8.0, speed=20.0)
+        if prev is not None and (path.s - prev) % path.length > 20.0:
+            skips += 1
+        prev = path.s
+    return skips
+
+
+@pytest.mark.parametrize("lobes", [3, 4, 5, 6, 7])
+@pytest.mark.parametrize("radius", [15.0, 25.0, 40.0])
+def test_a_rose_of_any_lobe_count_stays_on_its_lobe(lobes, radius):
+    """Every lobe of a rose passes through the origin, so crossings sit
+    `length / lobes` apart. Once that is under the forward window the window
+    spans the NEXT crossing too, the branches are equidistant at the centre,
+    and 3mm of tracker noise decides which one the ball leaves on. Measured
+    before the window was made to fit the shape: 10, 9, 12 and 4 skips at 15,
+    20, 25 and 30cm."""
+    assert _skips(_rose(radius, lobes)) == 0
+
+
+def test_the_window_is_measured_from_where_the_route_meets_itself():
+    rose = _rose(25.0, 3)
+    assert rose.self_gap == pytest.approx(rose.length / 3.0, rel=0.35)
+    assert rose.fwd_window == pytest.approx(0.5 * rose.self_gap, rel=0.01)
+
+
+def test_a_CORNER_is_not_read_as_a_crossing():
+    """The first attempt measured every rose at 8cm — its own touch distance —
+    because a lobe's apex turns hard enough that points a few centimetres
+    apart in arc are a few centimetres apart in space. That collapsed the
+    window to 4cm and left the follower unable to keep up."""
+    from fleet_test import Path
+    corner = Path([np.array([0.0, 0.0]), np.array([30.0, 0.0]),
+                   np.array([30.0, 30.0])])
+    assert corner.self_gap == float("inf")
+    assert corner.fwd_window == Path.FWD_CM
+
+
+def test_a_path_that_never_meets_itself_keeps_the_full_window():
+    from fleet_test import Path
+    line = Path([np.array([0.0, 0.0]), np.array([100.0, 0.0])])
+    assert line.self_gap == float("inf")
+    assert line.fwd_window == Path.FWD_CM
+
+
+def test_the_window_never_shrinks_below_a_few_frames_of_travel():
+    """A window under a frame of travel cannot follow a moving ball: it falls
+    behind, the projection lands outside it every frame, and the re-lock meant
+    for a ball picked up off the floor fires on ordinary driving."""
+    from fleet_test import Path
+    tight = _rose(6.0, 7)
+    assert tight.fwd_window >= Path.MIN_FWD_CM
