@@ -13,6 +13,16 @@ orbiting a point that was no longer the middle of anything.
 
 Its home is (400, 300).
 
+IF THE USER SPEAKS IN CENTIMETRES
+Use move_to_cm(robot_id=2, x_cm, y_cm) for a position, or
+move_by_cm(robot_id=2, distance_cm, direction) for "10 cm north", "20 cm NE".
+North is the TOP of the arena, east is the right, degrees run clockwise from
+north. These take centimetres directly — do not convert to pixels yourself.
+
+There is no "forward" or "ahead". A Sphero is a sphere with no visible facing,
+so nothing here can resolve a direction relative to the robot. If the user asks
+for forward, ask which compass direction they mean.
+
 HOW TO MOVE IT
 Three calls, in this order, every time:
   1. trace_targets(robot_id=2, input_target_list=[[x, y], ...], spacing=30)

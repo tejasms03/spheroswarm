@@ -6,6 +6,8 @@ bring-up tool has to start on a machine where any of those is broken. That is
 precisely the machine you are on when you need it.
 """
 
+import math
+
 import pygame
 
 INK = (11, 34, 57)
@@ -84,12 +86,18 @@ class Button:
 class Slider:
     """A labelled integer slider. Drag the track or click anywhere on it."""
 
-    def __init__(self, rect, label, lo, hi, get, set_):
+    def __init__(self, rect, label, lo, hi, get, set_, log=False):
         self.rect = pygame.Rect(rect)
         self.label = label
         self.lo, self.hi = lo, hi
         self.get, self.set = get, set_
         self.dragging = False
+        # Logarithmic travel, for ranges whose useful end is the bottom one.
+        # A camera exposure of 3..2047 is the case this was added for: the
+        # values that matter for a dark floor all sit under 300, and a linear
+        # track spends six sevenths of itself above them. Needs a positive
+        # floor, so it falls back to linear rather than raising on lo <= 0.
+        self.log = bool(log) and lo > 0
 
     @property
     def track(self):
@@ -101,8 +109,7 @@ class Slider:
         s.blit(f.render(self.label, True, DIM), (self.rect.x, self.rect.y))
         t = self.track
         pygame.draw.rect(s, RULE, t, border_radius=2)
-        frac = (v - self.lo) / max(self.hi - self.lo, 1)
-        x = int(t.x + frac * t.w)
+        x = int(t.x + self.to_frac(v) * t.w)
         pygame.draw.rect(s, CYAN, (t.x, t.y, x - t.x, t.h), border_radius=2)
         pygame.draw.circle(s, CYAN, (x, t.y + 2), 6)
         s.blit(f.render(str(v), True, CHALK), (t.right + 10, self.rect.y))
@@ -118,4 +125,17 @@ class Slider:
     def drag(self, p):
         t = self.track
         frac = min(1.0, max(0.0, (p[0] - t.x) / max(t.w, 1)))
-        self.set(int(round(self.lo + frac * (self.hi - self.lo))))
+        self.set(self.from_frac(frac))
+
+    def to_frac(self, v):
+        """Value -> how far along the track it sits, 0..1."""
+        v = min(max(v, self.lo), self.hi)
+        if not self.log:
+            return (v - self.lo) / max(self.hi - self.lo, 1)
+        return math.log(v / self.lo) / math.log(self.hi / self.lo)
+
+    def from_frac(self, frac):
+        """How far along the track -> the value there."""
+        if not self.log:
+            return int(round(self.lo + frac * (self.hi - self.lo)))
+        return int(round(self.lo * (self.hi / self.lo) ** frac))

@@ -20,6 +20,7 @@ call budget on round trips -- measured on the bench's own tool layer, four of
 six calls went to polling before the drive had finished.
 """
 
+import math
 import time
 
 from rpc_system import RPCClient
@@ -251,3 +252,90 @@ def get_arena(robot_id: int = 2) -> dict:
                           "not running, or not started with --rpc"}
     got["known"] = True
     return got
+
+
+COMPASS = {"n": 0.0, "north": 0.0, "ne": 45.0, "northeast": 45.0,
+           "e": 90.0, "east": 90.0, "se": 135.0, "southeast": 135.0,
+           "s": 180.0, "south": 180.0, "sw": 225.0, "southwest": 225.0,
+           "w": 270.0, "west": 270.0, "nw": 315.0, "northwest": 315.0}
+
+
+def _bearing(direction):
+    """A compass name or a number of degrees, as degrees clockwise from north.
+
+    NORTH IS THE TOP OF THE ARENA, and nothing here knows or cares which way
+    the Sphero's own compass points. These tools work out a POSITION; the
+    bench's controller drives to it. Keeping the ball's convention out of this
+    file is deliberate — the bench's own note says a second place that knows
+    that convention is a second place to get it wrong, and a sign error there
+    is the one that costs a fortnight because it circles whatever you correct.
+    """
+    if isinstance(direction, (int, float)):
+        return float(direction) % 360.0
+    key = str(direction).strip().lower().replace(" ", "").replace("-", "")
+    if key in COMPASS:
+        return COMPASS[key]
+    try:
+        return float(key) % 360.0
+    except ValueError:
+        return None
+
+
+def move_to_cm(robot_id: int, x_cm: float, y_cm: float) -> str:
+    """Drive to a position given in CENTIMETRES from the arena's top-left.
+
+    x runs right, y runs DOWN — the same way the camera sees it.
+    """
+    arena = get_arena(robot_id)
+    if not arena.get("known"):
+        return arena.get("reason", "the arena is not known yet")
+    k = float(arena["px_per_cm"])
+    return _goto_px(robot_id, float(x_cm) * k, float(y_cm) * k,
+                    f"({x_cm:.0f}, {y_cm:.0f}) cm")
+
+
+def move_by_cm(robot_id: int, distance_cm: float, direction) -> str:
+    """Move a distance in a COMPASS direction: "north", "NE", or degrees.
+
+    North is the top of the arena, east is the right, and degrees run
+    clockwise from north. This is an absolute direction in the room, not
+    relative to the way the robot happens to be facing — a Sphero is a sphere
+    and has no visible facing, so "forward" is not a direction anything here
+    can resolve.
+    """
+    bearing = _bearing(direction)
+    if bearing is None:
+        return (f"{direction!r} is not a direction. Use north, NE, east, ... "
+                f"or degrees clockwise from north.")
+    where = get_robot_position(robot_id)
+    if not where.get("tracked"):
+        return f"cannot move relative to a position nobody can see: {where.get('reason')}"
+    arena = get_arena(robot_id)
+    if not arena.get("known"):
+        return arena.get("reason", "the arena is not known yet")
+
+    k = float(arena["px_per_cm"])
+    step = float(distance_cm) * k
+    rad = math.radians(bearing)
+    # North is -y because the arena frame runs y DOWN, matching the camera.
+    x = float(where["x"]) + step * math.sin(rad)
+    y = float(where["y"]) - step * math.cos(rad)
+    return _goto_px(robot_id, x, y,
+                    f"{distance_cm:.0f} cm {str(direction).upper()}")
+
+
+def _goto_px(robot_id: int, x_px: float, y_px: float, said: str) -> str:
+    """Drive to one point in arena pixels, and confirm the bench took it."""
+    rid = int(robot_id)
+    arena = get_arena(rid)
+    if arena.get("known"):
+        x0, y0, x1, y1 = arena["safe"]
+        if not (x0 <= x_px <= x1 and y0 <= y_px <= y1):
+            return (f"{said} is ({x_px:.0f}, {y_px:.0f}) px, outside the safe "
+                    f"box {arena['safe']}. The ball has width and reads its own "
+                    f"position badly near a wall — pick somewhere further in.")
+    client.Robot.set_path(rid, [[float(x_px), float(y_px), 0.0, 0]])
+    posted = client.Robot.request_drive(rid)
+    if "Started controller" not in posted:
+        return posted
+    return _confirm(rid, f"driving to {said}")

@@ -101,7 +101,7 @@ import pygame
 from ui.theme import (CARD, CARD_EDGE, CHALK, CORAL, CYAN, DIM, GREY, INK,
                       MINT, PAD, PANEL, RULE, SUN, Button, Slider, card,
                       section)
-from vision import config
+from vision import config, shutter
 from vision.homography import Homography
 from vision.shots import BALL_CM
 
@@ -128,6 +128,14 @@ scenery does not. 200 rather than 255 because a ball at the far edge of the
 frame, or one whose LED has been dimmed a little, still cores well above
 anything reflected.
 """
+
+EXP_PUSH_S = 0.08
+"""How often a dragged exposure slider is allowed to reach the camera.
+
+Each write is a uvc-util subprocess, and a drag emits an event per pixel. At
+60fps unthrottled that is sixty processes a second competing with the render
+loop, which stutters the window during exactly the adjustment you are trying to
+judge by eye. Twelve a second is smooth to a hand and invisible to the camera."""
 
 MIN_AREA = 60
 MAX_AREA = 40000
@@ -1766,8 +1774,8 @@ def to_surface(bgr):
 
 
 class BlobTest:
-    def __init__(self, spec="0", size=None, exposure=-7, code=None,
-                 with_fleet=True, model=None, rpc=False):
+    def __init__(self, spec="0", size=None, exposure=None, code=None,
+                 with_fleet=True, model=None, rpc=False, uvc_index=0):
         pygame.init()
         pygame.display.set_caption("fleet test — many bots, driven by an agent")
         try:
@@ -1785,7 +1793,21 @@ class BlobTest:
         self.v_min = V_MIN
         self.min_area = MIN_AREA
         self.max_area = MAX_AREA
-        self.exposure = int(exposure)
+        # UVC `exposure-time-abs`, in units of 100us. Seeded from the last
+        # saved calibration so a tuned rig comes up tuned; the camera's own
+        # default is 250 (=25ms), which is a lit room, not this one.
+        saved = config.load("exposure", {}) or {}
+        if exposure is None:
+            exposure = saved.get("exposure_time_abs", shutter.EXP_DEFAULT)
+        self.exposure = max(shutter.EXP_MIN, min(shutter.EXP_MAX, int(exposure)))
+        self.uvc = shutter.tool()
+        self.uvc_index = int(uvc_index)
+        self.uvc_manual = False
+        # Pushed from the render loop rather than from the slider callback. A
+        # drag emits an event per pixel and every push is a subprocess, so
+        # writing on the callback stutters the window for the whole drag.
+        self.exp_pending = self.exposure
+        self.exp_pushed = 0.0
         self.bright = config.LED_VALUE
         self.paused = False
         self.view = "raw"
@@ -2274,12 +2296,48 @@ class BlobTest:
     # -- camera controls --------------------------------------------------
 
     def set_exposure(self, value):
-        self.exposure = int(value)
-        src = self.cam.source
-        if src is None or not hasattr(src, "set"):
-            self.say("this source has no camera controls", DIM)
+        """Ask for a shutter time. The write itself happens in `push_exposure`.
+
+        Deliberately not `CAP_PROP_EXPOSURE`: macOS does not plumb UVC exposure
+        through AVFoundation for external cameras, so OpenCV accepts that write
+        and drops it -- a slider that moves with a picture that does not. The
+        control goes out of band through uvc-util instead, which has the
+        consequence worth remembering: OpenCV never learns the exposure
+        changed, so its own exposure property stays as wrong as it ever was.
+        """
+        self.exposure = max(shutter.EXP_MIN,
+                            min(shutter.EXP_MAX, int(value)))
+        self.exp_pending = self.exposure
+
+    def push_exposure(self, force=False):
+        """Send a pending exposure to the camera, at most every PUSH_S.
+
+        Called once per rendered frame. The rate limit is what keeps a drag
+        smooth: the slider and the picture stay live while the hardware sees
+        roughly twelve writes a second instead of one per mouse event.
+        """
+        if self.exp_pending is None:
             return
-        self.exp_took = src.set("exposure", self.exposure)
+        now = time.perf_counter()
+        if not force and now - self.exp_pushed < EXP_PUSH_S:
+            return
+        value, self.exp_pending, self.exp_pushed = self.exp_pending, None, now
+        if self.uvc is None:
+            self.say("no uvc-util — see vision/shutter.py for the build", DIM)
+            return
+        # Manual mode first, every single time. In aperture-priority the camera
+        # owns the shutter and drops these writes without complaint: the value
+        # reads back unchanged, which is indistinguishable from a dead dial.
+        if not self.uvc_manual:
+            ok, msg = shutter.set_mode(self.uvc, self.uvc_index, shutter.MANUAL)
+            self.uvc_manual = bool(ok)
+            if not ok:
+                self.say(f"could not take manual exposure: {msg}", CORAL)
+                return
+        ok, msg = shutter.set_exposure(self.uvc, self.uvc_index, value)
+        self.exp_took = ok
+        if not ok:
+            self.say(f"exposure {value}: {msg}", CORAL)
 
     def exposure_mode(self, lock):
         """Freeze the camera's metering, or hand it back.
@@ -2297,6 +2355,13 @@ class BlobTest:
             self.say(f"no AVFoundation control: {e}", SUN)
             return
         ok, msg = (avcam.lock() if lock else avcam.auto())
+        # Handing metering back means handing the SHUTTER back too, or the
+        # camera stays pinned at whatever the slider last set and "auto" is a
+        # button that visibly does nothing.
+        if not lock and self.uvc is not None:
+            shutter.set_mode(self.uvc, self.uvc_index,
+                             shutter.APERTURE_PRIORITY)
+            self.uvc_manual = False
         self.exposure_locked = bool(lock and ok)
         self.say(msg + ("  — now darken the room" if lock and ok else ""),
                  MINT if ok else CORAL)
@@ -2567,16 +2632,21 @@ class BlobTest:
         (self.build_track if self.tab == "track" else self.build_robot)(x, w, y)
 
     def build_track(self, x, w, y):
-        for label, lo, hi, get, set_ in (
-                ("threshold", 5, 255, lambda: self.v_min, self.set_v),
-                ("min area", 4, 2000, lambda: self.min_area, self.set_min),
-                ("max area", 500, 80000, lambda: self.max_area, self.set_max),
-                ("exposure", -13, 0, lambda: self.exposure, self.set_exposure),
-                ("max jump", 8, 400, lambda: self.track.max_jump, self.set_jump),
-                ("speed", 0, 60, lambda: self.speed, self.set_speed),
-                ("lookahead", 2, 60, lambda: self.lookahead, self.set_lookahead),
-                ("arrive", 2, 40, lambda: self.goal_tol, self.set_goal_tol)):
-            self.sliders.append(Slider((x, y, w, 18), label, lo, hi, get, set_))
+        for label, lo, hi, get, set_, log in (
+                ("threshold", 5, 255, lambda: self.v_min, self.set_v, False),
+                ("min area", 4, 2000, lambda: self.min_area, self.set_min, False),
+                ("max area", 500, 80000, lambda: self.max_area, self.set_max, False),
+                # 3..2047 is what the C920 actually reports, in 100us units, and
+                # the travel is logarithmic because everything useful for a dark
+                # floor and a bright ball sits below 300.
+                ("exposure", shutter.EXP_MIN, shutter.EXP_MAX,
+                 lambda: self.exposure, self.set_exposure, True),
+                ("max jump", 8, 400, lambda: self.track.max_jump, self.set_jump, False),
+                ("speed", 0, 60, lambda: self.speed, self.set_speed, False),
+                ("lookahead", 2, 60, lambda: self.lookahead, self.set_lookahead, False),
+                ("arrive", 2, 40, lambda: self.goal_tol, self.set_goal_tol, False)):
+            self.sliders.append(
+                Slider((x, y, w, 18), label, lo, hi, get, set_, log=log))
             y += 26
         y += 6
         bw = (w - 12) // 3
@@ -5343,6 +5413,7 @@ class BlobTest:
                     for s in self.sliders:
                         if s.dragging:
                             s.drag(e.pos)
+            self.push_exposure()
             self.tick()
             self.draw()
             self.clock.tick(60)
@@ -5389,7 +5460,12 @@ def main(argv=None):
                    help="camera index, a video file, or 'sim'")
     p.add_argument("--source", dest="camera", help="same as --camera")
     p.add_argument("--size", default=None, help="e.g. 1280x720")
-    p.add_argument("--exposure", type=int, default=-7)
+    p.add_argument("--exposure", type=int, default=None,
+                   help="UVC exposure-time-abs in 100us units (3-2047); "
+                        "default is the saved calibration, else 250")
+    p.add_argument("--uvc-index", type=int, default=0,
+                   help="uvc-util's own device index — see "
+                        "`python -m vision.shutter --list`")
     p.add_argument("--robot", default=None,
                    help="connect this roster entry at startup instead of scanning")
     p.add_argument("--no-fleet", action="store_true")
@@ -5402,7 +5478,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     size = tuple(int(v) for v in a.size.lower().split("x")) if a.size else None
     BlobTest(a.camera, size=size, exposure=a.exposure, code=a.robot,
-             with_fleet=not a.no_fleet, model=a.model, rpc=a.rpc).run()
+             with_fleet=not a.no_fleet, model=a.model, rpc=a.rpc,
+             uvc_index=a.uvc_index).run()
     return 0
 
 

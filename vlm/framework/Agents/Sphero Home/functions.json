@@ -4,6 +4,14 @@
     "name": "get_arena"
   },
   {
+    "library": "sphero_control",
+    "name": "move_by_cm"
+  },
+  {
+    "library": "sphero_control",
+    "name": "move_to_cm"
+  },
+  {
     "library": "planning",
     "name": "trace_targets"
   },
