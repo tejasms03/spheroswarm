@@ -31,6 +31,7 @@ class Driver:
         self.attached = False
         self.was_armed = False
         self.was_probing = False
+        self.was_scaling = False
         self.served = 0
         self.refused = 0
         self.last_note = ""
@@ -104,6 +105,7 @@ class Driver:
 
         self.report_finished(client)
         self.report_probe(client)
+        self.report_scale(client)
 
         request = client.Robot.take_request(self.robot_id)
         if request is not None:
@@ -137,6 +139,10 @@ class Driver:
             self.app.disarm("stopped by the framework")
             self.last_note = "stopped"
             return "stopped"
+        if want == "scale":
+            return self.scale_run(client, request)
+        if want == "scale_fix":
+            return self.scale_fix(client, request)
         if want == "flow":
             return self.flow(client, request)
         if want == "patrol":
@@ -411,6 +417,42 @@ class Driver:
         path.anchor = True
         path.restart()
         return path
+
+    def scale_run(self, client, request):
+        """Drive a straight line so the operator can measure it with a tape."""
+        self.app.start_scale_run(seconds=request.get("seconds", 3.0),
+                                 speed=request.get("speed"))
+        if getattr(self.app, "scale_run", None) is None:
+            self.last_note = getattr(self.app, "note", "") or "scale run refused"
+            client.Robot.set_outcome(self.robot_id, "refused", self.last_note)
+            return None
+        self.was_scaling = True
+        self.last_note = "measuring the scale"
+        return self.last_note
+
+    def report_scale(self, client):
+        """Publish the pixel measurement the instant the run settles."""
+        running = getattr(self.app, "scale_run", None) is not None
+        if self.was_scaling and not running:
+            pend = getattr(self.app, "pending_scale", None)
+            client.Robot.set_scale_result(dict(pend) if pend else
+                                          {"error": getattr(self.app, "note", "")})
+        self.was_scaling = running
+
+    def scale_fix(self, client, request):
+        """Fold the operator's measured distance into the homography.
+
+        The arena moves with it, so the cached ArenaFrame has to go: every
+        published position after this is in different centimetres, and holding
+        the old rectangle would report the new measurements against the old
+        floor.
+        """
+        said = self.app.set_measured_cm(request["measured_cm"])
+        client.Robot.set_scale_result({"applied": said})
+        self.arena = None
+        self.attached = False          # re-attach republishes the arena
+        self.last_note = said
+        return said
 
     def report_probe(self, client):
         """Say how the probe ended, once, on the tick it finishes."""

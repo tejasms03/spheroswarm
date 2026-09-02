@@ -339,3 +339,61 @@ def _goto_px(robot_id: int, x_px: float, y_px: float, said: str) -> str:
     if "Started controller" not in posted:
         return posted
     return _confirm(rid, f"driving to {said}")
+
+
+def start_scale_run(robot_id: int = 2, seconds: float = 3.0) -> dict:
+    """Drive a straight line so the operator can measure it with a tape.
+
+    STEP ONE of a two-step calibration, and it needs a person. The camera
+    measures the distance in pixels precisely; only a tape can say what that
+    is in centimetres. Report the number this returns to the user, ask them to
+    measure the distance the ball actually travelled, and then call
+    set_measured_distance with what they say.
+
+    The ball coasts after the motors cut, so the measurement runs to where it
+    came to REST. Measure to where it stopped, not to where it stopped
+    driving.
+    """
+    rid = int(robot_id)
+    posted = client.Robot.request_scale_run(rid, float(seconds))
+    if "Driving straight" not in posted:
+        return {"ok": False, "reason": posted}
+
+    until = time.time() + float(seconds) + 12.0
+    while time.time() < until:
+        got = client.Robot.get_scale_result()
+        if got.get("error"):
+            return {"ok": False, "reason": got["error"]}
+        if got.get("cm"):
+            return {"ok": True, "camera_says_cm": round(got["cm"], 1),
+                    "pixels": round(got["px"], 1),
+                    "next": "Ask the user to measure how far the ball actually "
+                            "travelled, in centimetres, then call "
+                            "set_measured_distance with that number."}
+        outcome = client.Robot.get_outcome(rid)
+        if outcome:
+            return {"ok": False, "reason": outcome.get("reason", "refused")}
+        time.sleep(0.2)
+    return {"ok": False, "reason": "the bench did not finish the run in time"}
+
+
+def set_measured_distance(measured_cm: float, robot_id: int = 2) -> str:
+    """STEP TWO: the distance the user actually measured, in centimetres.
+
+    Folds the correction into the camera calibration and saves it, so every
+    later run starts already scaled. Only call this with a number the user
+    gave you — never with an estimate of your own, because the whole point is
+    that the camera cannot know this and a person can.
+    """
+    rid = int(robot_id)
+    posted = client.Robot.request_scale_fix(rid, float(measured_cm))
+    if "Applying" not in posted:
+        return posted
+    until = time.time() + 6.0
+    while time.time() < until:
+        got = client.Robot.get_scale_result()
+        if got.get("applied"):
+            return got["applied"]
+        time.sleep(0.2)
+    return (f"Sent {float(measured_cm):.1f}cm to the bench. Check its window "
+            f"for the correction it applied.")

@@ -301,5 +301,43 @@
         "direction"
       ]
     }
+  },
+  {
+    "name": "start_scale_run",
+    "description": "STEP ONE of calibrating centimetres. Drives the robot in a straight line for a few seconds and reports how far the CAMERA thinks it went.\n\nThis needs a person. The camera measures the distance in pixels precisely, but only a tape measure can say what that is in real centimetres. Report the returned 'camera_says_cm' to the user, ask them to measure how far the ball actually travelled, and then call set_measured_distance with the number THEY give you.\n\nThe ball coasts after the motors cut, so this measures to where it came to REST. Tell the user to measure to where it stopped, not to where it stopped driving.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "seconds": {
+          "type": "number",
+          "description": "How long to drive. Default 3. Longer is more accurate but needs more clear floor."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "set_measured_distance",
+    "description": "STEP TWO of calibrating centimetres. Takes the distance the USER measured with a tape, folds the correction into the camera calibration, and saves it \u2014 so every later run starts already scaled and this does not need repeating.\n\nOnly call this with a number the user gave you. Never estimate it yourself: the entire point is that the camera cannot know this and a person can. If the user has not given you a measurement, ask for one.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "measured_cm": {
+          "type": "number",
+          "description": "The distance the user measured, in centimetres."
+        },
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        }
+      },
+      "required": [
+        "measured_cm"
+      ]
+    }
   }
 ]

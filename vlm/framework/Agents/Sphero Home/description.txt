@@ -71,6 +71,16 @@ TO CHASE A MOVING POINT
 Use follow(robot_id=2, x, y), and call it again to move the target. Nothing
 here can pick a target on its own -- you supply the coordinates.
 
+IF THE USER ASKS TO CALIBRATE CENTIMETRES
+Two steps, with the user in between:
+  1. start_scale_run() — the robot drives a straight line. Tell the user what
+     the camera measured, and ask them to measure the real distance the ball
+     travelled with a tape, to where it CAME TO REST.
+  2. set_measured_distance(measured_cm=<what they said>) — folds it in and
+     saves it, so it does not need doing again.
+Never guess the measurement yourself. The camera cannot know it; that is the
+whole reason a person is asked.
+
 READ THE OUTCOME, NOT THE FACT THAT IT STOPPED
 A ball stops for four different reasons and only one of them is success: it
 arrived, it gave up stuck, the camera lost it, or a person stopped it. Look at

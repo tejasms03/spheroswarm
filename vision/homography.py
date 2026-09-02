@@ -114,6 +114,38 @@ class Homography:
         self.M = T @ self.M
         return self
 
+    def scale_by(self, k):
+        """Multiply every centimetre this reports by `k`, and keep one matrix.
+
+        For the case where the mapping is the right SHAPE but the wrong size:
+        the corners were clicked correctly and the arena's declared dimensions
+        were a guess, so every distance comes out proportionally wrong. Driving
+        a known distance and comparing what this says against a tape measure
+        gives `k` directly.
+
+        Composed onto the matrix, for the same reason `nudge_cm` is. A
+        correction kept beside the transform has to be undone by hand in
+        `to_px`, and this project has already lost an afternoon to a drawn
+        robot landing where its blob was not. One mapping cannot drift out of
+        step with itself.
+
+        About the centimetre ORIGIN, deliberately. A scale error in the
+        camera-to-centimetre map is an error in every value it produces,
+        including where the arena's own corners land, so scaling all of it is
+        the whole correction rather than half of one.
+        """
+        k = float(k)
+        if not self.ready or not np.isfinite(k) or k <= 0:
+            return self
+        S = np.array([[k, 0.0, 0.0],
+                      [0.0, k, 0.0],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.M = S @ self.M
+        self.width *= k
+        self.height *= k
+        self.arena = float(self.arena) * k
+        return self
+
     def matches(self, width, height, tol=1.0):
         """Does this calibration describe the same rectangle as the workspace?"""
         return (abs(self.width - float(width)) <= tol

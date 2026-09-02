@@ -1858,6 +1858,8 @@ class BlobTest:
         self._slew_at = self._slew_deg = None
         self.cmd_log = deque(maxlen=120)
         self.probe = None
+        self.scale_run = None
+        self.pending_scale = None
         self.flips = {"x": False, "y": False}
         self.mirrored = False
         self.reid = None
@@ -2931,6 +2933,112 @@ class BlobTest:
     somebody correcting a fault that is not there.
     """
     PROBE_TIMEOUT_S = 8.0
+
+    SCALE_SETTLE_S = 3.0
+    """How long to wait for the roll-out after the motors cut.
+
+    The ball coasts 8 to 17cm from working speed, and BOTH ends of this
+    measurement have to include it: the tape measures where the ball came to
+    rest, so the camera must too. Sampling at motor-cut would compare a
+    distance the operator measured against a shorter one nobody drove.
+    """
+
+    def start_scale_run(self, seconds=3.0, speed=None, heading=0.0):
+        """Drive a straight line, and remember how far the CAMERA thinks it went.
+
+        Half of a scale calibration. The camera measures the displacement in
+        pixels, precisely -- `position_noise` puts this tracker at 0.31cm --
+        and the operator measures the same displacement with a tape. The ratio
+        is the correction, and `set_measured_cm` applies it.
+
+        Driven with `drive_raw` rather than through the follower, because
+        there is no goal here: the point is a straight line of any length, and
+        a controller steering toward a target would curve it.
+        """
+        h = self.fleet.handles.get(self.code) if (self.fleet and self.code) else None
+        if h is None:
+            self.say("nothing connected to run", SUN)
+            return
+        if not self.homography.ready or not self.track.locked:
+            self.say("needs a homography and a locked track", SUN)
+            return
+        self.disarm()
+        self.zero_at_rest(h)
+        from fleet.handle import MAX_SPEED
+        want = float(self.speed if speed is None else speed)
+        self.scale_run = {
+            "at": time.perf_counter(),
+            "seconds": float(np.clip(seconds, 0.5, 10.0)),
+            "byte": int(np.clip(want / MAX_SPEED * 255, 0, 255)),
+            "heading": float(heading) % 360.0,
+            "from_px": np.asarray(self.blob["xy"], dtype=float).copy(),
+            "from_cm": np.asarray(self.to_cm(self.blob["xy"]), dtype=float).copy(),
+            "phase": "driving",
+        }
+        h.drive_raw(self.scale_run["heading"], self.scale_run["byte"])
+        self.say(f"scale run: {self.scale_run['seconds']:.0f}s straight", MINT)
+
+    def step_scale_run(self):
+        """One tick. Drives, then rides the coast out, then records."""
+        r = self.scale_run
+        h = self.fleet.handles.get(self.code) if (self.fleet and self.code) else None
+        if h is None or not self.track.locked or self.blob is None:
+            if h is not None:
+                h.stop()
+            self.scale_run = None
+            self.say("scale run abandoned — lost the ball", CORAL)
+            return
+
+        elapsed = time.perf_counter() - r["at"]
+        if r["phase"] == "driving":
+            if elapsed < r["seconds"]:
+                h.drive_raw(r["heading"], r["byte"])
+                self.drive_note = f"scale run ({elapsed:.1f}s)"
+                return
+            h.stop()
+            r["phase"], r["stopped"] = "coasting", time.perf_counter()
+            return
+
+        # COASTING. Wait for it to actually stop, not merely be told to.
+        settled = self.travel is None
+        if not settled and time.perf_counter() - r["stopped"] < self.SCALE_SETTLE_S:
+            self.drive_note = "scale run: coasting"
+            return
+
+        here_px = np.asarray(self.blob["xy"], dtype=float)
+        here_cm = np.asarray(self.to_cm(self.blob["xy"]), dtype=float)
+        px = float(np.linalg.norm(here_px - r["from_px"]))
+        cm = float(np.linalg.norm(here_cm - r["from_cm"]))
+        self.scale_run = None
+        if cm < 2.0:
+            self.say(f"scale run: the ball barely moved ({cm:.1f}cm) — "
+                     f"nothing to measure", CORAL)
+            return
+        self.pending_scale = {"px": px, "cm": cm, "at": time.time()}
+        self.say(f"scale run: {px:.0f}px = {cm:.1f}cm by the current "
+                 f"calibration. Measure it and tell me the real distance.", MINT)
+
+    def set_measured_cm(self, measured):
+        """Fold the operator's tape measurement into the homography."""
+        pend = getattr(self, "pending_scale", None)
+        if not pend:
+            return "no scale run to measure — do a scale run first"
+        measured = float(measured)
+        if measured <= 0:
+            return "a measured distance must be positive"
+        k = measured / pend["cm"]
+        if not (0.2 <= k <= 5.0):
+            return (f"that would rescale the arena by {k:.2f}x, which is more "
+                    f"likely a typo than a calibration — the camera said "
+                    f"{pend['cm']:.1f}cm")
+        self.homography.scale_by(k)
+        self.homography.save()
+        self.pending_scale = None
+        self.region = None                    # the mask is cut in camera px
+        note = (f"scale corrected by {k:.4f} — {pend['cm']:.1f}cm was really "
+                f"{measured:.1f}cm. calib/homography.json written")
+        self.say(note, MINT)
+        return note
 
     def start_probe(self):
         """Drive each cardinal heading and report where the ball ACTUALLY went.
@@ -4701,6 +4809,9 @@ class BlobTest:
             return
         if self.probe is not None:
             self.step_probe()
+            return
+        if self.scale_run is not None:
+            self.step_scale_run()
             return
         if self.manual_drive():
             return
