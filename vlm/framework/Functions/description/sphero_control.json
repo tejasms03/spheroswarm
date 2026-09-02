@@ -249,5 +249,57 @@
       },
       "required": []
     }
+  },
+  {
+    "name": "move_to_cm",
+    "description": "Drives to a position given in CENTIMETRES from the arena's top-left corner. x runs right, y runs down \u2014 the same way the camera sees it. Use this whenever the user names a position in centimetres; use trace_targets only when you need the path planner to route around something.\n\nCall get_arena first if you need to know how big the arena is in centimetres. Reports arrival through wait_for_robot like an ordinary drive.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "x_cm": {
+          "type": "number",
+          "description": "Centimetres right of the arena's left edge."
+        },
+        "y_cm": {
+          "type": "number",
+          "description": "Centimetres down from the arena's top edge."
+        }
+      },
+      "required": [
+        "robot_id",
+        "x_cm",
+        "y_cm"
+      ]
+    }
+  },
+  {
+    "name": "move_by_cm",
+    "description": "Moves a distance in a compass direction: \"north\", \"NE\", \"east\", or a number of degrees clockwise from north. North is the TOP of the arena and east is the right.\n\nThis is an absolute direction in the room, not relative to the robot. Do not use it for 'forward' or 'ahead': a Sphero is a sphere with no visible facing, so there is no forward for it to have. If the user asks for 'forward', ask which direction they mean.\n\nRefuses if the destination would leave the safe box.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "robot_id": {
+          "type": "integer",
+          "description": "Robot ID. This rig has one robot and its id is 2."
+        },
+        "distance_cm": {
+          "type": "number",
+          "description": "How far to move, in centimetres."
+        },
+        "direction": {
+          "type": "string",
+          "description": "north, NE, east, SE, south, SW, west, NW \u2014 or degrees clockwise from north."
+        }
+      },
+      "required": [
+        "robot_id",
+        "distance_cm",
+        "direction"
+      ]
+    }
   }
 ]

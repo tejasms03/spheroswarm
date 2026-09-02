@@ -43,8 +43,9 @@ from .expose import FLICKER, USABLE
 MANUAL = 1
 APERTURE_PRIORITY = 8
 
-# exposure-time-abs, in 100us units. The C920 reports 3..2047.
+# exposure-time-abs, in 100us units. The C920 reports 3..2047, default 250.
 EXP_MIN, EXP_MAX = 3, 2047
+EXP_DEFAULT = 250
 STEPS = 100
 CHALK = (228, 240, 248)
 DIM = (204, 179, 143)
