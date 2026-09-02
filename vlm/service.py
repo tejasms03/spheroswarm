@@ -54,6 +54,7 @@ class SpheroRobot:
         self._requests = {}
         self._outcomes = {}
         self._arena = {}
+        self._scale = {}
 
         # Set by the bench when it attaches. Until then every drive request is
         # refused rather than queued: a path accepted by a service with nothing
@@ -383,6 +384,42 @@ class SpheroRobot:
         """Size, centre and safe bounds, in arena pixels. Empty until told."""
         with self._lock:
             return dict(self._arena)
+
+    def request_scale_run(self, robot_id, seconds=3.0, speed=None):
+        """Ask the bench to drive a straight line and measure it in pixels."""
+        rid = int(robot_id)
+        if rid not in self.id_list:
+            return f"Selected ID doesn't exist ({self.id_list})"
+        if not self.attached:
+            return ("No robot is attached to this service — start the bench "
+                    "with --rpc first.")
+        with self._lock:
+            self._requests[rid] = {"want": "scale", "at": time.time(),
+                                   "seconds": float(seconds), "speed": speed}
+            self._scale = {}
+            self._outcomes.pop(rid, None)
+        return f"Driving straight for {float(seconds):.0f}s to measure the scale."
+
+    def set_scale_result(self, result):
+        """Told by the bench: how far the CAMERA thinks the ball went."""
+        with self._lock:
+            self._scale = dict(result or {})
+        return True
+
+    def get_scale_result(self):
+        with self._lock:
+            return dict(self._scale)
+
+    def request_scale_fix(self, robot_id, measured_cm):
+        """The operator's tape measurement, for the bench to fold in."""
+        rid = int(robot_id)
+        if not self.attached:
+            return "No robot is attached to this service."
+        with self._lock:
+            self._requests[rid] = {"want": "scale_fix", "at": time.time(),
+                                   "measured_cm": float(measured_cm)}
+            self._scale = {}
+        return f"Applying a measured distance of {float(measured_cm):.1f}cm."
 
     def request_stop(self, robot_id):
         rid = int(robot_id)

@@ -50,5 +50,13 @@
   {
     "library": "sphero_control",
     "name": "get_robot_position"
+  },
+  {
+    "library": "sphero_control",
+    "name": "start_scale_run"
+  },
+  {
+    "library": "sphero_control",
+    "name": "set_measured_distance"
   }
 ]

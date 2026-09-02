@@ -85,6 +85,7 @@ class FakeRobot:
         self.outcomes = []
         self.states = {}
         self.arena = None
+        self.scale = None
         self.attached = False
 
     def attach(self):
@@ -114,6 +115,10 @@ class FakeRobot:
 
     def set_state(self, rid, state):
         self.states[rid] = state
+        return True
+
+    def set_scale_result(self, result):
+        self.scale = dict(result)
         return True
 
 
@@ -718,3 +723,64 @@ def test_a_REFUSED_request_does_not():
     drv.serve(client)
     assert client.Robot.states.get(2) != "moving"
     assert client.Robot.outcomes[-1]["outcome"] == "refused"
+
+
+# -- scale calibration, which needs a person in the middle ---------------------
+
+class ScaleApp(FakeApp):
+    def __init__(self, starts=True):
+        super().__init__()
+        self.scale_run = None
+        self.pending_scale = None
+        self._starts = starts
+        self.applied = None
+
+    def start_scale_run(self, seconds=3.0, speed=None):
+        if self._starts:
+            self.scale_run = {"seconds": seconds}
+        else:
+            self.note = "needs a homography and a locked track"
+
+    def set_measured_cm(self, cm):
+        self.applied = float(cm)
+        return f"scale corrected — 40.0cm was really {cm:.1f}cm"
+
+
+def a_scaler(starts=True):
+    app = ScaleApp(starts)
+    drv = Driver(app, ArenaFrame(ARENA_W, ARENA_H), robot_id=2, path_cls=FakePath)
+    return drv, app, FakeClient()
+
+
+def test_a_scale_run_publishes_the_camera_s_measurement_when_it_settles():
+    drv, app, client = a_scaler()
+    client.Robot.requests.append({"want": "scale", "seconds": 3.0})
+    drv.serve(client)
+    assert app.scale_run is not None
+    assert client.Robot.scale in (None, {})
+
+    app.scale_run = None                       # the bench finishes it
+    app.pending_scale = {"px": 400.0, "cm": 40.0}
+    drv.serve(client)
+    assert client.Robot.scale["cm"] == 40.0
+
+
+def test_a_refused_scale_run_says_so():
+    drv, app, client = a_scaler(starts=False)
+    client.Robot.requests.append({"want": "scale", "seconds": 3.0})
+    drv.serve(client)
+    assert client.Robot.outcomes[-1]["outcome"] == "refused"
+    assert "homography" in client.Robot.outcomes[-1]["reason"]
+
+
+def test_applying_a_measurement_DROPS_the_cached_arena():
+    """Every published position afterwards is in different centimetres. Holding
+    the old rectangle would report new measurements against the old floor."""
+    drv, app, client = a_scaler()
+    drv.serve(client)
+    assert drv.attached is True
+    client.Robot.requests.append({"want": "scale_fix", "measured_cm": 44.0})
+    drv.serve(client)
+    assert app.applied == 44.0
+    assert drv.arena is None
+    assert drv.attached is False, "it must re-attach to republish the arena"
