@@ -4243,6 +4243,16 @@ class BlobTest:
                 h.stop()
                 self.manual = False
                 self.cmd_v = None
+            # AND IT SAYS SO. This was the last gate here that refused in
+            # silence, which is the same defect the comment at the top of this
+            # routine describes three sessions being spent on. A text box is
+            # easy to be in without meaning to -- `/` opens one, and so does
+            # `m` once a scale run is waiting for its measurement -- and from
+            # the keyboard an unnoticed text box and a broken bench look
+            # identical.
+            note = "typing — press esc to get the keys back"
+            if pressed and self.note != note:
+                self.say(note, DIM)
             return False
         if pressed and not h.connected:
             # SAY IT, rather than commanding a link that is not there.
