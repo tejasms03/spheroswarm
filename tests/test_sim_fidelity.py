@@ -160,6 +160,29 @@ def test_an_unreadable_calibration_does_not_stop_a_fleet(open_ws, sim_entries,
 
 # -- speeding up and slowing down are not the same move -------------------
 
+def _roll_out(entry, coast_s, latency_s, dt=1 / 30):
+    """Drive up to speed, cut, and measure the stop — the brake test's shape.
+
+    Driving first matters: the delay is modelled as a queue of commands in
+    flight, so a ball whose velocity was assigned rather than COMMANDED has a
+    queue full of zeros and feels no delay at all. Measuring from that is
+    measuring a stop that never happens on the rig.
+    """
+    r = SimRobot("A", "AAAA", "cyan", randomize=False,
+                 motion={"coast_s": coast_s, "latency_s": latency_s})
+    r.pos = np.array([50.0, 50.0])
+    r.set_velocity(np.array([entry, 0.0]))
+    for _ in range(120):                      # four seconds, well past settled
+        r.step(dt)
+    cut = r.pos.copy()
+    r.stop()
+    for _ in range(400):
+        r.step(dt)
+        if r.speed < 0.3:
+            break
+    return float(np.linalg.norm(r.pos - cut))
+
+
 def test_a_measured_coast_is_pulled_out_of_a_fit():
     m = from_motion(_fit(stopping_distance_s_per_cm_s=0.51))
     assert m["coast_s"] == 0.51
@@ -178,23 +201,16 @@ def test_an_uncharacterised_ball_decelerates_exactly_as_it_always_did():
     r.stop()
     for _ in range(3):
         r.step(1 / 30)
-    # First-order on `tau`, which is what it has always been.
     assert r.speed == pytest.approx(30.0 * (1 - min((1 / 30) / 0.35, 1.0)) ** 3,
                                     rel=1e-6)
 
 
 def test_a_measured_ball_keeps_rolling_after_the_motors_cut():
-    slack = SimRobot("A", "AAAA", "cyan", randomize=False)
-    real = SimRobot("B", "BBBB", "red", randomize=False, motion={"coast_s": 0.6})
-    for r in (slack, real):
-        r.pos = np.array([50.0, 50.0])
-        r.vel = np.array([30.0, 0.0])
-        r.stop()
-        for _ in range(20):
-            r.step(1 / 30)
-    assert real.pos[0] > slack.pos[0] + 2.0, (
-        f"coasted {real.pos[0] - 50:.1f}cm vs {slack.pos[0] - 50:.1f}cm — a sim "
-        "that stops better than the ball is the one error tracking cannot survive")
+    slack = _roll_out(30.0, None, 1 / 30)
+    real = _roll_out(30.0, 0.6, 1 / 30)
+    assert real > slack + 2.0, (
+        f"coasted {real:.1f}cm vs {slack:.1f}cm — a sim that stops better than "
+        "the ball is the one error tracking cannot survive")
 
 
 @pytest.mark.parametrize("entry", [15.0, 30.0, 45.0])
@@ -202,17 +218,7 @@ def test_the_roll_out_matches_the_constant_that_was_measured(entry):
     """The brake test fits `coast_cm = k * v` through the origin. A first-order
     decay with time constant `k` travels exactly `v * k` — so the sim reproduces
     the measurement at every speed, with nothing fitted twice."""
-    coast_s = 0.5
-    r = SimRobot("A", "AAAA", "cyan", randomize=False,
-                 motion={"coast_s": coast_s, "latency_s": 1 / SIM_TICK_HZ})
-    r.pos = np.array([50.0, 50.0])
-    r.vel = np.array([entry, 0.0])
-    r.stop()
-    for _ in range(400):
-        r.step(1 / 30)
-        if r.speed < 0.5:
-            break
-    assert r.pos[0] - 50.0 == pytest.approx(entry * coast_s, rel=0.15)
+    assert _roll_out(entry, 0.5, 1 / 30) == pytest.approx(entry * 0.5, rel=0.1)
 
 
 def test_the_coast_does_not_touch_acceleration():
@@ -226,3 +232,42 @@ def test_the_coast_does_not_touch_acceleration():
         for _ in range(10):
             r.step(1 / 30)
     assert coasty.speed == pytest.approx(plain.speed, rel=1e-9)
+
+
+# -- against the hardware, not against the algebra ------------------------
+
+# Eight real stops, SYRX, 2026-08-24. Frozen here rather than read from
+# `calib/motion.json` for the reason the fleet tests give: live calibration
+# state must not decide what a test asserts. This is the only brake data this
+# project has ever collected, and its own fit was WITHHELD as untrustworthy —
+# 26% speed spread, r2 0.45, and two stops from the same command differing by
+# 3.7cm. So it pins the magnitude and nothing finer.
+SYRX_STOPS = [(24.69, 8.34), (25.32, 15.64), (25.97, 11.74), (24.71, 13.26),
+              (26.37, 12.05), (28.45, 16.37), (33.26, 17.28), (28.91, 16.73)]
+SYRX_COAST_S = 0.5142
+SYRX_LATENCY_S = 1 / SIM_TICK_HZ
+
+
+def test_the_sim_stops_where_the_real_ball_stopped():
+    """Checked against measurements, not against the fit it was derived from."""
+    err = [abs(_roll_out(v, SYRX_COAST_S, SYRX_LATENCY_S) - d)
+           for v, d in SYRX_STOPS]
+    # The fitted line's own residuals against these same stops average 1.8cm.
+    # The sim is not allowed to be worse than the calibration it came from.
+    assert np.mean(err) < 2.5, f"mean {np.mean(err):.2f}cm off: {np.round(err, 1)}"
+
+
+@pytest.mark.parametrize("latency_s", [1 / 30, 0.2, 0.5])
+def test_the_loop_delay_is_counted_once(latency_s):
+    """The measured constant spans the delay AND the roll-out, because the cut
+    position is a camera position. The sim already delays the command in its
+    queue, so decaying by the whole constant on top stopped the ball a full
+    `v * delay` too late — the bug this test exists to hold shut."""
+    got = _roll_out(30.0, 0.6, latency_s)
+    assert got == pytest.approx(30.0 * 0.6, rel=0.1), (
+        f"{got:.1f}cm at {latency_s}s delay — should be 18cm whatever the split")
+
+
+def test_a_coast_shorter_than_the_delay_still_rolls():
+    """Two calibrations disagreeing must not produce a ball that stops dead."""
+    assert _roll_out(30.0, 0.1, 0.5) > 12.0

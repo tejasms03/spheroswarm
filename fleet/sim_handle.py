@@ -236,8 +236,40 @@ class SimRobot(RobotHandle):
         # constant reproduces the measured stopping distance at every speed,
         # with nothing fitted twice. `coast_rest` in the bench runs the same
         # model forwards to say where the ball will end up.
+        # THE DELAY IS ALREADY IN THERE, and adding it again was the bug in the
+        # first version of this. `cut_pos` in the brake test is where the
+        # CAMERA thought the ball was, which is where it was one loop delay
+        # ago -- so the measured constant spans the delay and the roll-out
+        # together, which is what `fit` says it does and what makes it the
+        # right number for a controller. This simulator models the delay
+        # separately, in the command queue. Decaying by the whole constant on
+        # top of that stops the ball a full `v * delay` too late.
+        #
+        # Taken off the queue rather than off `latency_s`, because a guessed
+        # latency has no seconds behind it and is still a real delay here.
         shedding = float(np.linalg.norm(cmd)) < float(np.linalg.norm(self.vel))
-        lag = self.coast_s if (shedding and self.coast_s) else self.tau
+        lag = self.tau
+        if shedding and self.coast_s:
+            # TWO TICKS come back, and both are bookkeeping rather than
+            # physics: `stop` appends to the queue itself and `step` appends
+            # again before reading slot zero, so the modelled delay runs one
+            # tick short; and position integrates the velocity AFTER the decay
+            # is applied, which costs the roll-out another `v * dt`. Left
+            # uncorrected the ball stops about 6% early at 30Hz -- small, but
+            # always in the direction that teaches a controller it can brake
+            # later than it can.
+            #
+            # Exact near `SIM_TICK_HZ`, which is the rate the bench and the
+            # battery both run at. Well away from it the correction is only
+            # approximate, and that is deliberate: the constant it corrects
+            # carries +/-30% scatter between repeat stops on the real ball, so
+            # chasing the last tick here would be precision the measurement
+            # cannot support.
+            #
+            # Clamped to one tick. A coast shorter than the delay means the
+            # brake test and the latency probe disagree, and a ball that stops
+            # dead is the worst way to represent that.
+            lag = max(self.coast_s - (self.queue.maxlen - 2) * dt, dt)
         self.vel += (cmd - self.vel) * min(dt / lag, 1.0)
         self.pos = self.pos + self.vel * dt
 
