@@ -1123,3 +1123,47 @@ def test_a_moved_arena_reaches_the_driver_that_converts_through_it():
     bridge.publish_once()
     assert bridge.driver.arena.width_cm == pytest.approx(142.5)
     assert bridge.driver.attached is True, "re-attached, so the arena is resent"
+
+
+# -- the same grid, on the dashboard --------------------------------------
+
+def test_the_published_frame_carries_the_grid_when_the_bench_shows_it():
+    """One toggle, both views. An operator reading a position off the bench
+    and a professor watching the dashboard should be looking at one picture."""
+    app = FakeApp()
+    app.bounds = [0.0, 0.0, ARENA_W, ARENA_H]
+    client = FakeClient()
+    bridge = Bridge(app, robot_id=2, client=client)
+
+    bridge.publish_once()
+    plain = client.calls[-1]["frame"].copy()
+
+    app.show_axes = True
+    bridge.publish_once()
+    assert not np.array_equal(client.calls[-1]["frame"], plain), "no grid was drawn"
+
+
+def test_the_grid_is_off_when_the_bench_has_it_off():
+    app = FakeApp()
+    app.bounds = [0.0, 0.0, ARENA_W, ARENA_H]
+    client = FakeClient()
+    bridge = Bridge(app, robot_id=2, client=client)
+    bridge.publish_once()
+    first = client.calls[-1]["frame"].copy()
+    bridge.publish_once()
+    assert np.array_equal(client.calls[-1]["frame"], first)
+
+
+def test_the_dashboard_grid_is_labelled_in_the_BENCH_S_centimetres():
+    """The two frames differ by a third of a metre. A dashboard saying 0 where
+    the bench says -33 is a second coordinate system to hold in your head."""
+    arena = ArenaFrame(142.5, 122.7, origin_cm=(-33.3, -31.8))
+    w, h = arena.size_px
+    got = arena.draw_grid(np.zeros((h, w, 3), dtype=np.uint8), 20.0)
+    assert got.shape == (h, w, 3)
+    assert got.any(), "nothing was drawn"
+
+
+def test_a_missing_frame_is_not_a_crash():
+    arena = ArenaFrame(ARENA_W, ARENA_H)
+    assert arena.draw_grid(None) is None

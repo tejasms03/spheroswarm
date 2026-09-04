@@ -126,6 +126,45 @@ class ArenaFrame:
         """
         return float(px) / self.px_per_cm
 
+    def draw_grid(self, frame, step_cm=20.0):
+        """The same centimetre grid the bench draws, on the published frame.
+
+        STRAIGHT here, and bent there, and both are right: this frame has
+        already been rectified by the warp, so a centimetre is the same number
+        of pixels everywhere in it. Drawing curves into a rectified picture
+        would be inventing a distortion that was just removed.
+
+        Labelled in the BENCH'S centimetres -- the origin added back -- rather
+        than in this frame's own. The two differ by a third of a metre on this
+        rig, and a dashboard whose grid says 0 where the bench says -33 is a
+        second coordinate system for the operator to hold in their head, which
+        is the thing the grid exists to stop.
+        """
+        if frame is None or step_cm <= 0:
+            return frame
+        out = frame.copy()
+        h, w = out.shape[:2]
+        line, axis = (70, 70, 70), (40, 130, 190)
+        n = int(w / max(self.px_per_cm * step_cm, 1e-6)) + 1
+        m = int(h / max(self.px_per_cm * step_cm, 1e-6)) + 1
+        for i in range(min(n, 64) + 1):
+            x = int(round(i * step_cm * self.px_per_cm))
+            if x >= w:
+                break
+            cm = self.origin_cm[0] + i * step_cm
+            cv2.line(out, (x, 0), (x, h - 1), axis if abs(cm) < 1e-6 else line, 1)
+            cv2.putText(out, f"{cm:g}", (x + 3, 14), cv2.FONT_HERSHEY_PLAIN,
+                        0.8, (140, 140, 140), 1, cv2.LINE_AA)
+        for j in range(min(m, 64) + 1):
+            y = int(round(j * step_cm * self.px_per_cm))
+            if y >= h:
+                break
+            cm = self.origin_cm[1] + j * step_cm
+            cv2.line(out, (0, y), (w - 1, y), axis if abs(cm) < 1e-6 else line, 1)
+            cv2.putText(out, f"{cm:g}", (3, y - 4), cv2.FONT_HERSHEY_PLAIN,
+                        0.8, (140, 140, 140), 1, cv2.LINE_AA)
+        return out
+
     def matrix_from(self, homography):
         """Camera pixels straight to arena pixels, as one 3x3.
 
@@ -401,6 +440,9 @@ class Bridge(threading.Thread):
         frame = self.arena.warp(self.app.frame, self.app.homography)
         if frame is None:
             frame = np.zeros((h, w, 3), dtype=np.uint8)
+        if getattr(self.app, "show_axes", False):
+            frame = self.arena.draw_grid(frame,
+                                         getattr(self.app, "GRID_CM", 20.0))
 
         # `ind`, `raw` and `hf` are the per-camera dicts their stitcher
         # produces. Nothing in Functions/Library or backend/ reads them on the
