@@ -1970,3 +1970,39 @@ def test_typing_a_measurement_does_not_reach_the_agent():
         assert asked == []
     finally:
         app.close()
+
+
+def test_a_text_box_says_why_the_keys_are_dead():
+    """An unnoticed text box and a broken bench look identical from the
+    keyboard. Every other refusal in `manual_drive` speaks; this one did not,
+    and `m` made it easy to be in one without meaning to."""
+    import pygame
+
+    app = _scale_app()
+    try:
+        app.tab = "robot"
+        app.typing = True
+
+        class Handle:
+            connected = True
+            heading_offset = 0.0
+
+            def stop(self):
+                pass
+
+        app.fleet = type("F", (), {"handles": {"AAAA": Handle()}})()
+        app.code = "AAAA"
+
+        class Held:
+            def __getitem__(self, k):
+                return k == pygame.K_w
+
+        real = pygame.key.get_pressed
+        pygame.key.get_pressed = lambda: Held()
+        try:
+            assert app.manual_drive() is False
+        finally:
+            pygame.key.get_pressed = real
+        assert "esc" in (app.note or "").lower(), app.note
+    finally:
+        app.close()
