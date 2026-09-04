@@ -114,6 +114,18 @@ class ArenaFrame:
         """A length, not a point. Radii and margins have to cross too."""
         return float(cm) * self.px_per_cm
 
+    def scalar_to_cm(self, px):
+        """The way back, and the half that was missing.
+
+        A LENGTH does not carry the origin. `to_cm` adds it, correctly, because
+        a point in arena pixels has to land where the clicked floor actually
+        starts -- and on this rig that is a third of a metre from zero. Putting
+        a radius through the same call added the same third of a metre to it,
+        so an orbit asked for in centimetres came out that much smaller and
+        looked like the model had ignored the number.
+        """
+        return float(px) / self.px_per_cm
+
     def matrix_from(self, homography):
         """Camera pixels straight to arena pixels, as one 3x3.
 

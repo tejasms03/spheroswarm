@@ -32,6 +32,13 @@ class FakePath:
         self.s = 0.0 if self.anchor else None
 
     @classmethod
+    def circle(cls, centre, radius, n=64):
+        got = cls([np.asarray(centre, dtype=float)], closed=True, kind="circle")
+        got.centre = np.asarray(centre, dtype=float)
+        got.radius = float(radius)
+        return got
+
+    @classmethod
     def point(cls, p):
         got = cls([p], kind="point")
         got.length = 0.0
@@ -788,3 +795,38 @@ def test_applying_a_measurement_REPUBLISHES_the_arena():
     assert app.applied == 44.0
     assert drv.attached is False, "it must re-attach to republish the arena"
     assert drv.arena is not None, "a driver with no arena cannot convert"
+
+
+# -- a length is not a point --------------------------------------------------
+
+def test_an_orbit_radius_does_not_pick_up_the_arena_origin():
+    """The clicked workspace starts a third of a metre from zero on this rig.
+    `to_cm` adds that, correctly, to a POINT. Adding it to a radius made every
+    orbit asked for in centimetres come out 33cm smaller than the number given,
+    which read as the model ignoring the request."""
+    app = FakeApp()
+    drv = Driver(app, ArenaFrame(142.5, 122.7, origin_cm=(-33.3, -31.8)),
+                 robot_id=2, path_cls=FakePath)
+    client = FakeClient()
+    px_per_cm = drv.arena.px_per_cm
+    client.Robot.requests.append({"want": "orbit",
+                                  "centre": [50.0 * px_per_cm, 40.0 * px_per_cm],
+                                  "radius": 30.0 * px_per_cm})
+    drv.serve(client)
+    assert "r=30cm" in drv.last_note, drv.last_note
+
+
+def test_the_orbit_centre_still_does_pick_it_up():
+    """The other half. A centre that ignored the origin would put the circle
+    a third of a metre from where it was asked for."""
+    app = FakeApp()
+    drv = Driver(app, ArenaFrame(142.5, 122.7, origin_cm=(-33.3, -31.8)),
+                 robot_id=2, path_cls=FakePath)
+    client = FakeClient()
+    px = drv.arena.px_per_cm
+    client.Robot.requests.append({"want": "orbit",
+                                  "centre": [10.0 * px, 20.0 * px],
+                                  "radius": 15.0 * px})
+    drv.serve(client)
+    assert app.path.centre == pytest.approx([-23.3, -11.8])
+    assert app.path.radius == pytest.approx(15.0)
