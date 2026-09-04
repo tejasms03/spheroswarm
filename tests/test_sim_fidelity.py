@@ -156,3 +156,73 @@ def test_an_unreadable_calibration_does_not_stop_a_fleet(open_ws, sim_entries,
         assert len(f.handles) == 2, "a bad calibration costs fidelity, not a fleet"
     finally:
         f.close()
+
+
+# -- speeding up and slowing down are not the same move -------------------
+
+def test_a_measured_coast_is_pulled_out_of_a_fit():
+    m = from_motion(_fit(stopping_distance_s_per_cm_s=0.51))
+    assert m["coast_s"] == 0.51
+
+
+def test_a_run_that_never_braked_offers_no_coast():
+    assert "coast_s" not in from_motion(_fit(sim_tau_s=0.32))
+
+
+def test_an_uncharacterised_ball_decelerates_exactly_as_it_always_did():
+    """The asymmetry is a MEASUREMENT, not a new default. A guessed coast
+    would move the dynamics of every robot in the suite for no gain."""
+    r = SimRobot("A", "AAAA", "cyan", randomize=False)
+    assert r.coast_s is None
+    r.vel = np.array([30.0, 0.0])
+    r.stop()
+    for _ in range(3):
+        r.step(1 / 30)
+    # First-order on `tau`, which is what it has always been.
+    assert r.speed == pytest.approx(30.0 * (1 - min((1 / 30) / 0.35, 1.0)) ** 3,
+                                    rel=1e-6)
+
+
+def test_a_measured_ball_keeps_rolling_after_the_motors_cut():
+    slack = SimRobot("A", "AAAA", "cyan", randomize=False)
+    real = SimRobot("B", "BBBB", "red", randomize=False, motion={"coast_s": 0.6})
+    for r in (slack, real):
+        r.pos = np.array([50.0, 50.0])
+        r.vel = np.array([30.0, 0.0])
+        r.stop()
+        for _ in range(20):
+            r.step(1 / 30)
+    assert real.pos[0] > slack.pos[0] + 2.0, (
+        f"coasted {real.pos[0] - 50:.1f}cm vs {slack.pos[0] - 50:.1f}cm — a sim "
+        "that stops better than the ball is the one error tracking cannot survive")
+
+
+@pytest.mark.parametrize("entry", [15.0, 30.0, 45.0])
+def test_the_roll_out_matches_the_constant_that_was_measured(entry):
+    """The brake test fits `coast_cm = k * v` through the origin. A first-order
+    decay with time constant `k` travels exactly `v * k` — so the sim reproduces
+    the measurement at every speed, with nothing fitted twice."""
+    coast_s = 0.5
+    r = SimRobot("A", "AAAA", "cyan", randomize=False,
+                 motion={"coast_s": coast_s, "latency_s": 1 / SIM_TICK_HZ})
+    r.pos = np.array([50.0, 50.0])
+    r.vel = np.array([entry, 0.0])
+    r.stop()
+    for _ in range(400):
+        r.step(1 / 30)
+        if r.speed < 0.5:
+            break
+    assert r.pos[0] - 50.0 == pytest.approx(entry * coast_s, rel=0.15)
+
+
+def test_the_coast_does_not_touch_acceleration():
+    """It is the deceleration constant. A ball asked to speed up still does so
+    on `tau`, or the measurement would be doing two jobs."""
+    plain = SimRobot("A", "AAAA", "cyan", randomize=False)
+    coasty = SimRobot("B", "BBBB", "red", randomize=False, motion={"coast_s": 0.9})
+    for r in (plain, coasty):
+        r.vel = np.zeros(2)
+        r.set_velocity(np.array([30.0, 0.0]))
+        for _ in range(10):
+            r.step(1 / 30)
+    assert coasty.speed == pytest.approx(plain.speed, rel=1e-9)

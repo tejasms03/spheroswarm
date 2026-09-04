@@ -47,6 +47,13 @@ def from_motion(fit):
         out["latency_s"] = max(1, int(rec["sim_latency_steps"])) / SIM_TICK_HZ
     if rec.get("sim_gain"):
         out["gain"] = float(rec["sim_gain"])
+    if rec.get("stopping_distance_s_per_cm_s"):
+        # The COAST, which until now never reached the simulator at all. The
+        # brake test measures it and `fit` exports it; nothing read it, so a
+        # fully characterised ball still shed speed on its ACCELERATION
+        # constant -- a sim that stops better than the hardware, which is the
+        # one direction of error a tracking controller cannot survive.
+        out["coast_s"] = float(rec["stopping_distance_s_per_cm_s"])
     return out
 
 
@@ -88,6 +95,14 @@ class SimRobot(RobotHandle):
             self.latency, self.tau, self.gain, self.bias = 2, 0.35, 1.0, 0.0
             self.drift_rate = 0.0
             self.slip = 0.0
+
+        # No coast constant unless one was MEASURED. A guessed asymmetry would
+        # change the dynamics of every uncharacterised robot in the suite for
+        # no gain -- the same reasoning `_resize_queue` applies to a guessed
+        # latency. Left at None the deceleration runs on `tau`, exactly as it
+        # always has. `TrackEnv` randomises it explicitly for training, which
+        # is where a spread of plausible coasts is wanted and is asked for.
+        self.coast_s = None
 
         # Measurement beats a guess, per constant rather than all-or-nothing:
         # a run that established the motor lag but not the top speed should
@@ -208,7 +223,22 @@ class SimRobot(RobotHandle):
             # Loses a little of each command, the way a light ball does on a
             # smooth floor. Multiplicative, so it never adds energy.
             cmd = cmd * (1.0 - self.slip * float(self._rng.random()))
-        self.vel += (cmd - self.vel) * min(dt / self.tau, 1.0)
+        # SPEEDING UP AND SLOWING DOWN ARE NOT THE SAME MOVE. A Sphero drives
+        # by climbing the inside of its shell; cut the command and there is no
+        # brake left, only a ball rolling on cloth. Running both directions on
+        # `tau` gave a simulated ball that stopped on request, and a controller
+        # tuned against it brakes late and overshoots every target on the rig.
+        #
+        # The coast enters as a TIME CONSTANT because that is the form the
+        # measurement already takes. The brake test fits `coast_cm = k * v`
+        # through the origin, and a first-order decay from `v` with time
+        # constant `k` travels exactly `v * k` before it stops -- so the same
+        # constant reproduces the measured stopping distance at every speed,
+        # with nothing fitted twice. `coast_rest` in the bench runs the same
+        # model forwards to say where the ball will end up.
+        shedding = float(np.linalg.norm(cmd)) < float(np.linalg.norm(self.vel))
+        lag = self.coast_s if (shedding and self.coast_s) else self.tau
+        self.vel += (cmd - self.vel) * min(dt / lag, 1.0)
         self.pos = self.pos + self.vel * dt
 
         if self.ws is not None and not self.ws.is_valid_point(self.pos):
