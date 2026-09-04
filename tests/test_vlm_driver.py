@@ -773,14 +773,18 @@ def test_a_refused_scale_run_says_so():
     assert "homography" in client.Robot.outcomes[-1]["reason"]
 
 
-def test_applying_a_measurement_DROPS_the_cached_arena():
+def test_applying_a_measurement_REPUBLISHES_the_arena():
     """Every published position afterwards is in different centimetres. Holding
-    the old rectangle would report new measurements against the old floor."""
+    the old rectangle would report new measurements against the old floor.
+
+    Re-attaching is the mechanism. Clearing `arena` was, and it was wrong: the
+    bridge hands this driver a fresh frame every tick, so the cleared one only
+    guaranteed an AttributeError on any request that arrived first."""
     drv, app, client = a_scaler()
     drv.serve(client)
     assert drv.attached is True
     client.Robot.requests.append({"want": "scale_fix", "measured_cm": 44.0})
     drv.serve(client)
     assert app.applied == 44.0
-    assert drv.arena is None
     assert drv.attached is False, "it must re-attach to republish the arena"
+    assert drv.arena is not None, "a driver with no arena cannot convert"
