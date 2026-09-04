@@ -188,7 +188,11 @@ class Driver:
         `wait_for_robot` times out.
         """
         centre = self.arena.to_cm(request["centre"])
-        radius = self.arena.to_cm((request["radius"], 0.0))[0]
+        # A LENGTH, through the length conversion. `to_cm` adds the arena's
+        # origin -- which is right for the centre and wrong for the radius,
+        # and on this rig the origin is 33cm from zero, so every orbit asked
+        # for in centimetres came out 33cm smaller than the number given.
+        radius = self.arena.scalar_to_cm(request["radius"])
         self.app.path = self.anchored(
             self.Path.circle(np.asarray(centre, float), radius))
         self.app._arm_source = "vlm"
