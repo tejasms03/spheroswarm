@@ -1854,6 +1854,11 @@ class BlobTest:
         self.agent_client = self.connect_model()
         self.typing = False
         self.typed = ""
+        # What the text box is FOR. It started as the agent prompt and
+        # is now also how a tape measurement gets in, and those need
+        # different handling on Return -- one is a sentence for a
+        # language model, the other a number that rescales the arena.
+        self.typing_mode = "ask"
         self.turning = None
         self._slew_at = self._slew_deg = None
         self.cmd_log = deque(maxlen=120)
@@ -3017,6 +3022,34 @@ class BlobTest:
         self.pending_scale = {"px": px, "cm": cm, "at": time.time()}
         self.say(f"scale run: {px:.0f}px = {cm:.1f}cm by the current "
                  f"calibration. Measure it and tell me the real distance.", MINT)
+
+    def scale_key(self):
+        """One key for both halves of the centimetre calibration.
+
+        The two steps are separated by a person walking over with a tape, so
+        there is no moment where both are wanted at once: before the drive
+        there is nothing to measure, and after it the only thing left to do is
+        type the number. One key that reads which half it is in is fewer
+        things to remember than two keys that each refuse most of the time.
+        """
+        if self.pending_scale is not None:
+            self.typing, self.typed, self.typing_mode = True, "", "measure"
+            self.say(f"how far did it actually go? the camera said "
+                     f"{self.pending_scale['cm']:.1f}cm", MINT)
+            return
+        if self.scale_run is not None:
+            self.say("a scale run is already going", SUN)
+            return
+        self.start_scale_run(seconds=3.0)
+
+    def take_measurement(self, text):
+        """A tape reading, typed. Centimetres, and nothing else."""
+        try:
+            cm = float(text.strip().rstrip("cm").strip())
+        except ValueError:
+            self.say(f"'{text}' is not a distance in centimetres", CORAL)
+            return
+        self.say(self.set_measured_cm(cm), MINT)
 
     def set_measured_cm(self, measured):
         """Fold the operator's tape measurement into the homography."""
@@ -5164,12 +5197,13 @@ class BlobTest:
             box = pygame.Rect(x, H - 58, w, 22)
             card(self.screen, box)
             pygame.draw.rect(self.screen, CYAN, box, 1, border_radius=5)
-            self.text("> " + self.typed + "_", box.x + 6, box.y + 4, CHALK,
+            lead = "cm> " if self.typing_mode == "measure" else "> "
+            self.text(lead + self.typed + "_", box.x + 6, box.y + 4, CHALK,
                       self.fs)
         self.text("1 pt 2 line 3 poly 4 circ 5 free  g go", x, H - 36,
                   GREY, self.fs)
-        self.text("c corners t target b scan  / ask  esc STOP", x, H - 22,
-                  GREY, self.fs)
+        self.text("c corners t target b scan  m cm  / ask  esc STOP", x,
+                  H - 22, GREY, self.fs)
 
     def draw_track_tab(self, x, w, y):
         y = self.sect(self.screen, self.fs, "position", x, y, w,
@@ -5418,7 +5452,9 @@ class BlobTest:
         if self.typing:
             if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 text, self.typed, self.typing = self.typed.strip(), "", False
-                if text:
+                if text and self.typing_mode == "measure":
+                    self.take_measurement(text)
+                elif text:
                     self.ask(text)
             elif e.key == pygame.K_ESCAPE:
                 self.typed, self.typing = "", False
@@ -5428,7 +5464,7 @@ class BlobTest:
                 self.typed = (self.typed + e.unicode)[:120]
             return True
         if e.key == pygame.K_SLASH:
-            self.typing, self.typed = True, ""
+            self.typing, self.typed, self.typing_mode = True, "", "ask"
             return True
 
         # On the ROBOT tab W/A/S/D are the manual drive, so the shortcuts that
@@ -5474,6 +5510,7 @@ class BlobTest:
                    pygame.K_k: self.cycle_aim,
                    pygame.K_i: self.start_reid,
                    pygame.K_o: self.toggle_taper,
+                   pygame.K_m: self.scale_key,
                    pygame.K_TAB if False else pygame.K_n: self.cycle_selected,
                    pygame.K_y: self.cycle_style,
                    pygame.K_TAB: lambda: self.set_tab(
