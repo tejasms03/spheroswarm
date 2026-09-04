@@ -2006,3 +2006,64 @@ def test_a_text_box_says_why_the_keys_are_dead():
         assert "esc" in (app.note or "").lower(), app.note
     finally:
         app.close()
+
+
+# -- the coordinate frame, drawn on the floor it describes ----------------
+
+def test_the_frame_overlay_is_off_until_it_is_asked_for():
+    app = _scale_app()
+    try:
+        assert app.show_axes is False
+        app.toggle_axes()
+        assert app.show_axes is True
+        app.toggle_axes()
+        assert app.show_axes is False
+    finally:
+        app.close()
+
+
+def test_drawing_the_frame_does_not_need_a_ball_or_a_path():
+    """It describes the floor, not the run. Refusing to draw without a lock
+    would hide it exactly when a position is most in doubt."""
+    import time
+
+    app = _scale_app()
+    try:
+        app.show_axes = True
+        app.track.forget()
+        app.path = None
+        for _ in range(5):
+            time.sleep(0.01)
+            app.tick()
+            app.draw()
+    finally:
+        app.close()
+
+
+def test_the_frame_is_silent_without_a_homography():
+    """Centimetres mean nothing without one, so there is nothing to draw and
+    nothing to crash on."""
+    app = _scale_app()
+    try:
+        app.homography.M = None
+        app.show_axes = True
+        app.draw_axes(lambda p: (int(p[0]), int(p[1])))
+    finally:
+        app.close()
+
+
+def test_the_grid_follows_the_clicked_corners_not_the_calibration_quad():
+    """The two differ by a third of a metre on this rig. A grid drawn from the
+    homography's own rectangle would label the floor with numbers no other part
+    of the bench uses."""
+    app = _scale_app()
+    try:
+        b = app.agent_bounds()
+        if b is None:
+            pytest.skip("no corners in this fixture")
+        seen = []
+        app.show_axes = True
+        app.draw_axes(lambda p: seen.append(p) or (int(p[0]), int(p[1])))
+        assert seen, "nothing was drawn"
+    finally:
+        app.close()

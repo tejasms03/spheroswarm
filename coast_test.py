@@ -1852,6 +1852,7 @@ class BlobTest:
         self.agent_log = []
         self.agent_model = model or AGENT_MODEL
         self.agent_client = self.connect_model()
+        self.show_axes = False
         self.typing = False
         self.typed = ""
         # What the text box is FOR. It started as the agent prompt and
@@ -4520,6 +4521,85 @@ class BlobTest:
         ahead = np.asarray(self.to_cm(here_px + v_px), dtype=float)
         return coast_rest(here, ahead - here, coast_s)
 
+    GRID_CM = 20.0
+    """How far apart the grid lines are, in centimetres. Twenty because the
+    ball is seven across and the arena about a hundred and forty: fine enough
+    to read a position off by eye, coarse enough not to bury the picture."""
+
+    def toggle_axes(self):
+        self.show_axes = not self.show_axes
+        self.say(f"coordinate frame {'on' if self.show_axes else 'off'}", DIM)
+
+    def draw_axes(self, px):
+        """The centimetre frame, drawn on the floor it describes.
+
+        Every number here is in these centimetres -- a goal, an orbit centre,
+        the tape reading that sets the scale -- and until now the only way to
+        find out where they landed was to drive something there and watch. A
+        frame that is out by a reflection, or by the third of a metre between
+        the homography's origin and the clicked corners, looks exactly like a
+        frame that is right until it is put on the picture.
+
+        Drawn THROUGH the homography, one short segment at a time, rather than
+        as a straight grid in screen space. The lines then bend with the
+        perspective the homography exists to undo, which is the whole point: a
+        grid drawn straight would be the one rendering incapable of showing
+        the error it is there to reveal.
+        """
+        if not self.homography.ready:
+            return
+        b = self.agent_bounds()
+        if b is None:
+            b = [0.0, 0.0,
+                 float(self.homography.width), float(self.homography.height)]
+        x0, y0, x1, y1 = b
+        step = float(self.GRID_CM)
+        if not (x1 > x0 and y1 > y0) or step <= 0:
+            return
+
+        def at(p):
+            return px(self.homography.to_px([np.asarray(p, dtype=float)])[0])
+
+        def run(a, c, n=10):
+            a, c = np.asarray(a, dtype=float), np.asarray(c, dtype=float)
+            return [at(a + (c - a) * (i / max(n, 1))) for i in range(n + 1)]
+
+        def ticks(lo, hi):
+            first = np.ceil(lo / step) * step
+            out, v = [], first
+            while v <= hi + 1e-6 and len(out) < 64:
+                out.append(round(float(v), 3))
+                v += step
+            return out
+
+        for x in ticks(x0, x1):
+            axis = abs(x) < 1e-6
+            pygame.draw.lines(self.screen, SUN if axis else RULE, False,
+                              run((x, y0), (x, y1)), 2 if axis else 1)
+            here = at((x, y0))
+            self.text(f"{x:g}", here[0] + 3, here[1] + 2,
+                      SUN if axis else DIM, self.fs)
+        for y in ticks(y0, y1):
+            axis = abs(y) < 1e-6
+            pygame.draw.lines(self.screen, SUN if axis else RULE, False,
+                              run((x0, y), (x1, y)), 2 if axis else 1)
+            here = at((x0, y))
+            self.text(f"{y:g}", here[0] + 3, here[1] + 2,
+                      SUN if axis else DIM, self.fs)
+
+        # WHICH WAY THE AXES RUN, which is the half of this that a grid alone
+        # cannot say. A mirrored frame draws an identical grid; it is only the
+        # arrows that come out backwards.
+        origin = np.array([x0, y0], dtype=float)
+        arm = min(x1 - x0, y1 - y0) * 0.18
+        o = at(origin)
+        for tip, name in (((arm, 0.0), "x"), ((0.0, arm), "y")):
+            end = run(origin, origin + np.asarray(tip), n=6)
+            pygame.draw.lines(self.screen, MINT, False, end, 3)
+            self.text(name, end[-1][0] + 4, end[-1][1] - 4, MINT, self.fs)
+        pygame.draw.circle(self.screen, MINT, o, 4)
+        self.text(f"({x0:g}, {y0:g})cm", o[0] + 8, o[1] + 8, MINT, self.fs)
+
     def agent_bounds(self):
         """The workspace quad in cm, or None. What the model may aim inside."""
         if self.corners is None or not self.homography.ready:
@@ -5046,6 +5126,11 @@ class BlobTest:
             pygame.draw.lines(self.screen, SUN, False,
                               [px(p) for p in self.picking], 1)
 
+        # Under the trail, the path and the ball: a reference frame that
+        # obscures what it is a reference for is worse than none.
+        if self.show_axes:
+            self.draw_axes(px)
+
         # Where the ball has been. Drawn first so everything else sits over it,
         # and drawn at all because a track that is quietly jumping looks fine
         # in a single frame and obvious as a trail.
@@ -5210,8 +5295,8 @@ class BlobTest:
             lead = "cm> " if self.typing_mode == "measure" else "> "
             self.text(lead + self.typed + "_", box.x + 6, box.y + 4, CHALK,
                       self.fs)
-        self.text("1 pt 2 line 3 poly 4 circ 5 free  g go", x, H - 36,
-                  GREY, self.fs)
+        self.text("1 pt 2 line 3 poly 4 circ 5 free  g go  f grid", x,
+                  H - 36, GREY, self.fs)
         self.text("c corners t target b scan  m cm  / ask  esc STOP", x,
                   H - 22, GREY, self.fs)
 
@@ -5521,6 +5606,7 @@ class BlobTest:
                    pygame.K_i: self.start_reid,
                    pygame.K_o: self.toggle_taper,
                    pygame.K_m: self.scale_key,
+                   pygame.K_f: self.toggle_axes,
                    pygame.K_TAB if False else pygame.K_n: self.cycle_selected,
                    pygame.K_y: self.cycle_style,
                    pygame.K_TAB: lambda: self.set_tab(
