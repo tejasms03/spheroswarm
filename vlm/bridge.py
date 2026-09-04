@@ -74,6 +74,20 @@ class ArenaFrame:
         # the offset crop the framework's UI was showing.
         self.origin_cm = np.asarray(origin_cm, dtype=float)
 
+    def describes(self, width_cm, height_cm, origin_cm, tol=0.5):
+        """Is this still the arena that was just measured?
+
+        Tolerated rather than exact. The corners are a click through a
+        homography and the numbers wobble in the last fraction of a
+        centimetre; rebuilding on that would republish the arena every tick
+        and re-attach the driver sixty times a second.
+        """
+        return (abs(self.width_cm - float(width_cm)) <= tol
+                and abs(self.height_cm - float(height_cm)) <= tol
+                and bool(np.all(np.abs(self.origin_cm
+                                       - np.asarray(origin_cm, dtype=float))
+                                <= tol)))
+
     @property
     def size_px(self):
         """(width, height) in pixels -- what `arena_settings.json` must say."""
@@ -247,6 +261,7 @@ class Bridge(threading.Thread):
         self.app = app
         self.robot_id = int(robot_id)
         self._arena = arena
+        self._arena_moved = False
         self.period = 1.0 / max(1.0, float(hz))
         self._client = client
         self._stop = threading.Event()
@@ -295,6 +310,17 @@ class Bridge(threading.Thread):
             if not measured:
                 return ArenaFrame(w, h, origin_cm=origin)
             self._arena = ArenaFrame(w, h, origin_cm=origin)
+            self._arena_moved = True
+        elif measured and not self._arena.describes(w, h, origin):
+            # AND IT LETS GO WHEN THE FLOOR MOVES. Latching against a
+            # placeholder is right; latching against a re-measurement is not.
+            # Re-clicking the corners changed what `agent_bounds` returns and
+            # nothing here noticed, so the framework carried on being told
+            # about the rectangle from before the click -- the operator drew
+            # a new arena and the dashboard kept drawing the old one, with no
+            # way to update it short of restarting the bench.
+            self._arena = ArenaFrame(w, h, origin_cm=origin)
+            self._arena_moved = True
         return self._arena
 
     def connect(self):
@@ -378,6 +404,16 @@ class Bridge(threading.Thread):
             if self.driver is None:
                 from vlm.driver import Driver
                 self.driver = Driver(self.app, self.arena, self.robot_id)
+            # REFRESHED EVERY TICK, not snapshotted at construction. The
+            # driver converts every request through this, and the arena moves
+            # whenever the corners are re-clicked or the scale is corrected --
+            # a driver holding the frame it was born with converts the
+            # agent's pixels against a floor that no longer exists.
+            arena = self.arena
+            self.driver.arena = arena
+            if self._arena_moved:
+                self.driver.attached = False   # re-attach republishes it
+                self._arena_moved = False
             self.driver.serve(client)
         return poses
 

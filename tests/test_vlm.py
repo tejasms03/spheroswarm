@@ -1075,3 +1075,51 @@ def test_brightness_OUTSIDE_the_clicked_corners_is_not_reported():
     assert len(inside) == 1
     # The bench keeps only the inside ones once any exist.
     assert inside[0]["xy"][0] == pytest.approx(300, abs=3)
+
+
+# -- the arena is allowed to move ------------------------------------------
+
+def test_re_clicking_the_corners_moves_the_published_arena():
+    """The cache guards against a PLACEHOLDER, not against a re-measurement.
+
+    Latched for good, re-clicking the corners changed nothing the framework
+    could see: the operator drew a new arena and the dashboard carried on
+    drawing the one from before the click, with no way to update it short of
+    restarting the bench.
+    """
+    app = FakeApp()
+    app.bounds = [0.0, 0.0, 138.8, 110.8]
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    assert bridge.arena.width_cm == pytest.approx(138.8)
+
+    app.bounds = [-33.3, -31.8, 109.2, 90.9]          # four new clicks
+    assert bridge.arena.width_cm == pytest.approx(142.5)
+    assert tuple(bridge.arena.origin_cm) == pytest.approx((-33.3, -31.8))
+
+
+def test_a_millimetre_of_wobble_does_not_republish_the_arena():
+    """The corners are a click through a homography and the last fraction of a
+    centimetre moves. Rebuilding on that would re-attach sixty times a second."""
+    app = FakeApp()
+    app.bounds = [0.0, 0.0, 138.8, 110.8]
+    bridge = Bridge(app, robot_id=2, client=FakeClient())
+    first = bridge.arena
+    app.bounds = [0.0, 0.02, 138.81, 110.83]
+    assert bridge.arena is first
+
+
+def test_a_moved_arena_reaches_the_driver_that_converts_through_it():
+    """A driver holding the frame it was born with converts the agent's pixels
+    against a floor that no longer exists."""
+    app = FakeApp()
+    app.bounds = [0.0, 0.0, 138.8, 110.8]
+    client = FakeClient()
+    bridge = Bridge(app, robot_id=2, client=client)
+    bridge.publish_once()
+    assert bridge.driver is not None
+    assert bridge.driver.arena.width_cm == pytest.approx(138.8)
+
+    app.bounds = [-33.3, -31.8, 109.2, 90.9]
+    bridge.publish_once()
+    assert bridge.driver.arena.width_cm == pytest.approx(142.5)
+    assert bridge.driver.attached is True, "re-attached, so the arena is resent"

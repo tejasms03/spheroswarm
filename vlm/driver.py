@@ -449,7 +449,11 @@ class Driver:
         """
         said = self.app.set_measured_cm(request["measured_cm"])
         client.Robot.set_scale_result({"applied": said})
-        self.arena = None
+        # NOT set to None, which is what this did and which broke the next
+        # request that tried to convert through it. The bridge hands this
+        # driver a fresh `arena` every tick, so the correct move is to leave
+        # it alone and let that arrive; clearing it only guaranteed an
+        # AttributeError in the window before it did.
         self.attached = False          # re-attach republishes the arena
         self.last_note = said
         return said
