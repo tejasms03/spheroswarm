@@ -37,7 +37,7 @@ DEFAULT_THRESH = {
 # validates against it and a missing calibration file must not invalidate a
 # roster.
 SIGNATURE_KEYS = ("hue", "tol", "s_min", "v_min", "min_area", "max_area",
-                  "led_value")
+                  "led_value", "rgb")
 
 # What the ball is TOLD to glow, derived from the hue we intend to detect —
 # rather than kept in a second table beside it. Two tables is how a robot ends
@@ -58,10 +58,28 @@ def led_rgb(hue, saturation=255, value=LED_VALUE):
 
 
 def led_for(name, colors=None):
-    """The RGB for a named slot, from whatever hue that slot currently holds."""
+    """The RGB a named slot should be driven at.
+
+    An explicit `rgb` on the signature wins over the hue. Deriving the drive
+    from the hunted hue assumes the LED emits what the maths says and the
+    camera reads back what the LED emits, and neither holds: on this bench a
+    slot driven from hue 172 is READ at hue 165, because the LED's spectrum
+    and the sensor's response are not inverses of each other. Once you are
+    hand-tuning the emitter, the number you tuned is the number to send —
+    round-tripping it through HSV just puts the error back.
+
+    Both still live on the ONE signature, which is the point. `rgb` is what
+    the ball is driven at and `hue` is what the tracker hunts for; they are
+    genuinely different quantities, and the failure this project keeps hitting
+    is not that they differ — it is editing one in a place that does not hold
+    the other.
+    """
     spec = (colors or load_signatures()).get(name)
     if not spec:
         return (255, 255, 255)
+    got = spec.get("rgb")
+    if got:
+        return tuple(int(max(0, min(255, v))) for v in got)[:3]
     return led_rgb(spec.get("hue", 0), value=spec.get("led_value", LED_VALUE))
 
 
