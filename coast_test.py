@@ -93,6 +93,7 @@ import os
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -1894,6 +1895,11 @@ class BlobTest:
         self.trail = deque(maxlen=90)
         self.bots = {}
         self._idle_track = None
+        # Set only while ANOTHER robot's drive is swapped in -- see `as_bot`.
+        self._background = False
+        # Run ids come from one counter for every robot, so two robots never
+        # both write a run 1 into the same log.
+        self._runs = 0
         self.exposure_locked = False
         self.exp_took = None
 
@@ -2003,6 +2009,10 @@ class BlobTest:
             else:
                 self.say("press b to scan for a ball, then click it to connect")
             return
+        codes = [c.strip() for c in str(self.code).split(",") if c.strip()]
+        if len(codes) > 1:
+            self.build_fleet_many(codes, Fleet)
+            return
         try:
             from fleet.roster import Roster
             roster = Roster.load()
@@ -2021,6 +2031,38 @@ class BlobTest:
         except Exception as e:
             self.say(f"could not load {self.code}: {type(e).__name__}: {e}", CORAL)
             self.code = None
+
+    def build_fleet_many(self, codes, Fleet):
+        """`--robot A,B,C`: several roster robots, each a connected bot.
+
+        One code keeps the path it always took, outside `bots`, so a
+        single-robot run is untouched. Several go through `bots` exactly as
+        balls picked out of a scan do -- which is what lets three simulated
+        robots exercise the same assignment, roll call and per-robot drive
+        that three real ones will.
+        """
+        from fleet.roster import Roster
+        self.fleet = Fleet()
+        self.code = None
+        try:
+            roster = Roster.load()
+        except Exception as e:
+            self.say(f"no roster: {type(e).__name__}: {e}", CORAL)
+            return
+        for code in codes:
+            entry = roster.by_code(code)
+            if entry is None:
+                self.say(f"{code} is not in roster.json — skipped", SUN)
+                continue
+            errs = self.fleet.add(entry)
+            if errs:
+                self.say(f"{code}: {errs[0]}", CORAL)
+                continue
+            self._add_bot(code, entry.color, getattr(entry, "ble_name", None) or code)
+        if self.bots:
+            self.push_led()
+            self.say(f"{len(self.bots)} robots: {', '.join(self.bots)} — "
+                     f"n cycles the controls, i identifies them", MINT)
 
     def push_led(self, code=None):
         """Light one robot, or all of them, and force every taillight OFF.
@@ -2122,7 +2164,10 @@ class BlobTest:
         """Ask what is advertising. Results land in an overlay you can click."""
         if self.scan is not None and not self.scan.finished:
             return
-        self.disarm()
+        # All of them: a scan takes the radio for seven seconds, and a robot
+        # still driving through it is being steered by commands that stop
+        # arriving.
+        self.stop_all()
         self.scan = Scan()
         self.scan.start()
         self.say("scanning for Spheros — about 7 seconds")
@@ -2179,12 +2224,7 @@ class BlobTest:
             self.say(errs[0], CORAL)
             return
 
-        rgb = list(config.led_rgb(config.COLORS[colour]["hue"]))
-        self.bots[code] = {"ble": ble_name, "color": colour,
-                           "rgb": rgb, "track": Track(),
-                           "marker": tuple(rgb),
-                           "zeroed": False, "identified": False}
-        self.code = code                    # newest becomes the selected one
+        self._add_bot(code, colour, ble_name)  # newest becomes the selected one
         self.dismiss_scan()
         self.push_led(code)
         self.say(f"{code} connecting to {ble_name} as {colour} "
@@ -2233,16 +2273,164 @@ class BlobTest:
                 pass
         self.bots.pop(code, None)
         if self.code == code:
-            self.code = next(iter(self.bots), None)
+            self._switch_to(next(iter(self.bots), None))
         self.say(f"dropped {code} ({len(self.bots)} left)")
         self.build_dock()
+
+    # -- one drive per robot ----------------------------------------------
+
+    DRIVE_STATE = ("path", "armed", "drive_note", "target_cm", "cmd_v",
+                   "unstick", "coasting", "coast_learned", "run_id",
+                   "run_source", "last_outcome", "last_note",
+                   "_clear_radius_px", "patrol", "_logged_path_run",
+                   "_arm_source", "bootstrap", "_boot_pending",
+                   "_still_since", "turning", "_slew_at", "_slew_deg",
+                   "cmd_log", "probe", "scale_run", "pending_scale",
+                   "aligned", "plant", "aim_note", "manual", "zeroed",
+                   "history", "trail")
+    """Everything one DRIVE owns, as opposed to the bench or the camera.
+
+    Found by walking what `drive`, `arm` and `disarm` reach and what they
+    write, not by reading and guessing -- because a name missing from here is
+    not an error anywhere, it is two robots silently sharing one thing. A test
+    walks the same graph and fails if this list falls behind it.
+
+    The sliders are NOT here, deliberately. One speed, lookahead and arrival
+    for every robot keeps the first multi-robot version to one set of knobs.
+    """
+
+    @staticmethod
+    def fresh_drive():
+        """A robot's drive state before it has ever driven -- `__init__`'s values."""
+        return {"path": None, "armed": False, "drive_note": "",
+                "target_cm": None, "cmd_v": None, "unstick": None,
+                "coasting": None, "coast_learned": None, "run_id": 0,
+                "run_source": None, "last_outcome": None, "last_note": "",
+                "_clear_radius_px": None, "patrol": None,
+                "_logged_path_run": None, "_arm_source": "button",
+                "bootstrap": None, "_boot_pending": False,
+                "_still_since": None, "turning": None, "_slew_at": None,
+                "_slew_deg": None, "cmd_log": deque(maxlen=120),
+                "probe": None, "scale_run": None, "pending_scale": None,
+                "aligned": False, "plant": None, "aim_note": "",
+                "manual": False, "zeroed": False,
+                "history": deque(maxlen=JITTER_N),
+                "trail": deque(maxlen=90)}
+
+    def _save_drive(self):
+        return {k: getattr(self, k) for k in self.DRIVE_STATE}
+
+    def _load_drive(self, state):
+        for k in self.DRIVE_STATE:
+            setattr(self, k, state[k])
+
+    def background(self):
+        """Every connected robot the controls are not pointed at."""
+        return [c for c in self.bots if c != self.code]
+
+    @contextmanager
+    def as_bot(self, code):
+        """Be `code` for the length of a block, then be the selected one again.
+
+        THE SELECTED ROBOT'S DRIVE LIVES ON `self`, exactly where the
+        single-robot app kept it, so one robot runs through precisely the code
+        it always did. Every other robot's drive lives in its own entry, and
+        this swaps it in, lets the unchanged `drive` run against it, and swaps
+        it back out. The same move `track` already makes as a property, done
+        for the rest of what a drive owns.
+        """
+        if code == self.code or code not in self.bots:
+            yield self.bots.get(code)
+            return
+        home_code, home_blob = self.code, self.blob
+        home = self._save_drive()
+        bot = self.bots[code]
+        self._load_drive(bot.setdefault("drive", self.fresh_drive()))
+        self.code, self.blob = code, bot.get("blob")
+        self._background = True
+        try:
+            yield bot
+        finally:
+            bot["drive"] = self._save_drive()
+            self._load_drive(home)
+            self.code, self.blob = home_code, home_blob
+            self._background = False
+
+    def _switch_to(self, code):
+        """Point the controls at `code`, each robot keeping its own drive."""
+        old = self.code
+        if code == old:
+            return
+        if self.manual and self.fleet and old:
+            # A HELD KEY DOES NOT FOLLOW THE SELECTION. Manual drive only runs
+            # for the selected robot, so the one being left would keep rolling
+            # on the last key it was given, with nothing left to release it.
+            h = self.fleet.handles.get(old)
+            if h is not None:
+                h.stop()
+            self.manual, self.cmd_v = False, None
+        if old in self.bots:
+            self.bots[old]["drive"] = self._save_drive()
+        elif self.armed:
+            self.disarm("controls moved to another robot")
+        new = self.bots.get(code)
+        self._load_drive(new.setdefault("drive", self.fresh_drive())
+                         if new is not None else self.fresh_drive())
+        self.code = code
+        self.blob = new.get("blob") if new is not None else None
+
+    def _add_bot(self, code, colour, ble_name):
+        rgb = list(config.led_rgb(config.COLORS[colour]["hue"]))
+        self.bots[code] = {"ble": ble_name, "color": colour,
+                           "rgb": rgb, "track": Track(),
+                           "marker": tuple(rgb),
+                           "zeroed": False, "identified": False,
+                           "drive": self.fresh_drive()}
+        self._switch_to(code)
+
+    def drive_all(self):
+        """One control tick for every robot: the selected one, then the rest.
+
+        The roll call is the exception. It owns every LED at once and is only
+        allowed to start with nothing driving, so while it runs nobody else is
+        stepped -- the selected robot's `drive` is what advances it.
+        """
+        rollcall = self.reid is not None
+        self.drive()
+        if rollcall:
+            return
+        for code in self.background():
+            with self.as_bot(code):
+                self.drive()
+
+    def driving_codes(self):
+        """Robots armed or running a tool right now, the selected one included."""
+        out = []
+        if self.armed or self.probe or self.scale_run or self.manual:
+            out.append(self.code)
+        for c in self.background():
+            d = self.bots[c].get("drive") or {}
+            if d.get("armed") or d.get("probe") or d.get("scale_run"):
+                out.append(c)
+        return out
+
+    def stop_all(self, note=None):
+        """Stop every robot. What `esc` means, however many are connected."""
+        for code in self.background():
+            with self.as_bot(code):
+                self.probe = self.scale_run = None
+                self.disarm(note)
+        self.probe = self.scale_run = None
+        self.disarm(note)
 
     def select(self, code):
         """Point the controls at one robot. Everything the single-robot app
         did to `self.code` now happens to whichever this names."""
         if code in self.bots:
-            self.disarm()
-            self.code = code
+            # NO DISARM. With one drive slot, moving the controls had to stop
+            # whatever held it; with one per robot, it would stop a robot for
+            # no reason other than that you looked at another one.
+            self._switch_to(code)
             self.say(f"selected {code} ({self.bots[code]['color']})")
             self.build_dock()
 
@@ -2425,6 +2613,10 @@ class BlobTest:
         self.say(f"saved {os.path.relpath(path)}", MINT)
 
     def say(self, msg, tone=DIM):
+        if self._background and self.code:
+            # A message from a robot the controls are NOT pointed at. Unnamed,
+            # "arrived — stopped" reads as the selected one arriving.
+            msg = f"{self.code}: {msg}"
         self.note, self.note_tone = msg, tone
         print(f"fleet_test: {msg}")
 
@@ -2499,6 +2691,32 @@ class BlobTest:
         if self.blown:
             self.why = ("the frame is BLOWN OUT — the room lights are on, or "
                         "the exposure is too high. Nothing can be tracked")
+        self.record_blob()
+        for code in self.background():
+            with self.as_bot(code):
+                self.record_blob()
+        # Simulated robots only move when something advances them. A real one
+        # moves because it is a ball on a floor.
+        if self.fleet is not None:
+            now = time.perf_counter()
+            dt = min(0.1, now - self._stepped) if self._stepped else 0.0
+            self._stepped = now
+            if dt > 0:
+                try:
+                    self.fleet.step(dt)
+                except Exception:
+                    pass
+        self.drive_all()
+        self.log_state()
+
+    def record_blob(self):
+        """Speed history, trail and ball size, from this frame's blob.
+
+        Per robot. It ran for the selected one only, which was right while
+        there was only one -- but `travel`, `true_speed`, the stall detector
+        and the arrival radius all read what this records, so a robot driving
+        without it would be steering blind on everything except position.
+        """
         if self.blob is not None:
             if not self.blob.get("clipped_by_region"):
                 # Remembered only while the blob is WHOLE, because that is the
@@ -2515,19 +2733,6 @@ class BlobTest:
             self.history.clear()
             if self.track.xy is None:
                 self.trail.clear()
-        # Simulated robots only move when something advances them. A real one
-        # moves because it is a ball on a floor.
-        if self.fleet is not None:
-            now = time.perf_counter()
-            dt = min(0.1, now - self._stepped) if self._stepped else 0.0
-            self._stepped = now
-            if dt > 0:
-                try:
-                    self.fleet.step(dt)
-                except Exception:
-                    pass
-        self.drive()
-        self.log_state()
 
     def to_cm(self, xy):
         if not self.homography.ready:
@@ -2902,7 +3107,8 @@ class BlobTest:
         if h is not None:
             self.zero_at_rest(h)
         self.armed = True
-        self.run_id += 1
+        self._runs += 1
+        self.run_id = self._runs
         self.run_source = self._arm_source
         self._arm_source = "button"        # back to the default for next time
         self.bootstrap = None      # armed on the next fix, once a pos exists
@@ -4213,6 +4419,10 @@ class BlobTest:
         # only one of them spoke; the other three left a pressed key doing
         # nothing with nothing on screen, which reads as a broken bench. Three
         # separate sessions have now been spent finding out which gate it was.
+        if self._background:
+            # The keyboard steers the SELECTED robot. Without this, holding W
+            # would drive every connected ball up the picture at once.
+            return False
         held = pygame.key.get_pressed()
         want = np.zeros(2)
         for key, direction in self.MANUAL_KEYS.items():
@@ -4336,7 +4546,10 @@ class BlobTest:
         if len(self.bots) < 1:
             self.say("nothing connected to identify", SUN)
             return
-        if self.armed:
+        if self.driving_codes():
+            # ANY robot, not just the selected one: while the roll call runs
+            # nothing else is stepped, so a robot left armed would roll on its
+            # last command for two seconds with nobody steering it.
             self.say("stop driving first", SUN)
             return
         codes = self.id_codes(len(self.bots))
@@ -5151,6 +5364,18 @@ class BlobTest:
             elif self.path is not None:
                 pygame.draw.circle(self.screen, CYAN,
                                    path_px(self.path.pts)[0], 7, 2)
+            # The OTHER robots' routes, thinner and in their own colours. A
+            # robot driving a route nobody can see is the multi-robot version
+            # of the ball rolling while the dock says idle.
+            for code in self.background():
+                bp = (self.bots[code].get("drive") or {}).get("path")
+                col = self.bots[code].get("marker", GREY)
+                if bp is not None and len(bp.pts) > 1:
+                    pygame.draw.lines(self.screen, col, bp.closed,
+                                      path_px(bp.pts), 1)
+                elif bp is not None:
+                    pygame.draw.circle(self.screen, col,
+                                       path_px(bp.pts)[0], 6, 1)
             # The arrival radius, drawn where the run actually ends. An
             # acceptance test you cannot see is one you tune by guesswork --
             # and this is the number that decides between arriving and
@@ -5569,9 +5794,11 @@ class BlobTest:
             return True
         # Escape is the panic key first and a cancel second. Whatever else is
         # going on, it stops the robot.
-        if e.key == pygame.K_ESCAPE and (self.armed or self.probe):
-            self.probe = None
-            self.disarm("halted by esc")
+        if e.key == pygame.K_ESCAPE and self.driving_codes():
+            # EVERY robot. The panic key cannot mean "stop whichever one the
+            # controls happen to be pointed at". And a scale run counts: it
+            # drives while `armed` is False, so esc used to fall through it.
+            self.stop_all("halted by esc")
             return True
         if e.key == pygame.K_ESCAPE and self.scan is not None:
             self.dismiss_scan()
