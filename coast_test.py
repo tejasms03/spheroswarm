@@ -1902,6 +1902,7 @@ class BlobTest:
         self._runs = 0
         self._beacon = None
         self.beacon_on = True
+        self._fresh_at = deque(maxlen=60)     # when frames were PROCESSED
         self.exposure_locked = False
         self.exp_took = None
 
@@ -2647,6 +2648,7 @@ class BlobTest:
             frame, count = self.cam.latest()
             if frame is not None and count != self.seen:
                 self.frame, self.seen, fresh = frame, count, True
+                self._fresh_at.append(time.perf_counter())
         if self.frame is None:
             return
 
@@ -4581,6 +4583,19 @@ class BlobTest:
             return None
         return tuple(1 if f > 0.5 else 0 for f in where)
 
+    def tracked_fps(self):
+        """Frames the bench actually PROCESSED per second, over the last ~2s.
+
+        Not the camera's rate. The camera can deliver 15 while tracking keeps up
+        with 12, and it is the second that the jump gate, the blink and the
+        controller live on. Measured over a window that ends NOW, so a stall
+        shows up rather than being averaged away.
+        """
+        t = [x for x in self._fresh_at if time.perf_counter() - x < 2.0]
+        if len(t) < 2:
+            return 0.0
+        return (len(t) - 1) / max(t[-1] - t[0], 1e-6)
+
     def beacon_skip(self):
         """Seconds to discard at the start of each slot: all but the last two frames.
 
@@ -5820,6 +5835,12 @@ class BlobTest:
         y += 8
 
         y = self.sect(self.screen, self.fs, "frame", x, y, w)
+        # Under 10 the blink reads slowly and the jump gate widens; the tone
+        # says so without anyone having to remember the number.
+        tracked = self.tracked_fps()
+        y = self.row(f"camera {self.cam.fps:4.1f} fps   tracking {tracked:4.1f} fps",
+                     x, y, MINT if tracked >= 10 else (SUN if tracked >= 6 else CORAL),
+                     self.fs)
         want_jump = self.jump_advice()
         if want_jump:
             loose = self.track.max_jump > want_jump * 2.5
