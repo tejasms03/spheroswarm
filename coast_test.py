@@ -854,7 +854,7 @@ class RunLog:
                "parts", "area", "peak", "clipped",
                "run_id", "run_source", "run_outcome",
                "path", "path_pts",
-               "style", "set_speed", "set_lookahead", "set_arrive",
+               "style", "set_speed", "set_lookahead", "set_arrive", "set_turn",
                "cmd_vx", "cmd_vy", "cmd_deg", "aim_offset_deg", "note")
 
     FLUSH_EVERY = 30
@@ -1825,6 +1825,7 @@ class BlobTest:
         self.armed = False          # is the controller allowed to drive?
         self.speed = 20             # cm/s, the slider the operator drives with
         self.lookahead = 15         # cm
+        self.turn_rate = SLEW_DEG_S  # deg/s the command may swing; see `slew`
         self.drive_note = ""
         self.target_cm = None
         self._stepped = 0.0
@@ -2869,10 +2870,17 @@ class BlobTest:
                 ("max jump", 8, 400, lambda: self.track.max_jump, self.set_jump, False),
                 ("speed", 0, 60, lambda: self.speed, self.set_speed, False),
                 ("lookahead", 2, 60, lambda: self.lookahead, self.set_lookahead, False),
+                # Beside lookahead, because together they set how tight a
+                # corner is: lookahead is the bigger lever, and once it is
+                # short this becomes the next limit.
+                ("turn rate", 60, 900, lambda: self.turn_rate, self.set_turn_rate, False),
                 ("arrive", 2, 40, lambda: self.goal_tol, self.set_goal_tol, False)):
             self.sliders.append(
                 Slider((x, y, w, 18), label, lo, hi, get, set_, log=log))
-            y += 26
+            # 23, not 26: the turn-rate slider costs a row, and the rows it
+            # pushes off the bottom are the FRAME warnings -- "exposure on
+            # auto" among them, which is the first thing to check at the rig.
+            y += 23
         y += 6
         bw = (w - 12) // 3
         rows = ((("lock", lambda: self.exposure_mode(True), MINT),
@@ -2982,6 +2990,9 @@ class BlobTest:
 
     def set_lookahead(self, v):
         self.lookahead = int(v)
+
+    def set_turn_rate(self, v):
+        self.turn_rate = float(v)
 
     def apply_latency_advice(self):
         """Set lookahead and arrival from the measured lag at the current speed.
@@ -3610,6 +3621,7 @@ class BlobTest:
                            run_outcome=outcome, mode="end", note=note or "",
                            set_speed=int(self.speed),
                            set_lookahead=int(self.lookahead),
+                           set_turn=int(self.turn_rate),
                            set_arrive=int(self.goal_tol), style=self.style,
                            path=None if self.path is None else self.path.kind)
         self.armed = False
@@ -3907,7 +3919,7 @@ class BlobTest:
             return v
         dt = max(now - self._slew_at, 1e-3)
         step = (want - self._slew_deg + 180.0) % 360.0 - 180.0
-        limit = SLEW_DEG_S * dt
+        limit = float(self.turn_rate) * dt
         if abs(step) > limit:
             step = limit if step > 0 else -limit
         self._slew_deg = (self._slew_deg + step) % 360.0
@@ -4376,6 +4388,7 @@ class BlobTest:
             style=self.style,
             set_speed=int(self.speed),
             set_lookahead=int(self.lookahead),
+            set_turn=int(self.turn_rate),
             set_arrive=int(self.goal_tol),
             x_px=None if blob is None else float(blob["xy"][0]),
             y_px=None if blob is None else float(blob["xy"][1]),
