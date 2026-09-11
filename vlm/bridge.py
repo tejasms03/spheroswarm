@@ -74,6 +74,20 @@ class ArenaFrame:
         # the offset crop the framework's UI was showing.
         self.origin_cm = np.asarray(origin_cm, dtype=float)
 
+    def describes(self, width_cm, height_cm, origin_cm, tol=0.5):
+        """Is this still the arena that was just measured?
+
+        Tolerated rather than exact. The corners are a click through a
+        homography and the numbers wobble in the last fraction of a
+        centimetre; rebuilding on that would republish the arena every tick
+        and re-attach the driver sixty times a second.
+        """
+        return (abs(self.width_cm - float(width_cm)) <= tol
+                and abs(self.height_cm - float(height_cm)) <= tol
+                and bool(np.all(np.abs(self.origin_cm
+                                       - np.asarray(origin_cm, dtype=float))
+                                <= tol)))
+
     @property
     def size_px(self):
         """(width, height) in pixels -- what `arena_settings.json` must say."""
@@ -99,6 +113,57 @@ class ArenaFrame:
     def scalar_to_px(self, cm):
         """A length, not a point. Radii and margins have to cross too."""
         return float(cm) * self.px_per_cm
+
+    def scalar_to_cm(self, px):
+        """The way back, and the half that was missing.
+
+        A LENGTH does not carry the origin. `to_cm` adds it, correctly, because
+        a point in arena pixels has to land where the clicked floor actually
+        starts -- and on this rig that is a third of a metre from zero. Putting
+        a radius through the same call added the same third of a metre to it,
+        so an orbit asked for in centimetres came out that much smaller and
+        looked like the model had ignored the number.
+        """
+        return float(px) / self.px_per_cm
+
+    def draw_grid(self, frame, step_cm=20.0):
+        """The same centimetre grid the bench draws, on the published frame.
+
+        STRAIGHT here, and bent there, and both are right: this frame has
+        already been rectified by the warp, so a centimetre is the same number
+        of pixels everywhere in it. Drawing curves into a rectified picture
+        would be inventing a distortion that was just removed.
+
+        Labelled in the BENCH'S centimetres -- the origin added back -- rather
+        than in this frame's own. The two differ by a third of a metre on this
+        rig, and a dashboard whose grid says 0 where the bench says -33 is a
+        second coordinate system for the operator to hold in their head, which
+        is the thing the grid exists to stop.
+        """
+        if frame is None or step_cm <= 0:
+            return frame
+        out = frame.copy()
+        h, w = out.shape[:2]
+        line, axis = (70, 70, 70), (40, 130, 190)
+        n = int(w / max(self.px_per_cm * step_cm, 1e-6)) + 1
+        m = int(h / max(self.px_per_cm * step_cm, 1e-6)) + 1
+        for i in range(min(n, 64) + 1):
+            x = int(round(i * step_cm * self.px_per_cm))
+            if x >= w:
+                break
+            cm = self.origin_cm[0] + i * step_cm
+            cv2.line(out, (x, 0), (x, h - 1), axis if abs(cm) < 1e-6 else line, 1)
+            cv2.putText(out, f"{cm:g}", (x + 3, 14), cv2.FONT_HERSHEY_PLAIN,
+                        0.8, (140, 140, 140), 1, cv2.LINE_AA)
+        for j in range(min(m, 64) + 1):
+            y = int(round(j * step_cm * self.px_per_cm))
+            if y >= h:
+                break
+            cm = self.origin_cm[1] + j * step_cm
+            cv2.line(out, (0, y), (w - 1, y), axis if abs(cm) < 1e-6 else line, 1)
+            cv2.putText(out, f"{cm:g}", (3, y - 4), cv2.FONT_HERSHEY_PLAIN,
+                        0.8, (140, 140, 140), 1, cv2.LINE_AA)
+        return out
 
     def matrix_from(self, homography):
         """Camera pixels straight to arena pixels, as one 3x3.
@@ -247,6 +312,7 @@ class Bridge(threading.Thread):
         self.app = app
         self.robot_id = int(robot_id)
         self._arena = arena
+        self._arena_moved = False
         self.period = 1.0 / max(1.0, float(hz))
         self._client = client
         self._stop = threading.Event()
@@ -295,6 +361,17 @@ class Bridge(threading.Thread):
             if not measured:
                 return ArenaFrame(w, h, origin_cm=origin)
             self._arena = ArenaFrame(w, h, origin_cm=origin)
+            self._arena_moved = True
+        elif measured and not self._arena.describes(w, h, origin):
+            # AND IT LETS GO WHEN THE FLOOR MOVES. Latching against a
+            # placeholder is right; latching against a re-measurement is not.
+            # Re-clicking the corners changed what `agent_bounds` returns and
+            # nothing here noticed, so the framework carried on being told
+            # about the rectangle from before the click -- the operator drew
+            # a new arena and the dashboard kept drawing the old one, with no
+            # way to update it short of restarting the bench.
+            self._arena = ArenaFrame(w, h, origin_cm=origin)
+            self._arena_moved = True
         return self._arena
 
     def connect(self):
@@ -363,6 +440,9 @@ class Bridge(threading.Thread):
         frame = self.arena.warp(self.app.frame, self.app.homography)
         if frame is None:
             frame = np.zeros((h, w, 3), dtype=np.uint8)
+        if getattr(self.app, "show_axes", False):
+            frame = self.arena.draw_grid(frame,
+                                         getattr(self.app, "GRID_CM", 20.0))
 
         # `ind`, `raw` and `hf` are the per-camera dicts their stitcher
         # produces. Nothing in Functions/Library or backend/ reads them on the
@@ -378,6 +458,16 @@ class Bridge(threading.Thread):
             if self.driver is None:
                 from vlm.driver import Driver
                 self.driver = Driver(self.app, self.arena, self.robot_id)
+            # REFRESHED EVERY TICK, not snapshotted at construction. The
+            # driver converts every request through this, and the arena moves
+            # whenever the corners are re-clicked or the scale is corrected --
+            # a driver holding the frame it was born with converts the
+            # agent's pixels against a floor that no longer exists.
+            arena = self.arena
+            self.driver.arena = arena
+            if self._arena_moved:
+                self.driver.attached = False   # re-attach republishes it
+                self._arena_moved = False
             self.driver.serve(client)
         return poses
 
