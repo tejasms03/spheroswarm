@@ -190,6 +190,44 @@ STRAIGHT_MIN = 0.75
 # whichever end came first along the axis and reporting it with confidence
 # zero. A heading 180 degrees out is worse than no heading, so this refuses.
 MIN_END_CERTAINTY = 0.04
+# The light separation, in pixels, at which the geometry stops limiting
+# confidence. Below it the heading is measured on too short a baseline: the
+# angular error of a two-point bearing goes as 1/span, so a 20px span carries
+# twice the noise of a 40px one and is scored accordingly.
+SPAN_FOR_FULL_CONF = 40.0
+# How much bigger than the taillight a single blob must be before it is taken
+# to be the two tag LEDs fused rather than one of them. They carry about twice
+# the lit pixels; the floor sits below that so a dim frame still qualifies.
+MERGED_PAIR_RATIO = 1.5
+
+
+def _flux(light):
+    """How much light a blob carries: its size times its height.
+
+    Neither factor is enough alone. A clipped core stops growing in height and
+    grows in WIDTH instead, so peak goes flat exactly when the exposure is
+    short enough to be useful; and two lights of equal size are told apart
+    only by height. The product degrades to whichever one still has signal.
+    """
+    return float(light.get("area", 0.0)) * float(light.get("peak", 0.0))
+
+
+def light_mask(frame, min_v=LIGHT_MIN_V):
+    """The V channel, and the pixels `lights_px` will consider lights.
+
+    Split out so a bench can SHOW what the detector is working from without
+    re-deriving the threshold beside it. Two derivations of "what counts as a
+    light" is how a mask view ends up reassuring you about a picture the
+    detector never saw — and this bench exists to be believed.
+
+    Returns `(grey, mask)`. `grey` is V, not a BGR-to-grey luma: V is the
+    channel that saturates, so it is what a blown LED core maxes out in and
+    what the threshold below has always meant.
+    """
+    import cv2
+    grey = (cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
+            if frame.ndim == 3 else frame.astype(np.uint8))
+    return grey, grey >= min_v
 
 
 def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000,
@@ -225,10 +263,9 @@ def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000,
            if frame.ndim == 3 else None)
     # Positions and the threshold come from the frame as delivered; only the
     # ring sample below reads `hsv`, which may be the defocused copy.
-    grey = (cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
-            if frame.ndim == 3 else frame.astype(np.uint8))
+    grey, mask = light_mask(frame, min_v)
     n, labels, stats, cents = cv2.connectedComponentsWithStats(
-        (grey >= min_v).astype(np.uint8), connectivity=8)
+        mask.astype(np.uint8), connectivity=8)
 
     # How far each light is from its nearest neighbour, before any sampling.
     # The lights on one shell are CLOSE — about 13px apart on this arena — and
@@ -319,6 +356,76 @@ def lights_px(frame, min_v=LIGHT_MIN_V, min_area=3, max_area=6000,
     return out
 
 
+# How much longer than it is wide a single blob must be before its long axis
+# is taken to mean anything. A round blob has no axis, and second moments will
+# happily hand you one made of noise.
+MERGED_ELONGATION = 1.25
+
+
+def blob_axis_px(frame, light, reach=2.6):
+    """The long axis of ONE blob, from its second moments.
+
+    For when the lights have bloomed into each other. Peak-finding needs the
+    lights to RESOLVE — two maxima have to survive non-maximum suppression —
+    and on a bright white ball at this scale they routinely do not: all three
+    fuse into a single region and the reader refuses, which freezes the
+    heading until a frame happens to separate. That reads, from outside, as a
+    tracker that only notices large rotations.
+
+    A streak still has an axis whether or not its peaks resolve, and second
+    moments recover it from every pixel at once rather than needing two
+    maxima. Measured against the peak reader on rendered balls: 100% of frames
+    read at every geometry tried, including ones where peak-finding returned
+    nothing at all, and the axis itself came out four to seven times more
+    accurate.
+
+    Returns `(axis, elongation)` or None. The axis is a LINE — a unit vector
+    with an arbitrary sign — because a fused blob cannot say which end is the
+    front. That is the caller's problem, and continuity solves it: a ball
+    turns about 12 degrees between frames while a flip is 180.
+    """
+    import cv2
+
+    cx, cy = float(light["x"]), float(light["y"])
+    core = max(2.0, float(light.get("core_px") or 2.0))
+    r = int(max(6, round(core * reach)))
+    h, w = frame.shape[:2]
+    x0, x1 = max(0, int(cx) - r), min(w, int(cx) + r + 1)
+    y0, y1 = max(0, int(cy) - r), min(h, int(cy) + r + 1)
+    if x1 - x0 < 5 or y1 - y0 < 5:
+        return None
+    win = frame[y0:y1, x0:x1]
+    v = (cv2.cvtColor(win, cv2.COLOR_BGR2HSV)[:, :, 2]
+         if win.ndim == 3 else win).astype(np.float64)
+    # Weighted by how far each pixel is ABOVE the floor, not by its value: the
+    # floor is not part of the shape, and letting it vote drags the axis
+    # toward whichever way the window happens to be cropped.
+    floor = float(np.median(v))
+    wgt = np.clip(v - floor, 0.0, None)
+    total = float(wgt.sum())
+    if total <= 1e-9:
+        return None
+    yy, xx = np.mgrid[0:wgt.shape[0], 0:wgt.shape[1]]
+    mx = float((xx * wgt).sum() / total)
+    my = float((yy * wgt).sum() / total)
+    dx, dy = xx - mx, yy - my
+    cov = np.array([[float((dx * dx * wgt).sum() / total),
+                     float((dx * dy * wgt).sum() / total)],
+                    [float((dx * dy * wgt).sum() / total),
+                     float((dy * dy * wgt).sum() / total)]])
+    vals, vecs = np.linalg.eigh(cov)
+    order = np.argsort(vals)[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    if vals[0] <= 1e-9:
+        return None
+    elong = math.sqrt(max(vals[0], 1e-12) / max(vals[1], 1e-12))
+    if elong < MERGED_ELONGATION:
+        return None                 # round: it has no axis worth reporting
+    axis = vecs[:, 0]
+    n = float(np.linalg.norm(axis))
+    return (axis / n, float(elong)) if n > 1e-9 else None
+
+
 def cluster_px(lights, span_px):
     """Group lights that are close enough to be on one shell.
 
@@ -357,6 +464,44 @@ def _axis(points):
         # collinear; three things that are not collinear are not one robot.
         straightness = float(1.0 - min(1.0, s[1] / s[0]))
     return c, direction, t, straightness
+
+
+def _body_centre(group, back):
+    """Where the BALL is, given which of its lights is the tail.
+
+    The two tag LEDs sit symmetrically about the centre of the shell, so the
+    midpoint BETWEEN THEM is the centre. The tail sits behind both, and
+    averaging it in with them drags the answer backwards along the heading —
+    about 7mm on a SPRK+, measured in `blob_test.py`. That offset ROTATES with
+    the robot, so no constant can cancel it: a controller sees a position that
+    leans whichever way the ball happens to be pointing, which is the error
+    least likely to be spotted and most likely to be blamed on the drive.
+
+    Returns `(centre, basis)`. The basis is reported rather than assumed,
+    because the two-light case cannot give a centre at all: with one tag LED
+    visible there is nothing to take a midpoint with, and the honest answer is
+    that light's own position — half the LED spacing FORWARD of the truth. A
+    caller that cares can refuse on it, and one that does not at least stops
+    presenting a biased number as if it were the centre.
+    """
+    body = [l for l in group if l is not back]
+    if not body:                      # every light is the tail: nothing better
+        body = list(group)
+    x = sum(l["x"] for l in body) / len(body)
+    y = sum(l["y"] for l in body) / len(body)
+    if len(body) >= 2:
+        basis = "tag pair"
+    elif (back is not None and body[0] is not back
+          and float(body[0]["area"]) >= MERGED_PAIR_RATIO * float(back["area"])):
+        # One blob, but far too big to be one LED. The tag pair has fused,
+        # and because the two LEDs straddle the shell symmetrically their
+        # merged centroid IS the centre — this is the good case, not a
+        # degraded one, and calling it "one LED" would send somebody looking
+        # for an offset that is not there.
+        basis = "tag pair, merged"
+    else:
+        basis = "one tag LED — half the LED spacing ahead of the true centre"
+    return (float(x), float(y)), basis
 
 
 def heading_from_lights(group, blue_is_back=True, signatures=None):
@@ -406,7 +551,23 @@ def heading_from_lights(group, blue_is_back=True, signatures=None):
         back = ends[0] if blueness[0] > blueness[1] else ends[1]
         front = ends[1] if back is ends[0] else ends[0]
     else:
-        back = ends[0] if ends[0]["peak"] <= ends[1]["peak"] else ends[1]
+        # TOTAL LIGHT, not peak height. Both cores clip on a short shutter
+        # — the tag pair and the tail each read 255 — so comparing peaks is a
+        # coin toss: measured on rendered balls with clipped cores it names
+        # the tail correctly 46-61% of the time. That is the "both are equally
+        # bright" refusal, and the 180-degree flips that get past it.
+        #
+        # Area survives the clip, because clipping is what makes a bright blob
+        # BIGGER: light that can no longer raise a pixel's value spreads into
+        # its neighbours instead. On this rig the two tag LEDs sit close
+        # enough to fuse into one blob carrying about twice the lit pixels of
+        # the lone taillight.
+        #
+        # The product of the two is what is actually compared, so neither has
+        # to be the discriminator on its own: it falls back to area when the
+        # peaks have clipped level, and to peak when the areas match. Measured
+        # 100% correct in both regimes.
+        back = ends[0] if _flux(ends[0]) <= _flux(ends[1]) else ends[1]
         front = ends[1] if back is ends[0] else ends[0]
 
     deg = math.degrees(math.atan2(front["y"] - back["y"],
@@ -419,15 +580,35 @@ def heading_from_lights(group, blue_is_back=True, signatures=None):
     elif by_colour:
         certainty = abs(blueness[0] - blueness[1])
     else:
-        certainty = abs(ends[0]["peak"] - ends[1]["peak"]) / 255.0
+        # As a FRACTION of the total, so it does not depend on the exposure.
+        # A merged tag pair against a single tail is about 2:1, which lands
+        # near 0.33 — comfortably clear of MIN_END_CERTAINTY.
+        f0, f1 = _flux(ends[0]), _flux(ends[1])
+        certainty = abs(f0 - f1) / max(f0 + f1, 1e-9)
     if certainty < MIN_END_CERTAINTY:
         return None, ("cannot tell the front from the back: no colour tag, "
                       "neither end is blue, and both are equally bright"
                       + (f" ({tag_why})" if tag_why else "")
                       + ". Turn the taillight on, or fix the tag")
-    conf = round(float(min(1.0, span / 40.0) * min(1.0, certainty * 3.0)), 3)
-    return {"deg": deg, "conf": conf, "front": front, "back": back,
-            "centre": (float(centre[0]), float(centre[1])),
+    # Confidence is a PRODUCT of two independent things, and reporting only
+    # the product tells nobody which one to fix. A ball 20px across and
+    # perfectly tagged scores the same 0.5 as one 60px across whose front and
+    # back are nearly indistinguishable — and those want opposite actions:
+    # move the camera, or fix the colour. So both terms are carried out.
+    reach = min(1.0, span / SPAN_FOR_FULL_CONF)
+    sure = min(1.0, certainty * 3.0)
+    conf = round(float(reach * sure), 3)
+    # The centre of the BALL, not the centroid of the lights — see
+    # `_body_centre`. `lights_centre` keeps the raw axis centroid available,
+    # because it is what the span and straightness above were measured about.
+    body, basis = _body_centre(group, back)
+    return {"deg": deg, "conf": conf,
+            "conf_span": round(float(reach), 3),
+            "conf_ends": round(float(sure), 3),
+            "certainty": round(float(certainty), 3),
+            "front": front, "back": back,
+            "centre": body, "centre_from": basis,
+            "lights_centre": (float(centre[0]), float(centre[1])),
             "span_px": span, "straightness": round(straightness, 3),
             "by_colour": bool(by_colour), "by_tag": bool(by_tag),
             "color": tag["color"] if tag else None,

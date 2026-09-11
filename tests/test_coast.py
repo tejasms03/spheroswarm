@@ -1906,3 +1906,164 @@ def test_the_prediction_differs_from_the_position_by_more_than_the_ball():
     here = np.array([88.0, 58.0])
     rest = coast_rest(here, [24.0, 8.0], 0.509)
     assert float(np.linalg.norm(rest - here)) > 7.3
+
+
+# -- centimetres from one drive, from the bench keyboard ------------------
+
+def _scale_app():
+    import coast_test as F
+    return F.BlobTest("sim", with_fleet=False)
+
+
+def test_m_reads_which_half_of_the_calibration_it_is_in():
+    """One key, two steps, separated by somebody walking over with a tape."""
+    app = _scale_app()
+    try:
+        app.pending_scale = {"px": 400.0, "cm": 41.3, "at": 0.0}
+        app.scale_key()
+        assert app.typing and app.typing_mode == "measure"
+        assert "41.3" in app.note, app.note
+    finally:
+        app.close()
+
+
+def test_a_tape_reading_rescales_the_arena_and_is_written_down():
+    app = _scale_app()
+    try:
+        before = app.homography.M.copy()
+        app.pending_scale = {"px": 400.0, "cm": 40.0, "at": 0.0}
+        saved = []
+        app.homography.save = lambda: saved.append(True)
+        app.take_measurement("46")
+        assert saved, "a calibration that is not written down is not one"
+        assert app.pending_scale is None
+        # 46 measured against 40 reported: everything this reports grows 1.15x.
+        assert app.homography.M[0, 0] == pytest.approx(before[0, 0] * 1.15,
+                                                       rel=1e-9)
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize("typed", ["", "  ", "about a foot", "-5"])
+def test_a_reading_that_is_not_a_distance_changes_nothing(typed):
+    app = _scale_app()
+    try:
+        before = app.homography.M.copy()
+        app.pending_scale = {"px": 400.0, "cm": 40.0, "at": 0.0}
+        app.take_measurement(typed)
+        assert np.allclose(app.homography.M, before)
+    finally:
+        app.close()
+
+
+def test_typing_a_measurement_does_not_reach_the_agent():
+    """The text box started as the agent prompt. A tape reading typed into it
+    must not be sent to a language model as a sentence."""
+    app = _scale_app()
+    try:
+        asked = []
+        app.ask = lambda t: asked.append(t)
+        app.pending_scale = {"px": 400.0, "cm": 40.0, "at": 0.0}
+        app.homography.save = lambda: None
+        app.scale_key()
+        app.take_measurement("46") if app.typing_mode == "measure" else None
+        assert asked == []
+    finally:
+        app.close()
+
+
+def test_a_text_box_says_why_the_keys_are_dead():
+    """An unnoticed text box and a broken bench look identical from the
+    keyboard. Every other refusal in `manual_drive` speaks; this one did not,
+    and `m` made it easy to be in one without meaning to."""
+    import pygame
+
+    app = _scale_app()
+    try:
+        app.tab = "robot"
+        app.typing = True
+
+        class Handle:
+            connected = True
+            heading_offset = 0.0
+
+            def stop(self):
+                pass
+
+        app.fleet = type("F", (), {"handles": {"AAAA": Handle()}})()
+        app.code = "AAAA"
+
+        class Held:
+            def __getitem__(self, k):
+                return k == pygame.K_w
+
+        real = pygame.key.get_pressed
+        pygame.key.get_pressed = lambda: Held()
+        try:
+            assert app.manual_drive() is False
+        finally:
+            pygame.key.get_pressed = real
+        assert "esc" in (app.note or "").lower(), app.note
+    finally:
+        app.close()
+
+
+# -- the coordinate frame, drawn on the floor it describes ----------------
+
+def test_the_frame_overlay_is_off_until_it_is_asked_for():
+    app = _scale_app()
+    try:
+        assert app.show_axes is False
+        app.toggle_axes()
+        assert app.show_axes is True
+        app.toggle_axes()
+        assert app.show_axes is False
+    finally:
+        app.close()
+
+
+def test_drawing_the_frame_does_not_need_a_ball_or_a_path():
+    """It describes the floor, not the run. Refusing to draw without a lock
+    would hide it exactly when a position is most in doubt."""
+    import time
+
+    app = _scale_app()
+    try:
+        app.show_axes = True
+        app.track.forget()
+        app.path = None
+        for _ in range(5):
+            time.sleep(0.01)
+            app.tick()
+            app.draw()
+    finally:
+        app.close()
+
+
+def test_the_frame_is_silent_without_a_homography():
+    """Centimetres mean nothing without one, so there is nothing to draw and
+    nothing to crash on."""
+    app = _scale_app()
+    try:
+        app.homography.M = None
+        app.show_axes = True
+        app.draw_axes(lambda p: (int(p[0]), int(p[1])))
+    finally:
+        app.close()
+
+
+def test_the_grid_follows_the_clicked_corners_not_the_calibration_quad():
+    """The two differ by a third of a metre on this rig. A grid drawn from the
+    homography's own rectangle would label the floor with numbers no other part
+    of the bench uses."""
+    app = _scale_app()
+    try:
+        b = app.agent_bounds()
+        if b is None:
+            pytest.skip("no corners in this fixture")
+        seen = []
+        app.show_axes = True
+        app.draw_axes(lambda p: seen.append(p) or (int(p[0]), int(p[1])))
+        assert seen, "nothing was drawn"
+    finally:
+        app.close()

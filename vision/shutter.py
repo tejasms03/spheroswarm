@@ -105,6 +105,24 @@ def set_mode(binary, index, mode):
     return run(binary, "-I", str(index), "-s", f"auto-exposure-mode={mode}")
 
 
+# Focus goes the same way as exposure and for the same reason: AVFoundation
+# accepts `CAP_PROP_AUTOFOCUS` for an external camera and drops it, so the
+# "af off" button was as dead as the exposure slider was. On a dark floor a
+# hunting autofocus is worse than a wrong exposure -- it smears two LEDs a few
+# pixels apart into one blob, and `facing.py` then refuses every other frame.
+FOCUS_MIN, FOCUS_MAX = 0, 255
+FOCUS_DEFAULT = 0           # 0 is infinity on this camera, which is the floor
+
+
+def set_autofocus(binary, index, on):
+    return run(binary, "-I", str(index), "-s",
+               f"auto-focus={1 if on else 0}")
+
+
+def set_focus(binary, index, value):
+    return run(binary, "-I", str(index), "-s", f"focus-abs={int(value)}")
+
+
 def dial(camera=0, uvc_index=0, size=None):
     binary = tool()
     if binary is None:
@@ -225,3 +243,136 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class Dial:
+    """The camera's shutter, as a thing an app can hold.
+
+    `dial()` above is a bench in its own right; this is the same control with
+    no window around it, so an app that already has a slider can drive the
+    shutter without growing a second copy of the three things that are easy to
+    get wrong here.
+
+    MANUAL MODE IS RE-ASSERTED, not set once at startup. In aperture priority
+    the camera owns the shutter and drops these writes without complaint --
+    the value reads back unchanged, which is indistinguishable from a dead
+    dial. Anything can put the camera back: unplugging it, another app opening
+    it, `auto()` on this object. So the mode is checked before every write and
+    the write is abandoned if it cannot be taken.
+
+    WRITES ARE RATE LIMITED. Each one is a uvc-util subprocess and a dragged
+    slider emits an event per pixel; unthrottled that is dozens of processes a
+    second competing with the render loop, which stutters the window during
+    exactly the adjustment you are trying to judge by eye. `set` only records
+    what is wanted and `push` -- called once per rendered frame -- is what
+    reaches the camera.
+
+    OPENCV NEVER LEARNS. The frames come from `VideoCapture` and this control
+    goes out of band, so `cap.get(CAP_PROP_EXPOSURE)` stays as wrong as it
+    ever was. `self.value` is the only place that knows.
+    """
+
+    PUSH_S = 0.08           # about twelve writes a second
+    WHAT = "exposure"
+    SAVE_KEY, SAVE_FIELD = "exposure", "exposure_time_abs"
+    VMIN, VMAX, VDEFAULT = EXP_MIN, EXP_MAX, EXP_DEFAULT
+
+    def __init__(self, index=0, value=None):
+        self.binary = tool()
+        self.index = int(index)
+        saved = config.load(self.SAVE_KEY, {}) or {}
+        if value is None:
+            value = saved.get(self.SAVE_FIELD, self.VDEFAULT)
+        self.value = self.clamp(value)
+        self.manual = False
+        self.pending = self.value      # push once at startup, so the camera
+        self.pushed = 0.0              # actually starts where the slider says
+        self.took = None
+
+    @classmethod
+    def clamp(cls, value):
+        return max(cls.VMIN, min(cls.VMAX, int(value)))
+
+    @property
+    def available(self):
+        return self.binary is not None
+
+    @property
+    def ms(self):
+        return self.value / 10.0
+
+    def set(self, value):
+        """Ask for a shutter time. The write happens in `push`."""
+        self.value = self.clamp(value)
+        self.pending = self.value
+
+    def push(self, force=False):
+        """Send a pending value to the camera. Returns None, or (ok, message).
+
+        None means there was nothing to do -- no pending write, or too soon
+        since the last one. Call it once per frame and report anything it
+        hands back.
+        """
+        if self.pending is None:
+            return None
+        now = time.perf_counter()
+        if not force and now - self.pushed < self.PUSH_S:
+            return None
+        value, self.pending, self.pushed = self.pending, None, now
+        if self.binary is None:
+            self.took = False
+            return False, ("no uvc-util, and it is the only thing on macOS "
+                           "that can move this camera's shutter — see "
+                           "vision/shutter.py for the build")
+        if not self.manual:
+            ok, msg = self._write_auto(True)
+            self.manual = bool(ok)
+            if not ok:
+                self.took = False
+                return False, f"could not take manual {self.WHAT}: {msg}"
+        ok, msg = self._write_value(value)
+        self.took = bool(ok)
+        if not ok:
+            return False, f"exposure {value}: {msg}"
+        return True, f"exposure {value} = {value / 10:.1f} ms"
+
+    def _write_auto(self, manual):
+        return set_mode(self.binary, self.index,
+                        MANUAL if manual else APERTURE_PRIORITY)
+
+    def _write_value(self, value):
+        return set_exposure(self.binary, self.index, value)
+
+    def auto(self):
+        """Hand the control back to the camera's own automatics."""
+        if self.binary is None:
+            return False, "no uvc-util"
+        ok, msg = self._write_auto(False)
+        self.manual = False if ok else self.manual
+        return ok, (f"{self.WHAT} back to automatic" if ok else msg)
+
+    def save(self):
+        config.save(self.SAVE_KEY, {self.SAVE_FIELD: self.value,
+                                    "auto_exposure_mode": MANUAL,
+                                    "uvc_index": self.index})
+        return (f"saved {self.WHAT} {self.value} to "
+                f"calib/{self.SAVE_KEY}.json")
+
+
+class FocusDial(Dial):
+    """The same control, pointed at focus instead of the shutter.
+
+    Separate values, separate file, one push implementation — the rate limit
+    and the re-assert-manual-before-every-write rule are the parts that were
+    worth getting right once.
+    """
+
+    WHAT = "focus"
+    SAVE_KEY, SAVE_FIELD = "focus", "focus_abs"
+    VMIN, VMAX, VDEFAULT = FOCUS_MIN, FOCUS_MAX, FOCUS_DEFAULT
+
+    def _write_auto(self, manual):
+        return set_autofocus(self.binary, self.index, not manual)
+
+    def _write_value(self, value):
+        return set_focus(self.binary, self.index, value)
