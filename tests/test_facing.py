@@ -498,3 +498,226 @@ def test_a_clear_brightness_difference_still_answers():
     got, why = heading_from_lights(group)
     assert why is None and got is not None
     assert abs(got["deg"] - 0.0) < 1.0, "the brighter end is the front"
+
+
+def test_the_centre_is_the_midpoint_of_the_tag_pair_not_of_all_three():
+    """The two tag LEDs straddle the centre of the shell; the tail sits behind
+    both. Averaging the tail in with them is the ~7mm backward bias that
+    `blob_test.py` measured, and it is the whole reason that app runs with the
+    taillight off."""
+    from vision.facing import heading_from_lights
+
+    # tail at 100, tag LEDs at 120 and 140 — the ball is at 130, not at 120.
+    group = [tail(100, 100), light(120, 100, 60), light(140, 100, 60)]
+    got, why = heading_from_lights(group, signatures=SIGS)
+    assert why is None, why
+    assert got["centre_from"] == "tag pair"
+    assert abs(got["centre"][0] - 130.0) < 1e-6, got["centre"]
+    assert abs(got["lights_centre"][0] - 120.0) < 1e-6, "the raw centroid"
+
+
+def test_the_centre_does_not_lean_with_the_heading():
+    """The bias the tail introduces ROTATES with the robot, so no constant can
+    cancel it. Turn the ball round about a fixed centre and the answer has to
+    stay put."""
+    from vision.facing import heading_from_lights
+
+    cx, cy = 200.0, 200.0
+    seen = []
+    for dx, dy in ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)):
+        # tag LEDs 10px either side of the centre, tail 30px behind it
+        group = [light(cx + dx * 10, cy + dy * 10, 60),
+                 light(cx - dx * 10, cy - dy * 10, 60),
+                 tail(cx - dx * 30, cy - dy * 30)]
+        got, why = heading_from_lights(group, signatures=SIGS)
+        assert why is None, why
+        seen.append(got["centre"])
+    for x, y in seen:
+        assert abs(x - cx) < 1e-6 and abs(y - cy) < 1e-6, seen
+
+
+def test_one_tag_led_reports_that_its_centre_is_biased():
+    """With a single tag LED there is nothing to take a midpoint with. The
+    answer is that light's own position, which sits forward of the ball — and
+    saying so is the difference between a known offset and a silent one."""
+    from vision.facing import heading_from_lights
+
+    got, why = heading_from_lights([tail(100, 100), light(140, 100, 60)],
+                                   signatures=SIGS)
+    assert why is None, why
+    assert got["centre_from"] != "tag pair"
+    assert abs(got["centre"][0] - 140.0) < 1e-6, "the LED, not the midpoint"
+
+
+def test_confidence_says_which_of_its_two_terms_is_limiting():
+    """A ball 20px across and perfectly tagged scores the same 0.5 as one 60px
+    across whose ends are nearly indistinguishable. Those want opposite
+    actions — move the camera, or fix the colour — so the product alone is not
+    an actionable number."""
+    from vision.facing import SPAN_FOR_FULL_CONF, heading_from_lights
+
+    # Short baseline, perfect ends: the GEOMETRY is the limit.
+    near = [tail(100, 100), light(110, 100, 60), light(120, 100, 60)]
+    got, why = heading_from_lights(near, signatures=SIGS)
+    assert why is None, why
+    assert got["conf_ends"] == 1.0, "the ends were never in doubt"
+    assert got["conf_span"] < 1.0, "the span is what is holding it back"
+    assert got["conf"] == pytest.approx(got["conf_span"] * got["conf_ends"],
+                                        abs=1e-3)
+
+    # Long baseline: the same ends now score full marks.
+    far = [tail(100, 100), light(130, 100, 60), light(160, 100, 60)]
+    wide, why = heading_from_lights(far, signatures=SIGS)
+    assert why is None, why
+    assert wide["conf_span"] == 1.0, f"{wide['span_px']}px should reach"
+    assert wide["conf"] > got["conf"]
+
+
+def test_the_span_term_is_linear_up_to_the_threshold():
+    """The angular error of a two-point bearing goes as 1/span, so half the
+    separation is twice the noise and is scored as half the confidence."""
+    from vision.facing import SPAN_FOR_FULL_CONF, heading_from_lights
+
+    half = SPAN_FOR_FULL_CONF / 2.0
+    group = [tail(100, 100), light(100 + half / 2, 100, 60),
+             light(100 + half, 100, 60)]
+    got, why = heading_from_lights(group, signatures=SIGS)
+    assert why is None, why
+    assert got["conf_span"] == pytest.approx(0.5, abs=0.02)
+
+
+def big(x, y, hue, peak=255, core=4.0, **kw):
+    """A light with an explicit size, for the cases where SIZE is the signal."""
+    return light(x, y, hue, peak=peak, core=core, **kw)
+
+
+def test_clipped_cores_are_told_apart_by_size_not_by_height():
+    """The live failure. On a short shutter the tag pair and the tail both
+    read 255, so a peak comparison is a coin toss — measured at 46-61% correct
+    on rendered balls. Clipping makes a bright blob WIDER, so the light it
+    carries is still there to be counted."""
+    from vision.facing import heading_from_lights
+
+    flat = (120.0, 120.0, 120.0)
+    # Tail on the left: same clipped peak, half the size.
+    group = [big(100, 100, 60, peak=255, core=3.0, bgr=flat),
+             big(140, 100, 60, peak=255, core=4.3, bgr=flat)]
+    got, why = heading_from_lights(group)
+    assert why is None, why
+    assert got["back"] is group[0], "the smaller blob is the tail"
+    assert abs(got["deg"] - 0.0) < 1.0, "heading runs tail -> tags"
+    assert got["conf_ends"] > 0.5, "and it is not a marginal call"
+
+
+def test_a_merged_tag_pair_is_the_centre_not_a_degraded_single_led():
+    """Two tag LEDs close enough to fuse straddle the shell symmetrically, so
+    their merged centroid IS the centre. Reporting that as "one LED" would
+    send somebody hunting an offset that is not there."""
+    from vision.facing import heading_from_lights
+
+    flat = (120.0, 120.0, 120.0)
+    group = [big(100, 100, 60, peak=255, core=3.0, bgr=flat),   # tail
+             big(140, 100, 60, peak=255, core=4.3, bgr=flat)]   # fused pair
+    got, why = heading_from_lights(group)
+    assert why is None, why
+    assert got["centre_from"] == "tag pair, merged"
+    assert abs(got["centre"][0] - 140.0) < 1e-6, "the fused blob IS the centre"
+
+
+def test_a_lone_tag_led_is_still_reported_as_offset():
+    """The guard must not call every two-blob group a merged pair: one tag LED
+    the same size as the tail really is half a spacing ahead of the centre."""
+    from vision.facing import heading_from_lights
+
+    group = [light(100, 100, 60, peak=140), light(140, 100, 60, peak=255)]
+    got, why = heading_from_lights(group)
+    assert why is None, why
+    assert got["centre_from"].startswith("one tag LED")
+
+
+def test_size_and_height_each_carry_the_call_when_the_other_cannot():
+    """The product degrades to whichever factor still has signal."""
+    from vision.facing import heading_from_lights
+
+    flat = (120.0, 120.0, 120.0)
+    # Heights clipped level, sizes differ.
+    a, _ = heading_from_lights([big(100, 100, 60, peak=255, core=3.0, bgr=flat),
+                                big(140, 100, 60, peak=255, core=4.3, bgr=flat)])
+    # Sizes equal, heights differ.
+    b, _ = heading_from_lights([light(100, 100, 60, peak=120, bgr=flat),
+                                light(140, 100, 60, peak=255, bgr=flat)])
+    assert a is not None and b is not None
+    for got in (a, b):
+        assert abs(got["deg"] - 0.0) < 1.0
+
+
+def merged(deg, span=10.0, tag=3.0, core=2.8, size=120, over=3.0):
+    """A ball at the scale this rig actually runs at: three lights so close,
+    and driven so hard, that they bloom into ONE region."""
+    img = np.zeros((size, size), np.float64)
+    r = math.radians(deg)
+    ux, uy = math.cos(r), math.sin(r)
+    yy, xx = np.mgrid[0:size, 0:size]
+    for t, gain in ((-span / 2, 0.6), (-tag / 2, 1.0), (+tag / 2, 1.0)):
+        px, py = 60 + ux * t, 60 + uy * t
+        img += 255.0 * gain * over * np.exp(
+            -((xx - px) ** 2 + (yy - py) ** 2) / (2 * core ** 2))
+    return cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8),
+                        cv2.COLOR_GRAY2BGR)
+
+
+def test_the_peak_reader_really_does_refuse_a_merged_ball():
+    """The premise. At this scale the lights fuse into one region, and a
+    reader that needs two maxima has nothing to work with — which freezes the
+    heading until a frame happens to separate."""
+    from vision.facing import cluster_px, heading_from_lights, lights_px
+
+    spots = lights_px(merged(20.0), min_v=120)
+    assert len(spots) == 1, "the premise is that they merged"
+    got, why = heading_from_lights(cluster_px(spots, 40)[0])
+    assert got is None and "one light" in why
+
+
+def test_a_merged_blob_still_has_an_axis():
+    from vision.facing import blob_axis_px, cluster_px, lights_px
+
+    for true in (0.0, 37.0, 96.0, 214.0, 300.0):
+        f = merged(true)
+        spot = cluster_px(lights_px(f, min_v=120), 40)[0][0]
+        got = blob_axis_px(f, spot)
+        assert got is not None, f"no axis at {true}deg"
+        axis, elong = got
+        read = math.degrees(math.atan2(axis[1], axis[0])) % 180.0
+        # An axis is a line, so 0 and 180 are the same answer: compare the
+        # short way round on a 180-degree circle.
+        off = abs(((read - (true % 180.0) + 90.0) % 180.0) - 90.0)
+        assert off < 4.0, f"axis {read:.1f} for a ball at {true}"
+        assert elong > 1.25
+
+
+def test_a_round_blob_is_refused_rather_than_given_a_noise_axis():
+    """Second moments will happily hand you an axis made of nothing."""
+    from vision.facing import blob_axis_px
+
+    f = np.zeros((80, 80, 3), np.uint8)
+    cv2.circle(f, (40, 40), 6, (255, 255, 255), -1)
+    f = cv2.GaussianBlur(f, (5, 5), 0)
+    spot = {"x": 40.0, "y": 40.0, "core_px": 6.0}
+    assert blob_axis_px(f, spot) is None
+
+
+def test_the_axis_tracks_a_slow_turn_without_freezing():
+    """The live complaint: it took a big rotation before anything moved."""
+    from vision.facing import blob_axis_px, cluster_px, lights_px
+
+    seen = []
+    for i in range(40):
+        f = merged(i * 1.0)
+        spot = cluster_px(lights_px(f, min_v=120), 40)[0][0]
+        got = blob_axis_px(f, spot)
+        assert got is not None, f"refused at {i}deg"
+        seen.append(math.degrees(math.atan2(got[0][1], got[0][0])) % 180.0)
+    steps = [abs(((b - a + 90) % 180) - 90) for a, b in zip(seen, seen[1:])]
+    frozen = sum(1 for v in steps if v < 0.02)
+    assert frozen == 0, f"{frozen} frames read no change at all"
+    assert abs(np.mean(steps) - 1.0) < 0.4, "one degree in, one degree out"
