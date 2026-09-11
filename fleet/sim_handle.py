@@ -10,6 +10,7 @@ from collections import deque
 import numpy as np
 
 from .handle import MAX_SPEED, RobotHandle, now
+from .stillness import IMU_PERIOD_S, Stillness
 
 # Guesses, used only for a robot nothing has measured. Pass `motion=` and the
 # measured numbers take over — see `from_motion`.
@@ -24,6 +25,16 @@ BATTERY_DRAIN_PER_S = 1.0 / (90 * 60)     # a notional 90-minute run
 # delay at 30Hz, and this is the same 30Hz — kept as a named constant so the
 # assumption is visible rather than buried in a rounding.
 SIM_TICK_HZ = 30.0
+
+# A simulated accelerometer, so the stillness veto runs the same code path in
+# sim that it will on a ball. Noise at rest, plus vibration that grows with
+# speed, plus the push of speeding up or braking. The vibration figure is made
+# up, and chosen only so that working speed reads clearly above
+# `stillness.QUIET_G` while the tail of a coast does not -- which is the real
+# ambiguity the command-state half of the rule exists to cover.
+IMU_REST_G = 0.003
+IMU_VIB_G_PER_CM_S = 0.004
+GRAVITY_CM_S2 = 981.0
 
 
 def from_motion(fit):
@@ -113,6 +124,12 @@ class SimRobot(RobotHandle):
 
         self._drift = 0.0
         self._rng = rng
+        # Its OWN generator, so adding a sensor leaves every existing seeded
+        # run's drift and slip draws exactly where they were.
+        self._imu_rng = np.random.default_rng(None if seed is None else seed + 7919)
+        self.imu = Stillness()
+        self._imu_clock = 0.0
+        self._imu_vel = np.zeros(2)
 
         # A guessed latency has no units attached, so it stays a slot count and
         # behaves exactly as it always has. A MEASURED one is a real duration
@@ -198,6 +215,12 @@ class SimRobot(RobotHandle):
             self.queue.appendleft(np.zeros(2))
         self.latency = want
 
+    def accel_quiet(self):
+        return self.imu.quiet(self._t)
+
+    def accel_sigma(self):
+        return self.imu.sigma(self._t)
+
     def step(self, dt):
         self._resize_queue(dt)
         # Heading drift: a bounded random walk, in radians. Bounded because an
@@ -280,6 +303,14 @@ class SimRobot(RobotHandle):
         self.battery = max(0.0, self.battery - BATTERY_DRAIN_PER_S * dt)
         self.last_seen = now()
         self._t += dt
+        self._imu_clock += dt
+        if self._imu_clock >= IMU_PERIOD_S:
+            push = (self.vel - self._imu_vel) / self._imu_clock / GRAVITY_CM_S2
+            spread = IMU_REST_G + IMU_VIB_G_PER_CM_S * float(np.linalg.norm(self.vel))
+            self.imu.add(self._t, np.array([push[0], push[1], 1.0])
+                         + self._imu_rng.normal(0.0, spread, 3))
+            self._imu_vel = self.vel.copy()
+            self._imu_clock = 0.0
         # Same path a real robot takes with no usable gyro, so the camera-only
         # fallback is exercised by the whole suite rather than only on the day
         # a sensor stream drops.
