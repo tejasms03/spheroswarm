@@ -1093,8 +1093,15 @@ def test_decoding_is_relative_to_each_track_not_an_absolute_level():
     import inspect
 
     from coast_test import BlobTest
-    src = inspect.getsource(BlobTest.finish_reid)
+    # The roll call and the resting blink read through one shared reader.
+    assert "read_bits" in inspect.getsource(BlobTest.finish_reid)
+    src = inspect.getsource(BlobTest.read_bits)
     assert "min(means)" in src and "max(means)" in src
+    # And it behaves that way: the same code, near and far, reads the same.
+    reader = BlobTest.__new__(BlobTest)
+    near = [245.0, 73.0, 73.0, 245.0]
+    far = [v * 0.4 for v in near]
+    assert reader.read_bits(near) == reader.read_bits(far) == (1, 0, 0, 1)
 
 
 def test_an_unclaimed_or_contested_code_is_left_unidentified():

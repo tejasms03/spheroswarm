@@ -23,6 +23,7 @@ import numpy as np
 
 from . import sphero_fast
 from .handle import MAX_SPEED, RobotHandle, now, velocity_to_command
+from .stillness import IMU_PERIOD_S, Stillness
 
 log = logging.getLogger("fleet.real")
 
@@ -93,6 +94,8 @@ class SpheroRobot(RobotHandle):
 
         self._api = None
         self._link_up = False
+        self.imu = Stillness()
+        self._imu_read_at = 0.0
         self._stop_flag = threading.Event()
         self._wake = threading.Event()
         self._lock = threading.Lock()
@@ -200,6 +203,30 @@ class SpheroRobot(RobotHandle):
             self._pending = (heading, byte)
             self._force_write = True
         self._wake.set()
+
+    def accel_quiet(self):
+        """From spherov2's accelerometer stream, read at the rate it refreshes.
+
+        `get_acceleration` returns a CACHE that the sensor stream `__enter__`
+        started keeps up to date -- 150 ms a reading on this toy. That it
+        answers instantly is how a streamed value is supposed to behave, not
+        evidence that it is fake (`HANDOFF_CALIB.md` reasoned otherwise). Read
+        on the stream's own clock rather than every tick: sampling one value
+        thirty times a second would count a single reading thirty times.
+        """
+        now = time.monotonic()
+        if now - self._imu_read_at >= IMU_PERIOD_S:
+            self._imu_read_at = now
+            api = self._api
+            try:
+                reading = api.get_acceleration() if api is not None else None
+            except Exception:
+                reading = None
+            self.imu.add(now, reading)
+        return self.imu.quiet(now)
+
+    def accel_sigma(self):
+        return self.imu.sigma(time.monotonic())
 
     def aim_zero(self, error_deg):
         """Move the BALL's zero, instead of carrying a correction forever.

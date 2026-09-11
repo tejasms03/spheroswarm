@@ -87,6 +87,17 @@ a nominal 596 kHz. A read that returns faster than the radio can possibly
 answer never went near the robot: it is a cached struct. The correct design
 branch is **camera-only**, and the probe now says so.
 
+> **Correction (2026-09-11): the reasoning above is wrong.** In `spherov2` the
+> getters are *meant* to be a cache: `get_gyroscope()` is
+> `self.__sensor_data.get('gyroscope')`, filled by sensor-streaming
+> notifications that `SpheroEduAPI.__enter__` starts (v1 `SensorControl`,
+> 150 ms interval). `fleet/real_handle.py` enters it on every connect, and for a
+> SPRK+ it streams `attitude`, `accelerometer`, `gyroscope`, `locator` and
+> `velocity` (g, cm, cm/s). An instant read is what a working stream looks
+> like. Judge the sensors by whether values change every ~150 ms and track real
+> motion — still unverified on hardware. The accelerometer is now used as a
+> veto on "this ball is still" (`fleet/stillness.py`).
+
 **The colour tracking is the weak link.** Sessions repeatedly ran with 5 blobs
 detected for 2 connected robots. Every phantom is something the tracker can
 lock onto, and when it does, every safety mechanism downstream is guarding a

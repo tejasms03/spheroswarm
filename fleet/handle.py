@@ -258,6 +258,19 @@ class RobotHandle(ABC):
     def close(self):
         """Release any hardware. Safe to call on a robot that never connected."""
 
+    def accel_quiet(self):
+        """Is the ball's own accelerometer at rest? True, False, or None.
+
+        None means nothing to say -- no sensor, or a stream gone quiet -- and a
+        caller must treat it as "unknown", never as "still". See
+        `fleet/stillness.py` for why this is only ever half the answer.
+        """
+        return None
+
+    def accel_sigma(self):
+        """The spread behind `accel_quiet`, in g, for a person to read. Or None."""
+        return None
+
     def __repr__(self):
         return f"<{type(self).__name__} {self.code} {self.pos[0]:.0f},{self.pos[1]:.0f}>"
 
