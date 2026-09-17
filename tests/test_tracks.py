@@ -9,7 +9,8 @@ import math
 
 import pytest
 
-from vision.tracks import FLIP_COOLDOWN_S, Tracks, wrap180
+from vision.tracks import (BRIDGE_MAX_S, FLIP_COOLDOWN_S, Tracks,
+                           wrap180)
 
 
 def cluster(cx, cy, deg=0.0, span=40.0):
@@ -414,3 +415,211 @@ def test_turning_while_driving_is_followed_too():
         worst = max(worst, abs(wrap180(t.by_name["B"].heading - deg)))
     assert worst < 2.0, f"drifted {worst:.1f}deg while driving a circle"
     assert t.by_name["B"].flips_caught == 0
+
+
+# -- bridging a camera gap with the ball's own yaw ------------------------
+
+class Ball:
+    """A ball whose sensor yaw is in its OWN frame: offset, and possibly
+    running the opposite way round from the camera's degrees."""
+
+    def __init__(self, deg=0.0, sign=1.0, offset=137.0, drift=0.0):
+        self.deg = float(deg)
+        self.sign, self.offset, self.drift = sign, offset, drift
+        self.t = 0.0
+
+    def turn(self, by):
+        self.deg = (self.deg + by) % 360.0
+
+    def yaw(self, dt=0.0):
+        self.t += dt
+        return (self.sign * self.deg + self.offset + self.drift * self.t) % 360.0
+
+
+def warm(t, ball, name="A", steps=40, by=6.0):
+    """Turn the ball where the camera CAN see it, so the tracker works out how
+    the sensor's yaw relates to its own degrees."""
+    for _ in range(steps):
+        ball.turn(by)
+        t.update([bare(400, 300, deg=ball.deg)], dt=1 / 30.0,
+                 yaws={name: ball.yaw(1 / 30.0)})
+
+
+def test_the_sensor_frame_is_learned_not_assumed():
+    """Sign and scale both come out of watching the two move together. Guessing
+    the sign turns a 90 degree turn into minus 90 — the exact 180 error this
+    is here to prevent."""
+    for sign in (1.0, -1.0):
+        t = Tracks()
+        ball = Ball(sign=sign)
+        t.assign("A", bare(400, 300, deg=0.0), front_px=(420, 300))
+        warm(t, ball)
+        got = t.by_name["A"].yaw_gain
+        assert got is not None, f"never fitted for sign {sign}"
+        assert abs(got - sign) < 0.15, f"fitted {got} for sign {sign}"
+
+
+def test_a_hidden_turn_no_longer_comes_back_reversed():
+    """The failure found on 2026-09-10: hidden two thirds of a second, turned
+    more than about 110 degrees, and it returned silently 180 out."""
+    for turned in (60, 80, 100, 120, 150, 170):
+        t = Tracks()
+        ball = Ball(sign=-1.0)
+        t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+        warm(t, ball)
+        start = ball.deg
+
+        for _ in range(20):                     # hidden, turning all the while
+            ball.turn(turned / 20.0)
+            t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+        assert t.by_name["A"].bridged, "it should be carrying the heading"
+
+        t.update([bare(400, 300, deg=ball.deg)], dt=1 / 30.0,
+                 yaws={"A": ball.yaw(1 / 30.0)})
+        got = t.by_name["A"]
+        assert not got.bridged, "the camera is back; it must stop estimating"
+        assert abs(wrap180(got.heading - ball.deg)) < 10.0, (
+            f"turned {turned} while hidden, came back {got.heading:.0f} "
+            f"instead of {ball.deg:.0f}")
+        assert abs(wrap180(ball.deg - start - turned)) < 1.0, "sanity"
+
+
+def test_without_the_sensor_the_old_behaviour_is_unchanged():
+    """A caller with no sensor passes nothing and loses nothing — including
+    the old failure, which is honest rather than silently patched."""
+    t = Tracks()
+    t.assign("A", bare(400, 300, deg=0.0), front_px=(420, 300))
+    for _ in range(20):
+        t.update([], dt=1 / 30.0)
+    assert not t.by_name["A"].bridged
+    t.update([bare(400, 300, deg=150.0)], dt=1 / 30.0)
+    assert t.by_name["A"].lost or True      # it simply does not bridge
+
+
+def test_bridging_is_refused_until_the_frame_is_established():
+    """A sensor nobody has related to the camera yet is not evidence."""
+    t = Tracks()
+    ball = Ball()
+    t.assign("A", bare(400, 300, deg=0.0), front_px=(420, 300))
+    t.update([bare(400, 300, deg=0.0)], dt=1 / 30.0, yaws={"A": ball.yaw()})
+    assert t.by_name["A"].yaw_gain is None
+    for _ in range(10):
+        ball.turn(5.0)
+        t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+    assert not t.by_name["A"].bridged, "it bridged on a relationship it had not learned"
+
+
+def test_a_sensor_that_does_not_track_is_never_used():
+    """If yaw and the camera do not move together, the fit lands outside its
+    limits and bridging is refused. The sensor is checked continuously,
+    against the camera, for free."""
+    t = Tracks()
+    t.assign("A", bare(400, 300, deg=0.0), front_px=(420, 300))
+    frozen = 88.0
+    for i in range(60):
+        t.update([bare(400, 300, deg=(i * 6.0) % 360.0)], dt=1 / 30.0,
+                 yaws={"A": frozen})           # the sensor says nothing ever
+    assert t.by_name["A"].yaw_gain is None
+    for _ in range(10):
+        t.update([], dt=1 / 30.0, yaws={"A": frozen})
+    assert not t.by_name["A"].bridged
+
+
+def test_the_bridge_gives_up_rather_than_drifting_for_ever():
+    t = Tracks()
+    ball = Ball()
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    seen = []
+    for _ in range(int(30 * (BRIDGE_MAX_S + 1.5))):
+        ball.turn(1.0)
+        t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+        seen.append(t.by_name["A"].bridged)
+    assert seen[0] and not seen[-1], "it must start bridging and then stop"
+    held = sum(seen) / 30.0
+    assert abs(held - BRIDGE_MAX_S) < 0.5, f"bridged for {held:.1f}s"
+
+
+def test_a_bridged_heading_is_flagged_not_passed_off_as_a_reading():
+    t = Tracks()
+    ball = Ball()
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+    got = t.by_name["A"]
+    assert got.bridged and got.lost, "an estimate is not a live reading"
+    assert "own yaw" in (got.why or "")
+
+
+def test_sensor_drift_does_not_break_the_end_choice():
+    """The bar is 90 degrees, not one. Even a badly drifting sensor has a
+    minute of margin on a gap that lasts a fraction of a second."""
+    t = Tracks()
+    ball = Ball(sign=-1.0, drift=8.0)       # 8 deg/s of drift, far worse than real
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    for _ in range(20):
+        ball.turn(7.0)
+        t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+    t.update([bare(400, 300, deg=ball.deg)], dt=1 / 30.0,
+             yaws={"A": ball.yaw(1 / 30.0)})
+    assert abs(wrap180(t.by_name["A"].heading - ball.deg)) < 10.0
+
+
+# -- re-zeroing the ball under the tracker ---------------------------------
+
+def test_a_rezero_jump_is_not_learned_as_a_turn():
+    """Told to call its orientation zero, the ball's yaw jumps by the old angle
+    while nothing moves. Fitted as a turn, that one step swamps every real
+    one."""
+    t = Tracks()
+    ball = Ball(sign=-1.0)
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    before = t.by_name["A"].yaw_gain
+    assert before is not None
+
+    ball.offset += 140.0                    # the sensor re-zeroes; ball is still
+    for _ in range(5):
+        t.update([bare(400, 300, deg=ball.deg)], dt=1 / 30.0,
+                 yaws={"A": ball.yaw(1 / 30.0)})
+    assert abs(t.by_name["A"].yaw_gain - before) < 0.1, \
+        f"gain moved from {before:.2f} to {t.by_name['A'].yaw_gain:.2f}"
+
+
+def test_a_fast_real_spin_is_still_learned():
+    """The jump guard must not reject genuine big steps — the camera sees
+    those."""
+    t = Tracks()
+    ball = Ball(sign=1.0)
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    for _ in range(20):
+        ball.turn(40.0)                     # 40 degrees a frame, all real
+        t.update([bare(400, 300, deg=ball.deg)], dt=1 / 30.0,
+                 yaws={"A": ball.yaw(1 / 30.0)})
+    assert t.by_name["A"].yaw_gain is not None
+    assert abs(t.by_name["A"].yaw_gain - 1.0) < 0.2
+
+
+def test_rezeroed_forgets_the_anchor_but_keeps_the_gain():
+    t = Tracks()
+    ball = Ball()
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    gain = t.by_name["A"].yaw_gain
+    t.rezeroed("A")
+    got = t.by_name["A"]
+    assert got._anchor_yaw is None and got._last_yaw is None
+    assert got.yaw_gain == gain, "re-zeroing moves the origin, not the scale"
+
+
+def test_a_bridge_refuses_an_impossible_turn():
+    """A re-zero landing inside a camera gap would otherwise bridge the heading
+    straight to fiction."""
+    t = Tracks()
+    ball = Ball()
+    t.assign("A", bare(400, 300, deg=ball.deg), front_px=(420, 300))
+    warm(t, ball)
+    ball.offset += 150.0                    # jump, with the camera blind
+    t.update([], dt=1 / 30.0, yaws={"A": ball.yaw(1 / 30.0)})
+    assert not t.by_name["A"].bridged

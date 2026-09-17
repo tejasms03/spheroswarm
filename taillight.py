@@ -135,6 +135,11 @@ from vision.facing import (ANNULUS, LIGHT_MIN_V, MIN_TAG_SAT,
 from vision.homography import Homography
 from vision.tracks import Tracks, wrap180
 from vision.synthetic import open_source
+from pathlib import Path
+from bench_agent import BenchAgent
+from bench_calib import CalibWalk
+from bench_record import RunRecorder, TrackRecorder
+from swarm import ball_calib
 
 W, H = 1480, 1030
 """The window. Taller than the view needs, because the control column is what
@@ -583,9 +588,41 @@ class Lab:
         self.disconnect(ble_name)
         return self.connect(ble_name, color=color)
 
+    def chassis_yaw(self, robot):
+        """This ball's own yaw in degrees, or None.
+
+        `get_orientation` reads a streaming cache that spherov2 fills about
+        every 150ms, so this is a dictionary lookup rather than a radio round
+        trip and is safe to call every frame. It returns None until the first
+        packet lands, and None is exactly the right answer then.
+
+        Kept HERE rather than in `vision/`, which knows nothing about Spheros
+        or Bluetooth and takes plain numbers.
+        """
+        api = getattr(robot, "_api", None)
+        fn = getattr(api, "get_orientation", None) if api is not None else None
+        if fn is None:
+            return None
+        try:
+            got = fn()
+        except Exception:
+            return None
+        if not isinstance(got, dict) or got.get("yaw") is None:
+            return None
+        return float(got["yaw"])
+
+    def yaws(self):
+        """Every connected ball's own yaw, for bridging a camera gap."""
+        out = {}
+        for ble, robot in self.robots.items():
+            got = self.chassis_yaw(robot)
+            if got is not None:
+                out[ble] = got
+        return out
+
     def track(self, clusters, dt):
         """Carry the assigned identities onto this frame's clusters."""
-        return self.tracks.update(clusters, dt)
+        return self.tracks.update(clusters, dt, yaws=self.yaws())
 
     def px_per_cm(self, at_px):
         """Source pixels per centimetre, AT this point in the frame.
@@ -745,6 +782,66 @@ class App:
         self.held = None                # bearing being commanded, or None
         self.aim = 0.0                  # the bearing the arrows steer
         self.drive_byte = 90
+        self.turn_lead = 25.0       # deg the command may ever lead the facing
+        self.aim_band = 8.0         # deg inside which the turn is finished
+        # How a leg turns. "rate": spin on raw motor power and stop inside the
+        # deadband. "heading": command a heading a little ahead of the facing.
+        self.turn_mode = "rate"
+        self.spin_power = 50.0
+        # Which way a positive motor power turns each ball, as seen by the
+        # camera. Learned by watching, never assumed; `spin_sign_known` holds
+        # the balls for which it has been confirmed.
+        self.spin_sign = {}
+        self.spin_sign_known = set()
+        # Wrong readings in a row against a KNOWN spin direction. Two overturn
+        # it: one noisy reading must not, but a lock that is wrong must not
+        # last the whole session either.
+        self.spin_wrong = {}
+        # The tapered turn's own learning, per ball: the power that breaks it
+        # free, the least that keeps it turning, and how far it runs on after
+        # a stop. Separate from the rate turn's, which is left as it was.
+        self.taper = {}
+        # Line following. `line_pick` collects the start and end clicks.
+        # `steer_sign` is which way a positive HEADING turns each ball as the
+        # camera sees it — distinct from `spin_sign`, which is about raw motor
+        # power, and only needed once a leg steers while it drives.
+        self.line_pick = None
+        self.lookahead_cm = 12.0
+        self.steer_sign = {}
+        self.line_stats = None
+        self.calib_result = None
+        self.calib = None
+        # Polyline and freehand paths. `path_pick` is {"kind", "pts", "drawing"}
+        # while one is being drawn; `path_stats` the last finished one.
+        self.path_pick = None
+        self.path_stats = None
+        # Orbits. `orbit_pick` collects the centre then the edge click;
+        # `orbit_run` is the orbit being driven, lap chunk after lap chunk.
+        self.orbit_pick = None
+        self.orbit_run = None
+        self.orbit_dir = "ccw"
+        # Patrols: waypoints driven round and round (loop) or there and back.
+        self.patrol_pick = None
+        self.patrol_run = None
+        self.patrol_style = "loop"
+        # The job supervisor: whatever was asked for gets done. A run that
+        # stops for any reason but the user restarts from where the ball is.
+        # `stop_p2p` is watched, not changed, so it knows WHY a run ended.
+        self.job = None
+        self.retries = 0
+        self._last_stop = None
+        self._stop_p2p_inner = self.stop_p2p
+        self.stop_p2p = self._stop_p2p_watched
+        # A language model driving the same jobs: `t` opens the command bar.
+        self.agent = BenchAgent(self)
+        # Every run, frame by frame, to runs/p2p when it ends. Reads only.
+        self.recorder = RunRecorder(self)
+        # Every tracked ball every frame, only while `r` has it switched on.
+        self.track_recorder = TrackRecorder(self)
+        # p2p as a path: `o` switches clicks between the original spin-then-
+        # drive and pursuit along a straight path to the target.
+        self.pursuit_p2p = False
+        self._pursuit_pending = None
         self._drive_sent = None
         self._drive_at = 0.0
         self._tag_before = "colour"
@@ -753,6 +850,16 @@ class App:
         # ball and averaging two balls together describes neither.
         self.aim_samples = {}
         self._last_aim = None
+        # The north test: a timed burst at arena zero, so the saved offset can
+        # be checked against the floor rather than argued about.
+        self.north_until = None
+        self.north_bearing = None
+        self.north_seen = []
+        self.north_result = None
+        # Point to point: `p2p_pick` while waiting for a click, `p2p` while
+        # driving. See `start_p2p`.
+        self.p2p_pick = False
+        self.p2p = None
         # Who we are waiting to be told about, while assigning.
         self.assigning = None
         self.last_tick = time.time()
@@ -997,6 +1104,8 @@ class App:
         if name is None:
             self.held = None
             return
+        if self.north_until is not None or self.p2p is not None:
+            return          # a running test owns the radio until it is done
         keys = pygame.key.get_pressed()
         turn = int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
         go = int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])
@@ -1083,6 +1192,2083 @@ class App:
         if made is None:
             return None
         return self.held, made, wrap180(self.held - made)
+
+    # -- does north actually go north ------------------------------------
+
+    NORTH_SETTLE_S = 2.5
+    """Longest to wait for the turn to finish. A half turn at the drive
+    assembly's own rate is well under a second; the rest is margin for the
+    command lag and a ball that has to swing the long way round."""
+    NORTH_STILL_DEG = 2.5
+    """Two readings this close, a few frames apart, and the turn has landed."""
+
+    def saved_offset(self, ble_name):
+        """This ball's stored heading offset, and where it came from."""
+        try:
+            from fleet.roster import Roster
+            entry = next((e for e in Roster.load().entries
+                          if e.ble_name == ble_name), None)
+        except Exception:
+            entry = None
+        if entry is None:
+            return 0.0, "no roster row — testing the ball's own zero"
+        return float(entry.heading_offset or 0.0), f"roster {entry.code}"
+
+    def ball_px(self, name):
+        """Where this ball is, in frame pixels, from the track that follows it.
+
+        The TRACK rather than the frame's biggest cluster: with several balls
+        lit, the biggest cluster is whichever one happens to be nearest the
+        camera, and a leg aimed from another robot's position goes somewhere
+        nobody asked for.
+        """
+        t = self.lab.tracks.by_name.get(name)
+        return t.centre if t is not None else None
+
+    def ball_fresh(self, name):
+        """Is this frame's position a MEASUREMENT, or the last one held?"""
+        t = self.lab.tracks.by_name.get(name)
+        return t is not None and not t.lost
+
+    def arena_heading(self, name):
+        """Which way this ball POINTS, as an arena compass bearing.
+
+        The track carries image degrees. Taken through the homography as two
+        POINTS rather than as an angle, because a perspective map does not
+        preserve angles — rotating a bearing by whatever the matrix does at the
+        frame centre is wrong everywhere else in a tilted view, and a tilted
+        view is what an overhead camera on a tripod is.
+        """
+        # NOT gated on `lost`. A lost track is exactly when the tracker is
+        # earning its keep: continuity and the ball's own yaw carry the
+        # heading through a gap, and refusing it here would throw away the
+        # fusion at the only moment it matters.
+        t = self.lab.tracks.by_name.get(name)
+        if t is None or self.lab.hom is None:
+            return None
+        a = np.asarray(t.centre, dtype=float)
+        r = math.radians(t.heading)
+        b = a + np.array([math.cos(r), math.sin(r)]) * 30.0
+        return bearing_cm(a.tolist(), b.tolist(), self.lab.hom)
+
+    def start_north(self):
+        """Ask it to face arena north, then look at which way it is facing.
+
+        NO DRIVING. The heading is readable standing still, so the aim frame
+        can be checked without the ball travelling a centimetre — which also
+        means it cannot reach a wall while being wrong, and it can be repeated
+        at any bearing from anywhere on the floor.
+
+        `heading_offset` is what turns "face north" into a bearing this
+        particular ball understands. Until it is right, every leg the
+        calibration battery drives goes somewhere else — which is what stopped
+        it, on every stage, with "drove 12cm AWAY from the middle".
+        """
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to aim — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so its heading is not being "
+                     "followed — press i and click its front light", SUN)
+            return
+        off, source = self.saved_offset(name)
+        self.north_bearing = (0.0 + off) % 360.0
+        self.north_until = time.time() + self.NORTH_SETTLE_S
+        self.north_seen = []
+        self.north_result = None
+        try:
+            # Speed ZERO: a Sphero told to roll at nothing turns on the spot.
+            self.lab.robots[name].drive_raw(self.north_bearing, 0)
+        except Exception as e:
+            self.say(f"{name}: {e}", CORAL)
+            self.north_until = None
+            return
+        self.say(f"{name}: turning to face ARENA NORTH — sending "
+                 f"{self.north_bearing:.0f} ({source}, offset {off:+.0f}). "
+                 f"It should not travel.", CHALK)
+
+    def north_tick(self):
+        """Watch the turn land, then say where it ended up pointing."""
+        if self.north_until is None:
+            return
+        name = self.drive_target()
+        if name is None:
+            self.north_until = None
+            return
+        got = self.arena_heading(name)
+        if got is not None:
+            self.north_seen.append(got)
+            self.north_seen = self.north_seen[-4:]
+
+        settled = (len(self.north_seen) >= 4
+                   and max(abs(wrap180(v - self.north_seen[-1]))
+                           for v in self.north_seen) < self.NORTH_STILL_DEG)
+        if not settled and time.time() < self.north_until:
+            return
+
+        self.north_until = None
+        if got is None:
+            self.say("lost sight of it, so there is no heading to read", SUN)
+            return
+        err = wrap180(got - 0.0)
+        self.north_result = (got, err, settled)
+        late = "" if settled else "  (still moving when time ran out)"
+        if abs(err) < 8:
+            self.say(f"NORTH IS NORTH — asked 0, it faces {got:.0f}deg "
+                     f"({err:+.0f}){late}. The aim frame is good.", MINT)
+        else:
+            self.say(f"asked north, it faces {got:.0f}deg — the aim frame is "
+                     f"{err:+.0f} out{late}. Add that to heading_offset.",
+                     CORAL)
+
+    # -- point to point ---------------------------------------------------
+
+    P2P_CM_S = 6.0
+    """Commanded speed, in centimetres per second — the units coast_test's own
+    slider uses, not a raw byte. Slow on purpose: this is the first thing the
+    aim frame has ever been asked to do for real, and a leg that goes wrong at
+    6cm/s is a leg you can watch go wrong."""
+    P2P_AIM_TOL = 8.0
+    """How close the MEASURED heading must come to the bearing before it
+    drives. Closed on the camera rather than assumed — which is the whole
+    difference this week has bought: before, a turn was commanded and hoped
+    for."""
+    P2P_ARRIVE_CM = 5.0
+    P2P_BLIND_S = 2.0
+    """How long a leg may run on a held position while the camera cannot see
+    the ball. Single missed frames are normal — measured, 32 of them in 35
+    seconds — and abandoning a leg for one is a leg that can never finish. It
+    coasts while blind rather than driving on a stale fix, and gives up only
+    when the gap has gone on long enough to mean something."""
+    P2P_AIM_TIMEOUT_S = 8.0
+    P2P_RUN_TIMEOUT_S = 40.0
+    P2P_AIM_HOLD = 2
+    P2P_SETTLE_S = 0.3
+    """After stopping a spin, how long to let the chassis coast before judging
+    where it ended up. A reading taken while it is still moving is not where
+    it stopped."""
+    P2P_PROBE_S = 0.35
+    P2P_PROBE_DEG = 4.0
+    """How far it must turn before that says which WAY it turned. Below this
+    it is tracker noise, and learning a direction from noise flips it at
+    random."""
+    P2P_STALL_S = 1.6
+    """Spinning this long without turning P2P_PROBE_DEG means the power is too
+    low to overcome friction — not a slow turn, no turn."""
+    P2P_REAIM_DEG = 25.0
+    P2P_REAIM_MIN_CM = 12.0
+    """Close to the target the bearing swings wildly for a sideways error of a
+    centimetre or two, so drifting off the line is only a reason to stop and
+    re-aim while there is still distance to cover."""
+    P2P_AWAY_CM = 4.0
+    P2P_MAX_REAIMS = 4
+    """Re-aims in a row that got it no CLOSER. Not a count of re-aims: a long
+    leg that re-aims ten times while steadily closing in is working, and a
+    fixed cap would abandon it for being long. What this stops is hunting —
+    turning, driving, turning again, and ending up no nearer."""
+    P2P_PROGRESS_CM = 3.0
+    P2P_MAX_SIGN_FLIPS = 2
+    P2P_OFFSET_GAIN = 0.15
+    """How fast the ball-frame estimate is adapted. Gentle: during a turn the
+    measured facing lags the command, so a large gain would read that lag as
+    frame error and chase it."""
+    """Consecutive in-tolerance readings before the turn counts as finished.
+    One can be a single noisy frame caught mid-swing."""
+
+    def p2p_byte(self):
+        """`P2P_CM_S` as a speed byte, through the ball's own speed map.
+
+        `SpeedMap` rounds UP to the deadband: below it a Sphero does not creep,
+        it sits. So a slow leg is the slowest one that actually moves, rather
+        than a number that means nothing.
+        """
+        from swarm.trace import SpeedMap
+        fit = (config.load("motion", {}) or {}).get(self.drive_target() or "")
+        sm = (SpeedMap.from_motion(fit) if fit
+              else SpeedMap(min_moving_byte=18))
+        return int(sm.byte_for(self.P2P_CM_S)), sm
+
+    def start_p2p(self):
+        """Arm the click that picks where to go. Pressing again cancels."""
+        if self.p2p is not None or self.p2p_pick:
+            self.stop_p2p("cancelled")
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so there is no heading to aim "
+                     "with — press i and click its front light", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration, so a target in cm means nothing "
+                     "— press c and pick the corners", SUN)
+            return
+        self.p2p_pick = True
+        byte, _ = self.p2p_byte()
+        self.say(f"click where {name} should go — it will turn, then drive at "
+                 f"{self.P2P_CM_S:.0f}cm/s (byte {byte})", CHALK)
+        self._build()
+
+    def toggle_turn_mode(self):
+        if self.p2p is not None:
+            self.say("stop the leg before changing how it turns", SUN)
+            return
+        self.turn_mode = "heading" if self.turn_mode == "rate" else "rate"
+        self.say("turn by " + (
+            "SPINNING on motor power, stopping inside the aim band"
+            if self.turn_mode == "rate" else
+            "commanding a heading a little ahead of the facing"))
+        self._build()
+
+    def p2p_click(self, pos):
+        """A click in the view becomes the target."""
+        if not self.p2p_pick or self._shot is None:
+            return
+        (ox, oy), k = self._shot
+        target = ((pos[0] - ox) / k, (pos[1] - oy) / k)
+        self.p2p_pick = False
+        # `send` is the bearing being COMMANDED, which is in the ball's own
+        # frame and need not match the arena's. It starts at the stored offset
+        # purely as a first guess and is then corrected by what the camera
+        # sees, so a wrong or missing offset costs a step, not the leg.
+        off, _ = self.saved_offset(self.drive_target())
+        self.p2p = {"target": target, "phase": "aim", "at": time.time(),
+                    "name": self.drive_target(), "sent": None, "good": 0,
+                    "start_gap": None, "closest": None, "offset": off}
+        self.say("aiming…", CHALK)
+        self._build()
+
+    def p2p_geometry(self):
+        """(bearing to the target, distance in cm), or None."""
+        got = self.p2p
+        if got is None:
+            return None
+        here = self.ball_px(got["name"])
+        if here is None:
+            return None
+        bearing = bearing_cm(list(here), list(got["target"]), self.lab.hom)
+        if bearing is None:
+            return None
+        pa, pb = self.lab.hom.to_cm([list(here), list(got["target"])])
+        gap = float(np.linalg.norm(np.asarray(pb, float)[:2]
+                                   - np.asarray(pa, float)[:2]))
+        return bearing, gap
+
+    def stop_p2p(self, why, tone=None):
+        name = (self.p2p or {}).get("name") or self.drive_target()
+        robot = self.lab.robots.get(name) if name else None
+        if robot is not None:
+            try:
+                robot.stop()
+            except Exception:
+                pass
+        kind = (self.p2p or {}).get("kind", "p2p")
+        self.p2p, self.p2p_pick, self.line_pick = None, False, None
+        self.say(f"{'line' if kind == 'line' else 'point to point'}: {why}",
+                 tone or DIM)
+        self._build()
+
+    def p2p_tick(self):
+        """One step of turn-and-go. Called once a frame."""
+        got = self.p2p
+        if got is None:
+            return
+        name = got["name"]
+        robot = self.lab.robots.get(name)
+        if robot is None:
+            self.stop_p2p("the ball went away", CORAL)
+            return
+        limit = got.get("timeout", self.P2P_RUN_TIMEOUT_S)
+        if time.time() - got["at"] > limit:
+            self.stop_p2p("timed out", CORAL)
+            return
+        geo = self.p2p_geometry()
+        if geo is None:
+            self.stop_p2p("no position at all for it — stopping rather than "
+                          "driving blind", CORAL)
+            return
+
+        # A GAP IS NOT A FAILURE. Coast through it: stop commanding, so the
+        # ball rolls to a halt rather than driving on a position that is no
+        # longer being measured, but keep the leg alive.
+        if not self.ball_fresh(name):
+            # A roll command lapses on its own after a couple of seconds, but
+            # the library keeps raw motors alive every 0.8s indefinitely — so a
+            # spin left running while blind would spin for ever.
+            if getattr(robot, "spinning", False):
+                robot.stop_raw()
+                self.lab.tracks.rezeroed(name)
+                got["spin_dir"] = 0
+                got["ball_h"] = 0.0             # stopping re-zeroes
+            blind = got.get("blind_from")
+            if blind is None:
+                got["blind_from"] = blind = time.time()
+            if time.time() - blind > self.P2P_BLIND_S:
+                self.stop_p2p(
+                    f"could not see it for {self.P2P_BLIND_S:.0f}s — stopping",
+                    CORAL)
+            return
+        got["blind_from"] = None
+        bearing, gap = geo
+        if got["start_gap"] is None:
+            got["start_gap"] = gap
+        got["closest"] = gap if got["closest"] is None else min(got["closest"], gap)
+
+        facing = self.arena_heading(name)
+        now = time.time()
+        if facing is None:
+            return                      # nothing to steer by this frame
+
+        if got.get("path") is not None and got.get("stage") == "follow":
+            self._path_follow(got, robot, name, facing, now)
+            return
+        if got.get("stage") in ("check", "follow"):
+            self._line_tick(got, robot, name, facing, now)
+            return
+
+        if (self.turn_mode == "taper" and got["phase"] == "aim"
+                and callable(getattr(robot, "spin_raw", None))):
+            self._p2p_taper(got, robot, name, bearing, gap, facing, now)
+            return
+        if (self.turn_mode in ("rate", "taper")
+                and callable(getattr(robot, "spin_raw", None))):
+            self._p2p_rate(got, robot, name, bearing, gap, facing, now)
+            return
+
+        # THE WHOLE CONTROLLER (heading mode).
+        #
+        # `roll` takes a FINAL angle and the ball slews there at its own rate,
+        # which is what overshoots: hand it a 150 degree error and it arrives
+        # at speed with nothing left to stop it. So it is never told the final
+        # angle — only a point `turn lead` degrees ahead of where it is
+        # actually facing now. It is always chasing something close, which is
+        # a rate limit imposed from outside a loop we cannot see into, and the
+        # deadband is what ends the turn rather than the ball's own braking.
+        err = wrap180(bearing - facing)
+        lead = max(-self.turn_lead, min(self.turn_lead, err))
+        inside = abs(err) <= self.aim_band
+        want = facing if inside else (facing + lead)
+        send = (want + got["offset"]) % 360.0
+
+        # Adapt the ball-frame estimate from what actually happened: if it were
+        # right, a command of `send` would have left it facing `send - offset`.
+        # Gentle, because during a turn the facing lags the command and that
+        # lag is not frame error.
+        last = got.get("sent")
+        if last is not None:
+            residual = wrap180(last[0] - facing - got["offset"])
+            got["offset"] = (got["offset"]
+                             + self.P2P_OFFSET_GAIN * residual) % 360.0
+
+        got["good"] = got["good"] + 1 if inside else 0
+
+        if got["phase"] == "aim":
+            if got["good"] >= self.P2P_AIM_HOLD:
+                if self._p2p_aimed(got, robot, facing, now):
+                    return
+                got["phase"], got["at"], got["sent"] = "go", time.time(), None
+                self.say(f"aimed — facing {facing:.0f}, wanted "
+                         f"{bearing:.0f}. {gap:.0f}cm to run", MINT)
+                return
+            if now - got["at"] > self.P2P_AIM_TIMEOUT_S:
+                # NEVER drive on a turn that did not finish. Doing that is how
+                # a leg sets off on a heading the ball never reached, which
+                # from outside looks like it moved at random.
+                self.stop_p2p(
+                    "could not finish the turn — wanted "
+                    f"{bearing:.0f}deg, "
+                    + (f"stuck facing {facing:.0f}" if facing is not None
+                       else "no heading to read")
+                    + ". NOT driving.", CORAL)
+                return
+            self._p2p_send(robot, send, 0, always=True)
+            return
+
+        # ARRIVAL NEEDS A LIVE FIX. `ball_px` already refuses a lost track, so
+        # reaching here means the position is this frame's — but the gap must
+        # also have actually come down, or a target clicked on top of the ball
+        # reads as an arrival that never drove anywhere.
+        if gap <= self.P2P_ARRIVE_CM:
+            self._p2p_arrived(got, robot, gap)
+            return
+        byte, _ = self.p2p_byte()
+        self._p2p_send(robot, send, byte, always=True)
+
+    def _p2p_rate(self, got, robot, name, bearing, gap, facing, now):
+        """Turn by SPINNING, stop inside the deadband, then drive straight on.
+
+        No heading is commanded during the turn at all. `roll(heading, 0)`
+        hands the ball a final angle and it slews there flat out, which is what
+        overshoots and cannot be slowed from outside. Here the motors are given
+        a power — the turn RATE — and the camera decides when to stop.
+
+        Stopping re-zeroes the ball where it points (see `stop_raw`), so
+        driving straight on afterwards is `roll(0, speed)`: no stored offset,
+        no frame to get the wrong way round.
+        """
+        err = wrap180(bearing - facing)
+
+        if got["phase"] == "aim":
+            if now - got["at"] > self.P2P_AIM_TIMEOUT_S:
+                robot.stop()
+                self.stop_p2p(
+                    f"could not settle on {bearing:.0f}deg — still "
+                    f"{err:+.0f} off after {self.P2P_AIM_TIMEOUT_S:.0f}s. If it "
+                    "kept overshooting, lower spin power or widen aim band. "
+                    "NOT driving.", CORAL)
+                return
+
+            if abs(err) <= self.aim_band:
+                if got.get("spin_dir"):
+                    # Inside the band: stop, and let the coast finish before
+                    # deciding whether that was close enough.
+                    robot.stop_raw()
+                    got["ball_h"] = 0.0             # stopping re-zeroes
+                    self.lab.tracks.rezeroed(name)
+                    got["spin_dir"], got["probe"] = 0, None
+                    got["settle_until"] = now + self.P2P_SETTLE_S
+                    got["good"] = 0
+                    return
+                if now < got.get("settle_until", 0.0):
+                    return
+                got["good"] += 1
+                if got["good"] >= self.P2P_AIM_HOLD:
+                    if self._p2p_aimed(got, robot, facing, now):
+                        return
+                    got["phase"], got["at"] = "go", now
+                    got["best_gap"] = gap
+                    got["sent"] = None
+                    self.say(f"aimed — facing {facing:.0f}, wanted "
+                             f"{bearing:.0f} ({err:+.0f}). {gap:.0f}cm to run",
+                             MINT)
+                return
+
+            got["good"] = 0
+            if now < got.get("settle_until", 0.0):
+                return                  # still coasting from the last stop
+
+            want = 1 if err > 0 else -1
+            if want != got.get("spin_dir", 0):
+                reversing = bool(got.get("spin_dir"))
+                got["spin_dir"], got["probe"] = want, None
+                # A reversal starts with the chassis still turning the OLD way;
+                # probing straight away would read that coast as the motors
+                # turning backwards, and flip a direction that was right.
+                got["probe_after"] = now + (self.P2P_SETTLE_S if reversing
+                                            else 0.0)
+
+            if got["probe"] is None:
+                if now >= got.get("probe_after", 0.0):
+                    got["probe"] = (now, facing, want)
+            else:
+                t0, f0, asked = got["probe"]
+                moved = wrap180(facing - f0)
+                if abs(moved) >= self.P2P_PROBE_DEG:
+                    if (moved > 0) == (asked > 0):
+                        self.spin_sign_known.add(name)
+                        self.spin_wrong[name] = 0
+                    elif (name not in self.spin_sign_known
+                          or self.spin_wrong.get(name, 0) + 1 >= 2):
+                        self.spin_sign_known.discard(name)
+                        self.spin_wrong[name] = 0
+                        self.spin_sign[name] = -self.spin_sign.get(name, 1)
+                        got["flips"] = got.get("flips", 0) + 1
+                        if got["flips"] > self.P2P_MAX_SIGN_FLIPS:
+                            robot.stop()
+                            self.stop_p2p(
+                                "cannot tell which way the motors turn it — "
+                                "the heading is not following the spin. NOT "
+                                "driving.", CORAL)
+                            return
+                        self.say(f"{name} spins the other way to what was "
+                                 "asked — reversed", SUN)
+                    else:
+                        self.spin_wrong[name] = self.spin_wrong.get(name, 0) + 1
+                    got["probe"] = None
+                    got["probe_after"] = now
+                elif now - t0 >= self.P2P_STALL_S:
+                    robot.stop()
+                    self.stop_p2p(
+                        f"spin power {self.spin_power:.0f} did not turn it in "
+                        f"{self.P2P_STALL_S:.1f}s — raise spin power. NOT "
+                        "driving.", CORAL)
+                    return
+
+            power = int(round(self.spin_power * want
+                              * self.spin_sign.get(name, 1)))
+            self._p2p_spin(robot, power)
+            return
+
+        # GO: straight ahead of wherever the spin stopped, which is heading 0.
+        if gap <= self.P2P_ARRIVE_CM:
+            self._p2p_arrived(got, robot, gap)
+            return
+        got["best_gap"] = min(got.get("best_gap", gap), gap)
+        why = None
+        if gap > self.P2P_REAIM_MIN_CM and abs(err) > self.P2P_REAIM_DEG:
+            why = f"drifted {err:+.0f}deg off the line"
+        elif gap > got["best_gap"] + self.P2P_AWAY_CM:
+            why = "going away from the target"
+        if why is not None:
+            last = got.get("reaim_gap")
+            if last is None or got["best_gap"] <= last - self.P2P_PROGRESS_CM:
+                got["stale_reaims"] = 0         # it did get closer: carry on
+            else:
+                got["stale_reaims"] = got.get("stale_reaims", 0) + 1
+            got["reaim_gap"] = got["best_gap"]
+            got["reaims"] = got.get("reaims", 0) + 1
+            if got["stale_reaims"] >= self.P2P_MAX_REAIMS:
+                self.stop_p2p(
+                    f"{why}, and {self.P2P_MAX_REAIMS} re-aims in a row got it "
+                    f"no closer than {got['best_gap']:.0f}cm — stopping", CORAL)
+                return
+            robot.stop()
+            got["phase"], got["at"] = "aim", now
+            got["spin_dir"], got["probe"], got["good"] = 0, None, 0
+            got["settle_until"] = now + self.P2P_SETTLE_S
+            self.say(f"{why} — stopping to re-aim", SUN)
+            return
+        byte, _ = self.p2p_byte()
+        self._p2p_send(robot, 0.0, byte, always=True)
+
+    # -- the tapered turn ------------------------------------------------------
+
+    TAPER_START_KICK = 45.0
+    TAPER_MIN_KEEP = 15.0
+    TAPER_MAX_POWER = 120.0
+    TAPER_DEG = 60.0
+    """Inside this many degrees the power eases off toward `keep`."""
+    TAPER_RAMP_PER_S = 60.0
+    TAPER_MOVE_DEG = 4.0
+    TAPER_WINDOW_S = 0.4
+    TAPER_SETTLE_S = 0.4
+    TAPER_SETTLE_MAX_S = 2.0
+    TAPER_STILL_DEG = 2.0
+    TAPER_MAX_LEAD = 30.0
+    TAPER_AIM_TIMEOUT_S = 12.0
+    TAPER_STALL_S = 5.0
+
+    def _taper_learned(self, name):
+        got = self.taper.get(name)
+        if got is None:
+            kick = max(self.TAPER_START_KICK, float(self.spin_power))
+            got = self.taper[name] = {"kick": kick, "keep": 0.6 * kick,
+                                      "lead": 4.0, "known": False, "wrong": 0}
+        return got
+
+    def _p2p_taper(self, got, robot, name, bearing, gap, facing, now):
+        """Turn on the spot with the power EASED OFF as the angle closes.
+
+        A fixed power is wrong both ways on the bench: enough to break the
+        ball free from rest overshoots once it is turning, and little enough
+        not to overshoot sticks. So: a kick to break it free, then power falls
+        with the angle left — `spin power` far away, down to the least that
+        keeps it turning near the end — and it stops a learned few degrees
+        early for the run-on. Driving afterwards is the rate turn's, unchanged.
+        """
+        learn = self._taper_learned(name)
+        band = float(self.aim_band)
+        err = wrap180(bearing - facing)
+
+        if got.get("t_for") != got["at"]:
+            got.update(t_for=got["at"], t_phase="settle", t_dir=0,
+                       t_power=0.0, t_hist=deque(), t_still=deque(),
+                       t_until=now, t_stop=None, t_moving=False,
+                       t_streak=0, t_sdir=0, t_last=now, t_was_moving=False,
+                       t_stall_from=None, t_near=False)
+            got["good"] = 0
+
+        if now - got["at"] > self.TAPER_AIM_TIMEOUT_S:
+            robot.stop()
+            self.stop_p2p(
+                f"could not settle on {bearing:.0f}deg — still {err:+.0f} off "
+                f"after {self.TAPER_AIM_TIMEOUT_S:.0f}s. NOT driving.", CORAL)
+            return
+
+        # Something else stopped the spin (a blind frame does): settle.
+        if got["t_dir"] and not getattr(robot, "spinning", True):
+            got.update(t_phase="settle", t_until=now + self.TAPER_SETTLE_S,
+                       t_still=deque(), t_stop=None, t_dir=0)
+
+        if got["t_phase"] == "settle":
+            still = got["t_still"]
+            still.append((now, facing))
+            while still and now - still[0][0] > self.TAPER_WINDOW_S:
+                still.popleft()
+            if now < got["t_until"]:
+                return
+            rows = [wrap180(f - still[-1][1]) for _, f in still]
+            half = len(rows) // 2
+            wobble = (abs(float(np.mean(rows[:half]))
+                          - float(np.mean(rows[half:]))) if half else 0.0)
+            if (wobble > self.TAPER_STILL_DEG
+                    and now < got["t_until"] + self.TAPER_SETTLE_MAX_S):
+                return
+            if got["t_stop"] is not None:
+                stop_facing, sdir, near = got["t_stop"]
+                ran_on = wrap180(facing - stop_facing) * sdir
+                if near and -10.0 <= ran_on <= 60.0:
+                    learn["lead"] = float(np.clip(
+                        0.5 * learn["lead"] + 0.5 * ran_on, 0.0,
+                        self.TAPER_MAX_LEAD))
+                got["t_stop"] = None
+            if abs(err) <= band:
+                got["good"] += 1
+                if got["good"] >= self.P2P_AIM_HOLD:
+                    if self._p2p_aimed(got, robot, facing, now):
+                        return
+                    got["phase"], got["at"] = "go", now
+                    got["best_gap"] = gap
+                    got["sent"] = None
+                    got["spin_dir"] = 0
+                    self.say(f"aimed — facing {facing:.0f}, wanted "
+                             f"{bearing:.0f} ({err:+.0f}). {gap:.0f}cm to run",
+                             MINT)
+                return
+            got["good"] = 0
+            got.update(t_phase="spin", t_dir=0)
+            return
+
+        want = 1 if err > 0 else -1
+        # Only a ball that is actually TURNING can have gone past, or be close
+        # enough to coast in. Before it breaks free, a stop is just a stall.
+        turned = got["t_dir"] and got["t_was_moving"]
+        if turned and want != got["t_dir"]:
+            # Went past: that power was too much near the end.
+            learn["keep"] = max(self.TAPER_MIN_KEEP, learn["keep"] - 3.0)
+            self._taper_stop(got, robot, name, facing, now, near=False)
+            return
+        if turned and abs(err) - learn["lead"] <= band / 2.0:
+            self._taper_stop(got, robot, name, facing, now, near=True)
+            return
+        if abs(err) <= band and not got["t_dir"]:
+            got.update(t_phase="settle", t_until=now, t_still=deque())
+            return
+
+        dt = max(0.0, now - got["t_last"])
+        got["t_last"] = now
+        if got["t_dir"] == 0:
+            # Just under what broke it free last time, ramping up fast: a
+            # small correction then does not start with a full kick.
+            got.update(t_dir=want,
+                       t_power=max(learn["keep"], learn["kick"] - 10.0),
+                       t_hist=deque(),
+                       t_moving=False, t_was_moving=False, t_from=facing,
+                       t_streak=0, t_sdir=0, t_stall_from=now)
+        got["spin_dir"] = want                      # for the overlay
+
+        hist = got["t_hist"]
+        hist.append((now, facing))
+        while hist and now - hist[0][0] > self.TAPER_WINDOW_S:
+            hist.popleft()
+        span = now - hist[0][0]
+        moved = 0.0
+        if len(hist) >= 6:
+            ref = hist[0][1]
+            rows = [wrap180(f - ref) for _, f in hist]
+            moved = float(np.mean(rows[-3:]) - np.mean(rows[:3]))
+        turning = abs(moved) >= self.TAPER_MOVE_DEG
+        same = turning and (moved > 0) == (got["t_sdir"] > 0)
+        got["t_streak"] = got["t_streak"] + 1 if same else int(turning)
+        got["t_sdir"] = (1 if moved > 0 else -1) if turning else 0
+        full = span >= 0.75 * self.TAPER_WINDOW_S
+
+        if full and got["t_streak"] >= 3:
+            if not got["t_moving"]:
+                got["t_moving"] = True
+                got["t_stall_from"] = None
+                if not got["t_was_moving"]:
+                    learn["kick"] = float(np.clip(
+                        0.7 * learn["kick"] + 0.3 * got["t_power"],
+                        self.TAPER_MIN_KEEP, self.TAPER_MAX_POWER))
+                got["t_was_moving"] = True
+                total = wrap180(facing - got["t_from"])
+                if (total > 0) != (want > 0):
+                    learn["wrong"] += 1
+                    if not learn["known"] or learn["wrong"] >= 2:
+                        # Two wrong turns in a row overturn even a known
+                        # direction; one noisy reading does not.
+                        self.spin_sign[name] = -self.spin_sign.get(name, 1)
+                        learn["known"], learn["wrong"] = False, 0
+                        got["flips"] = got.get("flips", 0) + 1
+                        if got["flips"] > self.P2P_MAX_SIGN_FLIPS + 1:
+                            robot.stop()
+                            self.stop_p2p(
+                                "cannot tell which way the motors turn it — "
+                                "the heading is not following the spin. NOT "
+                                "driving.", CORAL)
+                            return
+                        self.say(f"{name} spins the other way to what was "
+                                 "asked — reversed", SUN)
+                        self._taper_stop(got, robot, name, facing, now,
+                                         near=False)
+                        return
+                else:
+                    learn["known"], learn["wrong"] = True, 0
+        elif full and not turning:
+            if got["t_moving"]:
+                # It was turning and stopped short: the ease-off went too low.
+                got["t_moving"] = False
+                learn["keep"] = min(learn["kick"], learn["keep"] + 3.0)
+                got["t_stall_from"] = now
+            got["t_power"] = min(self.TAPER_MAX_POWER, got["t_power"]
+                                 + self.TAPER_RAMP_PER_S * dt)
+            if (got["t_stall_from"] is not None
+                    and now - got["t_stall_from"] > self.TAPER_STALL_S):
+                robot.stop()
+                self.stop_p2p(
+                    f"power {got['t_power']:.0f} did not turn it in "
+                    f"{self.TAPER_STALL_S:.0f}s. NOT driving.", CORAL)
+                return
+
+        if got["t_moving"]:
+            far = min(1.0, abs(err) / self.TAPER_DEG)
+            top = max(float(self.spin_power), learn["keep"])
+            got["t_power"] = learn["keep"] + (top - learn["keep"]) * far
+
+        self._p2p_spin(robot, int(round(got["t_power"] * want
+                                        * self.spin_sign.get(name, 1))))
+
+    def _taper_stop(self, got, robot, name, facing, now, near):
+        if getattr(robot, "spinning", False):
+            robot.stop_raw()
+            self.lab.tracks.rezeroed(name)
+        got["ball_h"] = 0.0                         # stopping re-zeroes
+        got.update(t_phase="settle", t_until=now + self.TAPER_SETTLE_S,
+                   t_still=deque(), t_stop=(facing, got["t_dir"], near),
+                   t_dir=0, t_moving=False, spin_dir=0)
+
+    # -- following a line ---------------------------------------------------
+
+    LINE_CHECK_DEG = 20.0
+    """The nudge used to learn which way a HEADING turns the ball. Small, at
+    speed zero, and once per ball: big enough to read clearly over tracker
+    noise, too small to overshoot the way a large commanded turn does."""
+    LINE_CHECK_MIN_DEG = 8.0
+    LINE_CHECK_TIMEOUT_S = 2.0
+    LINE_MAX_CROSS_CM = 25.0
+    """Further than this from the line and it is not following it any more.
+    Stopping says so; carrying on is a ball wandering the floor with a
+    confident label on it."""
+    LINE_FRAME_GAIN = 0.08
+    """How fast the ball-frame anchor follows what the camera sees. Gentle:
+    while driving the facing lags each command slightly, and that lag is not
+    the frame moving."""
+    LINE_AWAY_DEG = 110.0
+
+    def start_line(self):
+        """Arm the two clicks — start, then end. Pressing again cancels."""
+        if self.p2p is not None or self.p2p_pick or self.line_pick is not None:
+            self.stop_p2p("cancelled")
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so there is no heading to steer "
+                     "with — press i and click its front light", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration, so a line in cm means nothing — "
+                     "press c and pick the corners", SUN)
+            return
+        self.line_pick = []
+        self.say("click the START of the line", CHALK)
+        self._build()
+
+    def line_click(self, pos):
+        """First click is the start, second the end, and then it goes."""
+        if self.line_pick is None or self._shot is None:
+            return
+        (ox, oy), k = self._shot
+        pt = ((pos[0] - ox) / k, (pos[1] - oy) / k)
+        self.line_pick.append(pt)
+        if len(self.line_pick) == 1:
+            self.say("now click the END of the line", CHALK)
+            return
+        start, end = self.line_pick
+        self.line_pick = None
+        a, b = self.lab.hom.to_cm([list(start), list(end)])
+        length = float(np.linalg.norm(np.asarray(b, float)[:2]
+                                      - np.asarray(a, float)[:2]))
+        if length < 2 * self.P2P_ARRIVE_CM:
+            self.say(f"that line is {length:.0f}cm — too short to follow",
+                     SUN)
+            self._build()
+            return
+        off, _ = self.saved_offset(self.drive_target())
+        # A line is a leg to its START, then a turn to face its END, then the
+        # follow. The first two are ordinary point-to-point, which already
+        # works, so they are exactly that and nothing new.
+        self.p2p = {"kind": "line", "stage": "to_start", "line": (start, end),
+                    "target": start, "phase": "aim", "at": time.time(),
+                    "name": self.drive_target(), "sent": None, "good": 0,
+                    "start_gap": None, "closest": None, "offset": off,
+                    "ball_h": 0.0}
+        self.line_stats = None
+        self.say(f"line of {length:.0f}cm — going to its start first", CHALK)
+        self._build()
+
+    def _p2p_arrived(self, got, robot, gap):
+        """A leg reached its target. For a line, that is the start: face the
+        end next. Otherwise the job is done."""
+        if got.get("kind") == "line" and got.get("stage") == "to_start":
+            robot.stop()
+            now = time.time()
+            got.update(stage="face_end", target=got["line"][1], phase="aim",
+                       at=now, good=0, spin_dir=0, probe=None,
+                       settle_until=now + self.P2P_SETTLE_S, sent=None,
+                       start_gap=None, best_gap=None, reaims=0,
+                       stale_reaims=0, reaim_gap=None)
+            self.say(f"at the start ({gap:.1f}cm off) — turning to face the "
+                     "end", MINT)
+            return
+        moved = (got["start_gap"] or gap) - gap
+        self.stop_p2p(f"arrived, {gap:.1f}cm off (came {moved:.0f}cm)", MINT)
+
+    def _p2p_aimed(self, got, robot, facing, now):
+        """A turn finished. True if a line took it over rather than driving."""
+        if not (got.get("kind") == "line" and got.get("stage") == "face_end"):
+            return False
+        robot.stop()
+        name = got["name"]
+        got.update(stage="check", check_from=now, check_facing=facing,
+                   check_h=got.get("ball_h", 0.0), at=now, sent=None)
+        if name in self.steer_sign:
+            self._line_begin(got, facing, now)
+        else:
+            self.say("facing the end — one small check of which way it "
+                     "steers, then following", MINT)
+        return True
+
+    def _line_begin(self, got, facing, now):
+        """Anchor the ball's heading frame to what the camera sees, and go."""
+        name = got["name"]
+        sign = self.steer_sign[name]
+        h = got.get("ball_h", 0.0)
+        a, b = self.lab.hom.to_cm([list(got["line"][0]), list(got["line"][1])])
+        a = np.asarray(a, float)[:2]
+        b = np.asarray(b, float)[:2]
+        length = float(np.linalg.norm(b - a))
+        byte, _ = self.p2p_byte()
+        got.update(stage="follow", at=now, frame=(facing - sign * h) % 360.0,
+                   s_cm=a, e_cm=b, length=length, cross=[], lookahead=None,
+                   timeout=max(self.P2P_RUN_TIMEOUT_S,
+                               3.0 * length / max(self.P2P_CM_S, 1.0) + 10.0))
+        self.say(f"following — {length:.0f}cm at {self.P2P_CM_S:.0f}cm/s, "
+                 f"looking {self.lookahead_cm:.0f}cm ahead", MINT)
+
+    def _line_tick(self, got, robot, name, facing, now):
+        if got["stage"] == "check":
+            self._line_check(got, robot, name, facing, now)
+            return
+        self._line_follow(got, robot, name, facing, now)
+
+    def _line_check(self, got, robot, name, facing, now):
+        """Which way does a positive HEADING turn this ball, on camera?
+
+        Point-to-point never needed to know: it only ever drives heading 0 and
+        stops to re-aim. Following a line steers continuously, and with the
+        handedness backwards every correction steers AWAY from the line — the
+        fastest possible way to a bad demo. The arena's compass and a Sphero's
+        heading need not run the same way round, and whether they do depends
+        on how the camera and the arena were set up, so it is measured rather
+        than assumed.
+        """
+        moved = wrap180(facing - got["check_facing"])
+        if abs(moved) >= self.LINE_CHECK_MIN_DEG:
+            self.steer_sign[name] = 1 if moved > 0 else -1
+            got["ball_h"] = (got["check_h"] + self.LINE_CHECK_DEG) % 360.0
+            self.say(f"{name} steers "
+                     + ("the same way round as" if moved > 0 else
+                        "the opposite way round to")
+                     + " the camera — remembered", MINT)
+            self._line_begin(got, facing, now)
+            return
+        if now - got["check_from"] > self.LINE_CHECK_TIMEOUT_S:
+            robot.stop()
+            self.stop_p2p(
+                f"told a heading {self.LINE_CHECK_DEG:.0f}deg round, it did "
+                f"not turn ({moved:+.0f}) — cannot tell which way it steers. "
+                "NOT following.", CORAL)
+            return
+        # Speed ZERO: this is a check, not a move.
+        self._p2p_send(robot, (got["check_h"] + self.LINE_CHECK_DEG) % 360.0,
+                       0, always=True)
+
+    def _line_follow(self, got, robot, name, facing, now):
+        """Pure pursuit: steer at a point a fixed distance ahead ON the line.
+
+        Chosen over a PID on cross-track error because that needs three gains
+        tuned against a lag of the better part of a second, which is exactly
+        how a ball ends up weaving down a line; and over loop shaping because
+        that needs a plant model this ball does not have yet. Aiming at a
+        lookahead point makes each command already right for the lag it has to
+        ride out, it is stable without a model, and its one knob barely moves
+        the error — measured, on this plant.
+        """
+        here = self.ball_px(name)
+        hom = self.lab.hom
+        p = np.asarray(hom.to_cm([list(here)]), float).ravel()[:2]
+        a, b, length = got["s_cm"], got["e_cm"], got["length"]
+        u = (b - a) / max(length, 1e-9)
+        along = float(np.dot(p - a, u))
+        cross = float(u[0] * (p - a)[1] - u[1] * (p - a)[0])
+        got["cross"].append(cross)
+
+        to_end = float(np.linalg.norm(b - p))
+        if to_end <= self.P2P_ARRIVE_CM or along >= length:
+            self._line_done(got, to_end)
+            return
+        if abs(cross) > self.LINE_MAX_CROSS_CM:
+            self.stop_p2p(f"{abs(cross):.0f}cm off the line — that is not "
+                          "following it. Stopping.", CORAL)
+            return
+
+        reach = min(max(along, 0.0) + self.lookahead_cm, length)
+        t = a + u * reach
+        got["lookahead"] = t
+        want = math.degrees(math.atan2(t[0] - p[0], t[1] - p[1])) % 360.0
+
+        if (now - got["at"] > 1.5
+                and abs(wrap180(want - facing)) > self.LINE_AWAY_DEG):
+            self.stop_p2p(f"pointing {abs(wrap180(want - facing)):.0f}deg away "
+                          "from where it should go — stopping", CORAL)
+            return
+
+        sign = self.steer_sign[name]
+        # Follow the ball's frame as it creeps: the heading it is holding, seen
+        # on camera, says where heading 0 now points.
+        if got.get("sent") is not None:
+            seen = (facing - sign * got["ball_h"]) % 360.0
+            got["frame"] = (got["frame"] + self.LINE_FRAME_GAIN
+                            * wrap180(seen - got["frame"])) % 360.0
+        heading = (sign * wrap180(want - got["frame"])) % 360.0
+        byte, _ = self.p2p_byte()
+        self._p2p_send(robot, heading, byte, always=True)
+
+    def _line_done(self, got, to_end):
+        cross = np.asarray(got["cross"], float)
+        rms = float(np.sqrt(np.mean(cross ** 2))) if len(cross) else 0.0
+        worst = float(np.max(np.abs(cross))) if len(cross) else 0.0
+        self.line_stats = {"rms": rms, "max": worst, "end": to_end,
+                           "n": int(len(cross))}
+        self.stop_p2p(f"done, {to_end:.1f}cm from the end — held the line to "
+                      f"{rms:.1f}cm rms, {worst:.1f}cm worst", MINT)
+
+    # -- the calibration walk (its own turn and drive; see bench_calib) --------
+
+    CALIB_LOG_DIR = Path(__file__).resolve().parent / "runs" / "calib"
+
+    def start_calib(self):
+        """Walk the corners and a diagonal. Pressing again stops it."""
+        if self.calib is not None:
+            self.stop_calib("stopped")
+            return
+        if self.p2p is not None or self.p2p_pick or self.line_pick is not None:
+            self.say("stop the p2p/line first", SUN)
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned — press i and click its front "
+                     "light first", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration — press c and pick the corners "
+                     "first", SUN)
+            return
+        robot = self.lab.robots.get(name)
+        if not callable(getattr(robot, "spin_raw", None)):
+            self.say("calib turns by spinning, and this ball has no raw "
+                     "motors", SUN)
+            return
+        byte, _ = self.p2p_byte()
+        self.calib = CalibWalk(self, name, byte, self.P2P_CM_S,
+                               self.CALIB_LOG_DIR)
+        self.calib_result = None
+        self.say(f"calibrating {name}: 4 corners and a diagonal — keep the "
+                 "arena clear. It finds its own spin power.", CHALK)
+        self._build()
+
+    def stop_calib(self, why):
+        walk = self.calib
+        if walk is None:
+            return
+        walk.cancel()
+        self._calib_ended(walk)
+
+    def calib_tick(self):
+        walk = self.calib
+        if walk is None:
+            return
+        walk.tick()
+        if walk.done:
+            self._calib_ended(walk)
+
+    def _calib_ended(self, walk):
+        self.calib = None
+        rec = walk.result
+        if rec is not None:
+            self.calib_result = rec
+            t = rec.get("turn") or {}
+            delay = (f"{rec['delay_s']:.2f}s" if rec["delay_s"] is not None
+                     else "?")
+            brk = t.get("breakaway_power")
+            self.say(
+                f"calib: saved for {walk.name} — steers "
+                + ("the same way round as" if rec["sign"] > 0 else
+                   "opposite to")
+                + f" the camera, {rec['speed_cm_s']:.1f}cm/s at byte "
+                f"{rec['byte']}, steer delay {delay}, spin breaks free at "
+                f"power {brk if brk is None else round(brk)}, stops "
+                f"{t.get('turn_lead_deg', 0):.0f}deg early", MINT)
+        else:
+            self.say(f"calib: {walk.why} — nothing saved "
+                     "(log in runs/calib)", CORAL)
+        self._build()
+
+    def draw_calib(self, s, px_of):
+        walk = self.calib
+        if walk is None or px_of is None:
+            return
+        hom = self.lab.hom
+        for i, c in enumerate(walk.route):
+            q = px_of(tuple(np.asarray(hom.to_px([list(c)]), float).ravel()))
+            if q is None:
+                continue
+            tone = SUN if i == walk.leg else DIM
+            pygame.draw.circle(s, tone, (int(q[0]), int(q[1])),
+                               13 if i == walk.leg else 7, 2)
+        s.blit(self.fb.render(walk.status(), True, SUN),
+               (VIEW.x + 16, VIEW.y + 14))
+
+    # -- polyline and freehand paths ---------------------------------------------
+    #
+    # Built BESIDE the line follower, which works and is not changed. A path
+    # rides the line's own stages — to its start, turn to face along it, the
+    # steering check — and only the follow stage is its own: pure pursuit on a
+    # chain of segments instead of one.
+
+    PATH_STEP_CM = 2.0
+    """Paths are resampled to a point every this many cm."""
+    PATH_SMOOTH = 5
+    """Freehand is smoothed over this many points: a hand-drawn line wobbles
+    by a few pixels, and pursuit would dutifully steer every wobble."""
+    PATH_SEARCH_BACK_CM = 5.0
+    PATH_SEARCH_AHEAD_CM = 30.0
+    """Where along the path the ball is, searched only NEAR where it last was.
+    A freehand loop crosses itself, and a nearest-point search over the whole
+    path would jump it to the crossing and skip the loop."""
+    FREE_MIN_PX = 4.0
+
+    def start_path(self, kind):
+        """Arm drawing a polyline (clicks) or a freehand path (drag)."""
+        if self.path_pick is not None:
+            self.cancel_path("cancelled")
+            return
+        if self.p2p is not None or self.p2p_pick or self.line_pick is not None:
+            self.stop_p2p("cancelled")
+            return
+        if self.calib is not None:
+            self.say("stop calib first", SUN)
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so there is no heading to steer "
+                     "with — press i and click its front light", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration, so a path in cm means nothing — "
+                     "press c and pick the corners", SUN)
+            return
+        self.path_pick = {"kind": kind, "pts": [], "drawing": False}
+        self.say("click the corners of the path, then press done "
+                 "(or Enter)" if kind == "poly" else
+                 "press and DRAG the path, let go to start", CHALK)
+        self._build()
+
+    def cancel_path(self, why):
+        self.path_pick = None
+        self.say(f"path: {why}", DIM)
+        self._build()
+
+    def _view_to_frame(self, pos):
+        (ox, oy), k = self._shot
+        return ((pos[0] - ox) / k, (pos[1] - oy) / k)
+
+    def path_press(self, pos):
+        pick = self.path_pick
+        if pick is None or self._shot is None:
+            return
+        pt = self._view_to_frame(pos)
+        if pick["kind"] == "poly":
+            pick["pts"].append(pt)
+            self.say(f"{len(pick['pts'])} points — "
+                     + ("click more, then done" if len(pick["pts"]) > 1
+                        else "click the next"), CHALK)
+            self._build()
+            return
+        pick["pts"], pick["drawing"] = [pt], True
+
+    def path_drag(self, pos):
+        pick = self.path_pick
+        if pick is None or not pick["drawing"] or self._shot is None:
+            return
+        pt = self._view_to_frame(pos)
+        last = pick["pts"][-1]
+        if math.hypot(pt[0] - last[0], pt[1] - last[1]) >= self.FREE_MIN_PX:
+            pick["pts"].append(pt)
+
+    def path_release(self):
+        pick = self.path_pick
+        if pick is None:
+            return
+        pick["drawing"] = False
+        self.finish_path()
+
+    @staticmethod
+    def _resample(cm, step):
+        """Points every `step` cm along a polyline, corners kept."""
+        cm = np.asarray(cm, float)
+        keep = [cm[0]]
+        for a, b in zip(cm[:-1], cm[1:]):
+            seg = float(np.linalg.norm(b - a))
+            if seg < 1e-6:
+                continue
+            n = max(1, int(math.ceil(seg / step)))
+            for k in range(1, n + 1):
+                keep.append(a + (b - a) * (k / n))
+        return np.asarray(keep, float)
+
+    def finish_path(self):
+        pick = self.path_pick
+        if pick is None:
+            return
+        self.path_pick = None
+        pts = pick["pts"]
+        if len(pts) < 2:
+            self.say("path: needs at least two points", SUN)
+            self._build()
+            return
+        cm = np.asarray(self.lab.hom.to_cm([list(q) for q in pts]),
+                        float)[:, :2]
+        cm = self._resample(cm, self.PATH_STEP_CM)
+        if pick["kind"] == "free" and len(cm) > self.PATH_SMOOTH:
+            k = self.PATH_SMOOTH
+            pad = np.vstack([np.repeat(cm[:1], k // 2, 0), cm,
+                             np.repeat(cm[-1:], k // 2, 0)])
+            smooth = np.vstack([np.convolve(pad[:, i], np.ones(k) / k,
+                                            mode="valid")
+                                for i in range(2)]).T
+            smooth[0], smooth[-1] = cm[0], cm[-1]
+            cm = self._resample(smooth, self.PATH_STEP_CM)
+        seg = np.linalg.norm(np.diff(cm, axis=0), axis=1)
+        s_at = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s_at[-1])
+        if total < 2 * self.P2P_ARRIVE_CM:
+            self.say(f"path: {total:.0f}cm is too short to follow", SUN)
+            self._build()
+            return
+        face = self._path_point(cm, s_at, min(self.lookahead_cm, total))
+        start_px, face_px = self.lab.hom.to_px([list(cm[0]), list(face)])
+        start_px = tuple(float(v) for v in start_px)
+        face_px = tuple(float(v) for v in face_px)
+        name = self.drive_target()
+        off, _ = self.saved_offset(name)
+        # The line's own stages up to the follow: its `line` is the start and
+        # the point along the path to face, which is all those stages read.
+        self.p2p = {"kind": "line", "stage": "to_start",
+                    "line": (start_px, face_px), "target": start_px,
+                    "phase": "aim", "at": time.time(), "name": name,
+                    "sent": None, "good": 0, "start_gap": None,
+                    "closest": None, "offset": off, "ball_h": 0.0,
+                    "path": {"kind": pick["kind"], "cm": cm, "s": s_at,
+                             "total": total, "px": [tuple(q) for q in pts],
+                             "s_now": None}}
+        self.path_stats = None
+        self.say(f"{pick['kind']} path of {total:.0f}cm — going to its start "
+                 "first", CHALK)
+        self._build()
+
+    @staticmethod
+    def _path_point(cm, s_at, s):
+        """The point `s` cm along the path."""
+        s = float(np.clip(s, 0.0, s_at[-1]))
+        i = int(np.searchsorted(s_at, s, side="right")) - 1
+        i = min(max(i, 0), len(cm) - 2)
+        span = s_at[i + 1] - s_at[i]
+        t = 0.0 if span <= 1e-9 else (s - s_at[i]) / span
+        return cm[i] + (cm[i + 1] - cm[i]) * t
+
+    def _path_where(self, path, p):
+        """(arc length, distance) of the nearest point on the path, searched
+        only around where the ball last was."""
+        cm, s_at = path["cm"], path["s"]
+        s_now = path["s_now"] or 0.0
+        lo, hi = s_now - self.PATH_SEARCH_BACK_CM, s_now + self.PATH_SEARCH_AHEAD_CM
+        best = (s_now, float("inf"))
+        for i in range(len(cm) - 1):
+            if s_at[i + 1] < lo or s_at[i] > hi:
+                continue
+            a, b = cm[i], cm[i + 1]
+            d = b - a
+            span = float(np.dot(d, d))
+            t = 0.0 if span <= 1e-12 else float(np.clip(np.dot(p - a, d) / span,
+                                                        0.0, 1.0))
+            q = a + d * t
+            dist = float(np.linalg.norm(p - q))
+            if dist < best[1]:
+                best = (float(s_at[i] + t * (s_at[i + 1] - s_at[i])), dist)
+        return best
+
+    def _path_follow(self, got, robot, name, facing, now):
+        """Pure pursuit along the path: steer at the point `lookahead` cm
+        further along it than the ball is. The steering itself — the frame
+        tracking and heading — is the line follower's, unchanged."""
+        path = got["path"]
+        p = np.asarray(self.lab.hom.to_cm([list(self.ball_px(name))]),
+                       float).ravel()[:2]
+        if path["s_now"] is None:
+            path["s_now"] = 0.0
+            got["cross"] = []
+            got["timeout"] = max(self.P2P_RUN_TIMEOUT_S,
+                                 3.0 * path["total"] / max(self.P2P_CM_S, 1.0)
+                                 + 10.0)
+            self.say(f"following the {path['kind']} path — "
+                     f"{path['total']:.0f}cm, looking "
+                     f"{self.lookahead_cm:.0f}cm ahead", MINT)
+        s_now, cross = self._path_where(path, p)
+        path["s_now"] = max(path["s_now"] - self.PATH_SEARCH_BACK_CM, s_now)
+        got["cross"].append(cross)
+
+        end = path["cm"][-1]
+        to_end = float(np.linalg.norm(end - p))
+        if (to_end <= self.P2P_ARRIVE_CM
+                and path["s_now"] >= path["total"] - 2 * self.lookahead_cm) \
+                or path["s_now"] >= path["total"] - 0.5:
+            self._path_done(got, to_end)
+            return
+        if cross > self.LINE_MAX_CROSS_CM:
+            self.stop_p2p(f"{cross:.0f}cm off the path — that is not "
+                          "following it. Stopping.", CORAL)
+            return
+
+        t = self._path_point(path["cm"], path["s"],
+                             path["s_now"] + self.lookahead_cm)
+        got["lookahead"] = t
+        want = math.degrees(math.atan2(t[0] - p[0], t[1] - p[1])) % 360.0
+
+        if (now - got["at"] > 1.5
+                and abs(wrap180(want - facing)) > self.LINE_AWAY_DEG):
+            self.stop_p2p(f"pointing {abs(wrap180(want - facing)):.0f}deg away "
+                          "from where it should go — stopping", CORAL)
+            return
+
+        sign = self.steer_sign[name]
+        if got.get("sent") is not None:
+            seen = (facing - sign * got["ball_h"]) % 360.0
+            got["frame"] = (got["frame"] + self.LINE_FRAME_GAIN
+                            * wrap180(seen - got["frame"])) % 360.0
+        heading = (sign * wrap180(want - got["frame"])) % 360.0
+        byte, _ = self.p2p_byte()
+        self._p2p_send(robot, heading, byte, always=True)
+
+    def _path_done(self, got, to_end):
+        cross = np.asarray(got["cross"], float)
+        rms = float(np.sqrt(np.mean(cross ** 2))) if len(cross) else 0.0
+        worst = float(np.max(cross)) if len(cross) else 0.0
+        kind = got["path"]["kind"]
+        self.path_stats = {"rms": rms, "max": worst, "end": to_end,
+                           "n": int(len(cross)), "kind": kind}
+        self.stop_p2p(f"{kind} path done, {to_end:.1f}cm from the end — held "
+                      f"it to {rms:.1f}cm rms, {worst:.1f}cm worst", MINT)
+
+    def draw_path(self, s, px_of):
+        pick = self.path_pick
+        got = self.p2p
+        if pick is not None:
+            pts, tone = pick["pts"], SUN
+        elif got is not None and got.get("path") is not None:
+            pts = [tuple(q) for q in self.lab.hom.to_px(
+                [list(c) for c in got["path"]["cm"]])]
+            tone = CYAN
+        else:
+            return
+        drawn = [px_of(q) for q in pts]
+        drawn = [(int(q[0]), int(q[1])) for q in drawn if q is not None]
+        if len(drawn) >= 2:
+            pygame.draw.lines(s, tone, False, drawn, 2)
+        for q in drawn[:1]:
+            pygame.draw.circle(s, tone, q, 11, 2)
+            s.blit(self.fb.render("S", True, tone), (q[0] + 14, q[1] - 10))
+        if len(drawn) >= 2:
+            q = drawn[-1]
+            pygame.draw.circle(s, tone, q, 11, 2)
+            s.blit(self.fb.render("E", True, tone), (q[0] + 14, q[1] - 10))
+        if pick is not None and pick["kind"] == "poly":
+            for q in drawn:
+                pygame.draw.circle(s, tone, q, 4)
+        if (got is not None and got.get("path") is not None
+                and got.get("stage") == "follow"
+                and got.get("lookahead") is not None):
+            t_px = np.asarray(self.lab.hom.to_px([list(got["lookahead"])]),
+                              float).ravel()[:2]
+            q = px_of(tuple(t_px))
+            if q is not None:
+                pygame.draw.circle(s, MINT, (int(q[0]), int(q[1])), 5)
+        if pick is not None:
+            s.blit(self.fb.render(
+                ("click the path's corners — Enter or done to go"
+                 if pick["kind"] == "poly" else
+                 "press and drag the path — let go to start"), True, SUN),
+                (VIEW.x + 16, VIEW.y + 14))
+            s.blit(self.fs.render("space to cancel, backspace removes a point",
+                                  True, DIM), (VIEW.x + 16, VIEW.y + 36))
+
+    # -- orbits --------------------------------------------------------------------
+    #
+    # Beside the path follower, which works and is not changed: an orbit is a
+    # circular path of a few laps handed to the same machinery — to the circle,
+    # face along it, follow — and started again each time a chunk of laps
+    # finishes, until it is stopped or something fails.
+
+    ORBIT_LAPS_PER_RUN = 10
+    ORBIT_MIN_RADIUS_CM = 10.0
+    ORBIT_POINT_CM = 2.0
+
+    def toggle_orbit_dir(self):
+        if self.orbit_run is not None:
+            self.say("stop the orbit before changing its direction", SUN)
+            return
+        self.orbit_dir = "cw" if self.orbit_dir == "ccw" else "ccw"
+        self.say(f"orbits go {'clockwise' if self.orbit_dir == 'cw' else 'counter-clockwise'} "
+                 "as seen on screen", CHALK)
+        self._build()
+
+    def start_orbit(self):
+        """Arm the two clicks — centre, then a point on the circle."""
+        if self.orbit_pick is not None:
+            self.cancel_orbit("cancelled")
+            return
+        if self.orbit_run is not None:
+            self.orbit_run = None
+            self.stop_p2p("orbit stopped")
+            return
+        if (self.p2p is not None or self.p2p_pick or self.line_pick is not None
+                or self.path_pick is not None or self.calib is not None):
+            self.say("stop what is running first", SUN)
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so there is no heading to steer "
+                     "with — press i and click its front light", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration — press c and pick the corners",
+                     SUN)
+            return
+        self.orbit_pick = {"centre": None}
+        self.say("click the CENTRE of the orbit", CHALK)
+        self._build()
+
+    def cancel_orbit(self, why):
+        self.orbit_pick = None
+        self.say(f"orbit: {why}", DIM)
+        self._build()
+
+    def orbit_click(self, pos):
+        pick = self.orbit_pick
+        if pick is None or self._shot is None:
+            return
+        pt = self._view_to_frame(pos)
+        if pick["centre"] is None:
+            pick["centre"] = pt
+            self.say("now click a point ON the circle", CHALK)
+            return
+        self.orbit_pick = None
+        c, e = self.lab.hom.to_cm([list(pick["centre"]), list(pt)])
+        c = np.asarray(c, float)[:2]
+        radius = float(np.linalg.norm(np.asarray(e, float)[:2] - c))
+        hom = self.lab.hom
+        if radius < self.ORBIT_MIN_RADIUS_CM:
+            self.say(f"orbit: a {radius:.0f}cm radius is too small to follow",
+                     SUN)
+            self._build()
+            return
+        if (c[0] - radius < 0 or c[1] - radius < 0
+                or c[0] + radius > hom.width or c[1] + radius > hom.height):
+            self.say("orbit: that circle leaves the arena", SUN)
+            self._build()
+            return
+        if radius < 2 * self.lookahead_cm:
+            self.say(f"orbit: {radius:.0f}cm is tight for a "
+                     f"{self.lookahead_cm:.0f}cm lookahead — it will run "
+                     "inside the circle. Lower lookahead for a closer orbit.",
+                     SUN)
+        self.orbit_run = {"centre": c, "radius": radius, "dir": self.orbit_dir,
+                          "name": self.drive_target(), "laps": 0}
+        self._orbit_next()
+        self._build()
+
+    def _orbit_path(self, run, here_cm):
+        """Laps of the circle, from the point on it nearest the ball."""
+        c, r = run["centre"], run["radius"]
+        a0 = math.atan2(here_cm[1] - c[1], here_cm[0] - c[0])
+        # Screen y runs down, so increasing angle is CLOCKWISE on screen.
+        way = 1.0 if run["dir"] == "cw" else -1.0
+        n = max(12, int(math.ceil(2 * math.pi * r / self.ORBIT_POINT_CM)))
+        steps = n * self.ORBIT_LAPS_PER_RUN
+        a = a0 + way * 2 * math.pi * np.arange(steps + 1) / n
+        return np.stack([c[0] + r * np.cos(a), c[1] + r * np.sin(a)], axis=1)
+
+    def _orbit_next(self):
+        """Hand the next chunk of laps to the path follower."""
+        run = self.orbit_run
+        name = run["name"]
+        here = self.ball_px(name)
+        if here is None:
+            self.orbit_run = None
+            self.say("orbit: no position for the ball", CORAL)
+            return
+        here_cm = np.asarray(self.lab.hom.to_cm([list(here)]), float).ravel()[:2]
+        cm = self._orbit_path(run, here_cm)
+        seg = np.linalg.norm(np.diff(cm, axis=0), axis=1)
+        s_at = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s_at[-1])
+        face = self._path_point(cm, s_at, min(self.lookahead_cm, total))
+        start_px, face_px = self.lab.hom.to_px([list(cm[0]), list(face)])
+        start_px = tuple(float(v) for v in start_px)
+        face_px = tuple(float(v) for v in face_px)
+        off, _ = self.saved_offset(name)
+        # Already on the circle — the usual case when one chunk of laps runs
+        # into the next: skip the leg to the start. A leg to a point a couple
+        # of cm away aims at a bearing that is pure noise and spins for it.
+        on_it = (float(np.linalg.norm(cm[0] - here_cm))
+                 <= self.P2P_ARRIVE_CM)
+        self.p2p = {"kind": "line",
+                    "stage": "face_end" if on_it else "to_start",
+                    "line": (start_px, face_px),
+                    "target": face_px if on_it else start_px,
+                    "phase": "aim", "at": time.time(), "name": name,
+                    "sent": None, "good": 0, "start_gap": None,
+                    "closest": None, "offset": off, "ball_h": 0.0,
+                    "path": {"kind": "orbit", "cm": cm, "s": s_at,
+                             "total": total, "px": [], "s_now": None}}
+        self.path_stats = None
+        self.say(f"orbit: {run['radius']:.0f}cm radius, "
+                 f"{'clockwise' if run['dir'] == 'cw' else 'counter-clockwise'}"
+                 f" — laps {run['laps'] + 1}-"
+                 f"{run['laps'] + self.ORBIT_LAPS_PER_RUN}", CHALK)
+
+    def orbit_tick(self):
+        """When a chunk of laps finishes, start the next. When a run stops for
+        any other reason — stopped, off the path, lost — the orbit ends."""
+        run = self.orbit_run
+        if run is None or self.p2p is not None:
+            return
+        stats = self.path_stats
+        if stats is None or stats.get("kind") != "orbit":
+            if self._stopped_by_user():
+                self.orbit_run = None
+                self.say("orbit: ended", DIM)
+                self._build()
+            return              # a failure: the job supervisor restarts it
+        run["laps"] += self.ORBIT_LAPS_PER_RUN
+        run.setdefault("rms", []).append(stats["rms"])
+        self._orbit_next()
+
+    def draw_orbit(self, s, px_of):
+        pick = self.orbit_pick
+        if pick is None:
+            return
+        if pick["centre"] is not None:
+            q = px_of(pick["centre"])
+            if q is not None:
+                x, y = int(q[0]), int(q[1])
+                pygame.draw.line(s, SUN, (x - 10, y), (x + 10, y), 2)
+                pygame.draw.line(s, SUN, (x, y - 10), (x, y + 10), 2)
+        s.blit(self.fb.render(
+            "click the CENTRE of the orbit" if pick["centre"] is None
+            else "now click a point ON the circle", True, SUN),
+            (VIEW.x + 16, VIEW.y + 14))
+        s.blit(self.fs.render("space to cancel", True, DIM),
+               (VIEW.x + 16, VIEW.y + 36))
+
+    # -- never quit: the job supervisor ---------------------------------------------
+    #
+    # Beside the followers, which are not changed. Every run a user starts is
+    # watched; when one stops and it was not the user stopping it and it did
+    # not finish, it is restarted FROM WHERE THE BALL IS after a short pause,
+    # with whatever the failure points at adjusted first. Only stop ends a job.
+
+    JOB_RETRY_PAUSE_S = 1.0
+    USER_STOPS = ("stopped", "cancelled", "orbit stopped")
+
+    def _stop_p2p_watched(self, why, tone=None):
+        self._last_stop = (why, tone)
+        self._stop_p2p_inner(why, tone)
+
+    def _stopped_by_user(self):
+        return (self._last_stop is not None
+                and self._last_stop[0] in self.USER_STOPS)
+
+    def _seed_spin(self, name):
+        """The calibrated SPIN direction, so a calibrated ball never depends
+        on the 4 degree check that can lock in wrong. Still overturnable by
+        two wrong readings in a row, if the calibration is ever wrong."""
+        if name in self.spin_sign_known or self.lab.hom is None:
+            return
+        try:
+            rec, _ = ball_calib.load(name, self.lab.hom.M)
+        except Exception:
+            rec = None
+        sign = ((rec or {}).get("turn") or {}).get("spin_dir_sign")
+        if sign in (1, -1):
+            self.spin_sign[name] = int(sign)
+            self.spin_sign_known.add(name)
+            self.spin_wrong[name] = 0
+            self.say(f"{name}: spin direction from its calibration", MINT)
+
+    def _seed_steering(self, name):
+        """A calibrated steering direction beats the 20 degree check: on a
+        ball that runs on and is pulled back after a spin, the check reads the
+        pull-back. Six measured legs do not."""
+        if name in self.steer_sign or self.lab.hom is None:
+            return
+        try:
+            rec, _ = ball_calib.load(name, self.lab.hom.M)
+        except Exception:
+            rec = None
+        if rec is not None and rec.get("sign") in (1, -1):
+            self.steer_sign[name] = int(rec["sign"])
+            self.job["calibrated"] = True
+            self.say(f"{name}: steering direction from its calibration "
+                     "(no check needed)", MINT)
+
+    def job_tick(self):
+        got, job = self.p2p, self.job
+        if got is not None:
+            if job is None or job["got"] is not got:
+                self.job = {"got": got, "tries": 0, "name": got["name"],
+                            "retry_at": None, "follow_fails": 0,
+                            "calibrated": False}
+                self._last_stop = None
+                self._seed_spin(got["name"])
+                if got.get("kind") == "line":
+                    self._seed_steering(got["name"])
+            return
+        if job is None:
+            return
+        busy = (self.p2p_pick or self.line_pick is not None
+                or self.path_pick is not None or self.orbit_pick is not None
+                or self.calib is not None)
+        if busy or self._stopped_by_user():
+            self.job = None
+            return
+        now = time.time()
+        old = job["got"]
+        if job["retry_at"] is None:
+            if self._job_finished(old):
+                self.job = None
+                return
+            job["retry_at"] = now + self.JOB_RETRY_PAUSE_S
+            job["tries"] += 1
+            self._job_adjust(job, old)
+            return
+        if now < job["retry_at"]:
+            return
+        if not self.ball_fresh(job["name"]) or self.ball_px(job["name"]) is None:
+            return                      # wait until it can be seen again
+        why = (self._last_stop or ("", None))[0]
+        self._last_stop = None
+        new = self._job_restart(old)
+        if new is None:
+            self.job = None
+            return
+        job["got"], job["retry_at"] = self.p2p, None
+        self.retries += 1
+        self.say(f"retry {job['tries']} from here (last: {why[:60]})", SUN)
+        self._build()
+
+    def _job_finished(self, got):
+        if got.get("kind") != "line":
+            return "arrived" in (self._last_stop or ("", None))[0]
+        if got.get("path") is not None:
+            return self.path_stats is not None
+        return self.line_stats is not None
+
+    def _job_adjust(self, job, got):
+        """Change what the failure points at, so a retry is not the same run."""
+        why = (self._last_stop or ("", None))[0]
+        name = job["name"]
+        if "did not turn it" in why:
+            self.spin_power = min(100.0, self.spin_power + 5.0)
+            self.say(f"retry: spin power up to {self.spin_power:.0f}", SUN)
+        elif "could not settle" in why or "could not finish the turn" in why:
+            self.spin_power = max(25.0, self.spin_power - 5.0)
+            self.say(f"retry: spin power down to {self.spin_power:.0f}", SUN)
+        if "cannot tell which way it steers" in why:
+            # The check cannot read this ball (it runs on and is pulled back
+            # after a spin). Asking again reads the same. Guess instead: a
+            # wrong guess steers away, and the follow failure flips it.
+            self.steer_sign[name] = 1
+            job["guessed"] = True
+            self.say(f"retry: {name}'s steering check is unreadable — trying "
+                     "one direction, flipping it if it steers away", SUN)
+        if got.get("stage") == "follow" and (
+                "off the" in why or "pointing" in why):
+            job["follow_fails"] += 1
+            if job.get("guessed") and name in self.steer_sign:
+                self.steer_sign[name] = -self.steer_sign[name]
+                job["follow_fails"] = 0
+                self.say(f"retry: {name} steered away — trying the other "
+                         "steering direction", SUN)
+            elif not job["calibrated"]:
+                # The check's answer is suspect: ask again.
+                self.steer_sign.pop(name, None)
+            elif job["follow_fails"] >= 2 and name in self.steer_sign:
+                self.steer_sign[name] = -self.steer_sign[name]
+                job["follow_fails"] = 0
+                self.say(f"retry: {name} keeps steering away — trying the "
+                         "other steering direction", SUN)
+            self._build()
+
+    def _here_cm(self, name):
+        return np.asarray(self.lab.hom.to_cm([list(self.ball_px(name))]),
+                          float).ravel()[:2]
+
+    def _job_restart(self, old):
+        """Start the same job again from where the ball is now. None if there
+        is nothing left of it to do."""
+        name = old["name"]
+        now = time.time()
+        off, _ = self.saved_offset(name)
+        base = {"phase": "aim", "at": now, "name": name, "sent": None,
+                "good": 0, "start_gap": None, "closest": None, "offset": off}
+        if old.get("kind") != "line":
+            self.p2p = dict(base, target=old["target"])
+            return self.p2p
+        p = self._here_cm(name)
+        if old.get("path") is None:
+            a, b = self.lab.hom.to_cm([list(old["line"][0]),
+                                       list(old["line"][1])])
+            a, b = np.asarray(a, float)[:2], np.asarray(b, float)[:2]
+            length = float(np.linalg.norm(b - a))
+            u = (b - a) / max(length, 1e-9)
+            along = float(np.clip(np.dot(p - a, u), 0.0, length))
+            if length - along <= 2 * self.P2P_ARRIVE_CM:
+                along = max(0.0, length - 2 * self.P2P_ARRIVE_CM - 1.0)
+            start = tuple(float(v) for v in
+                          self.lab.hom.to_px([list(a + u * along)])[0])
+            self.p2p = dict(base, kind="line", stage="to_start",
+                            line=(start, old["line"][1]), target=start,
+                            ball_h=0.0)
+            self.line_stats = None
+            return self.p2p
+        path = old["path"]
+        if path["kind"] == "orbit":
+            if self.orbit_run is None:
+                return None
+            self._orbit_next()
+            return self.p2p
+        s_from = float(path.get("s_now") or 0.0)
+        if path["total"] - s_from <= 2 * self.P2P_ARRIVE_CM:
+            s_from = max(0.0, path["total"] - 2 * self.P2P_ARRIVE_CM - 1.0)
+        cm, s_at = path["cm"], path["s"]
+        first = self._path_point(cm, s_at, s_from)
+        rest = np.vstack([first[None, :], cm[s_at > s_from]])
+        seg = np.linalg.norm(np.diff(rest, axis=0), axis=1)
+        s_new = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s_new[-1])
+        face = self._path_point(rest, s_new, min(self.lookahead_cm, total))
+        start_px, face_px = self.lab.hom.to_px([list(rest[0]), list(face)])
+        start_px = tuple(float(v) for v in start_px)
+        face_px = tuple(float(v) for v in face_px)
+        self.p2p = dict(base, kind="line", stage="to_start",
+                        line=(start_px, face_px), target=start_px, ball_h=0.0,
+                        path={"kind": path["kind"], "cm": rest, "s": s_new,
+                              "total": total, "px": [], "s_now": None})
+        self.path_stats = None
+        return self.p2p
+
+    # -- patrols -----------------------------------------------------------------------
+    #
+    # Beside everything that works, none of it changed: a patrol hands routes to
+    # the path follower one run at a time, the way an orbit hands it laps, and
+    # the job supervisor retries a failed run from where the ball is.
+    #
+    # loop        A -> B -> C -> A -> ...  one closed route, driven smoothly,
+    #             a few rounds per run so there is no stop at A each round.
+    # back+forth  A -> B -> C, then C -> B -> A, ... It stops at each end and
+    #             turns round: pure pursuit cannot U-turn on the spot, and
+    #             trying swings wide.
+
+    PATROL_ROUNDS_PER_RUN = 5
+
+    def toggle_patrol_style(self):
+        if self.patrol_run is not None:
+            self.say("stop the patrol before changing its style", SUN)
+            return
+        self.patrol_style = "bounce" if self.patrol_style == "loop" else "loop"
+        self.say("patrol: " + ("round and round the points"
+                               if self.patrol_style == "loop" else
+                               "there and back along the points"), CHALK)
+        self._build()
+
+    def start_patrol(self):
+        if self.patrol_pick is not None:
+            self.cancel_patrol("cancelled")
+            return
+        if self.patrol_run is not None:
+            self.patrol_run = None
+            self.stop_p2p("stopped")
+            self.say("patrol: ended", DIM)
+            self._build()
+            return
+        if (self.p2p is not None or self.p2p_pick or self.line_pick is not None
+                or self.path_pick is not None or self.orbit_pick is not None
+                or self.orbit_run is not None or self.calib is not None):
+            self.say("stop what is running first", SUN)
+            return
+        name = self.drive_target()
+        if name is None:
+            self.say("no ball to drive — scan and connect one", SUN)
+            return
+        if name not in self.lab.tracks.by_name:
+            self.say(f"{name} is not assigned, so there is no heading to steer "
+                     "with — press i and click its front light", SUN)
+            return
+        if self.lab.hom is None or not self.lab.hom.ready:
+            self.say("no arena calibration — press c and pick the corners",
+                     SUN)
+            return
+        self.job = None                 # a job waiting to retry is replaced
+        self.patrol_pick = {"pts": []}
+        self.say("click the patrol points, then done (or Enter)", CHALK)
+        self._build()
+
+    def cancel_patrol(self, why):
+        self.patrol_pick = None
+        self.say(f"patrol: {why}", DIM)
+        self._build()
+
+    def patrol_click(self, pos):
+        pick = self.patrol_pick
+        if pick is None or self._shot is None:
+            return
+        pick["pts"].append(self._view_to_frame(pos))
+        self.say(f"{len(pick['pts'])} patrol points", CHALK)
+
+    def finish_patrol(self):
+        pick = self.patrol_pick
+        if pick is None:
+            return
+        pts = pick["pts"]
+        need = 3 if self.patrol_style == "loop" else 2
+        if len(pts) < need:
+            self.say(("a loop patrol needs at least 3 points — for 2, use "
+                      "back+forth" if self.patrol_style == "loop" else
+                      "a patrol needs at least 2 points"), SUN)
+            return
+        self.patrol_pick = None
+        cm = np.asarray(self.lab.hom.to_cm([list(q) for q in pts]),
+                        float)[:, :2]
+        legs = np.linalg.norm(np.diff(cm, axis=0), axis=1)
+        if float(legs.sum()) < 2 * self.P2P_ARRIVE_CM:
+            self.say("patrol: those points are too close together", SUN)
+            self._build()
+            return
+        self.patrol_run = {"cm": cm, "style": self.patrol_style,
+                           "name": self.drive_target(), "rounds": 0,
+                           "forward": True}
+        self._patrol_next()
+        self._build()
+
+    def _patrol_route(self, run):
+        cm = run["cm"]
+        if run["style"] == "loop":
+            closed = np.vstack([cm, cm[:1]])
+            route = [closed]
+            for _ in range(self.PATROL_ROUNDS_PER_RUN - 1):
+                route.append(closed[1:])
+            return self._resample(np.vstack(route), self.PATH_STEP_CM)
+        way = cm if run["forward"] else cm[::-1]
+        return self._resample(way, self.PATH_STEP_CM)
+
+    def _patrol_next(self):
+        run = self.patrol_run
+        name = run["name"]
+        here = self.ball_px(name)
+        if here is None:
+            return
+        here_cm = np.asarray(self.lab.hom.to_cm([list(here)]), float).ravel()[:2]
+        cm = self._patrol_route(run)
+        seg = np.linalg.norm(np.diff(cm, axis=0), axis=1)
+        s_at = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s_at[-1])
+        face = self._path_point(cm, s_at, min(self.lookahead_cm, total))
+        start_px, face_px = self.lab.hom.to_px([list(cm[0]), list(face)])
+        start_px = tuple(float(v) for v in start_px)
+        face_px = tuple(float(v) for v in face_px)
+        off, _ = self.saved_offset(name)
+        # At the start already — the usual case from one run to the next: turn
+        # to face along it rather than drive a leg to a point under the ball.
+        on_it = float(np.linalg.norm(cm[0] - here_cm)) <= self.P2P_ARRIVE_CM
+        self.p2p = {"kind": "line",
+                    "stage": "face_end" if on_it else "to_start",
+                    "line": (start_px, face_px),
+                    "target": face_px if on_it else start_px,
+                    "phase": "aim", "at": time.time(), "name": name,
+                    "sent": None, "good": 0, "start_gap": None,
+                    "closest": None, "offset": off, "ball_h": 0.0,
+                    "path": {"kind": "patrol", "cm": cm, "s": s_at,
+                             "total": total, "px": [], "s_now": None}}
+        self.path_stats = None
+        if run["style"] == "loop":
+            what = (f"rounds {run['rounds'] + 1}-"
+                    f"{run['rounds'] + self.PATROL_ROUNDS_PER_RUN}")
+        else:
+            what = ("out" if run["forward"] else "back") + \
+                   f", leg {run['rounds'] + 1}"
+        self.say(f"patrol ({'loop' if run['style'] == 'loop' else 'back+forth'})"
+                 f": {what}", CHALK)
+
+    def patrol_tick(self):
+        run = self.patrol_run
+        if run is None or self.p2p is not None:
+            return
+        stats = self.path_stats
+        if stats is None or stats.get("kind") != "patrol":
+            if self._stopped_by_user():
+                self.patrol_run = None
+                self.say("patrol: ended", DIM)
+                self._build()
+            return              # a failure: the job supervisor restarts it
+        if run["style"] == "loop":
+            run["rounds"] += self.PATROL_ROUNDS_PER_RUN
+        else:
+            run["rounds"] += 1
+            run["forward"] = not run["forward"]
+        self._patrol_next()
+
+    def draw_patrol(self, s, px_of):
+        pick = self.patrol_pick
+        if pick is None:
+            return
+        drawn = [px_of(q) for q in pick["pts"]]
+        drawn = [(int(q[0]), int(q[1])) for q in drawn if q is not None]
+        if len(drawn) >= 2:
+            closed = self.patrol_style == "loop" and len(drawn) >= 3
+            pygame.draw.lines(s, SUN, closed, drawn, 2)
+        for k, q in enumerate(drawn):
+            pygame.draw.circle(s, SUN, q, 6, 2)
+            s.blit(self.fs.render(str(k + 1), True, SUN), (q[0] + 9, q[1] - 8))
+        s.blit(self.fb.render(
+            "click the patrol points — Enter or done to go", True, SUN),
+            (VIEW.x + 16, VIEW.y + 14))
+        s.blit(self.fs.render("space to cancel, backspace removes a point",
+                              True, DIM), (VIEW.x + 16, VIEW.y + 36))
+
+    # -- recording every ball, and p2p as a path (built beside the rest) ---------
+
+    PURSUIT_NO_SPIN_DEG = 60.0
+    """Within this of the facing, a pursuit p2p goes straight into following."""
+    PURSUIT_MIN_CM = 10.0
+    """Shorter than this there is no room to steer: the spin p2p does it."""
+
+    def toggle_track_recording(self):
+        was = self.track_recorder.on
+        path = self.track_recorder.toggle()
+        if was:
+            self.say(f"track recording stopped — {self.track_recorder.rows} "
+                     f"frames in {path}", MINT)
+        else:
+            self.say(f"recording every tracked ball to {path} — r to stop",
+                     SUN)
+
+    def toggle_pursuit(self):
+        self.pursuit_p2p = not self.pursuit_p2p
+        self.say("p2p clicks now " + (
+            "PURSUIT: follow a straight path to the target, no spin when it "
+            "is within 60 degrees of the facing" if self.pursuit_p2p else
+            "SPIN: turn on the spot, then drive (the original)"), CHALK)
+
+    def _pursuit_steering(self, name):
+        """The calibrated steering direction, so pursuit does not depend on
+        the 20 degree check when a calibration exists."""
+        if name in self.steer_sign or self.lab.hom is None:
+            return
+        try:
+            rec, _ = ball_calib.load(name, self.lab.hom.M)
+        except Exception:
+            rec = None
+        if rec is not None and rec.get("sign") in (1, -1):
+            self.steer_sign[name] = int(rec["sign"])
+
+    def pursuit_click(self, pos):
+        """A click becomes a straight path to the target, followed by pursuit.
+
+        The path follower, retries and recorder all apply unchanged: this only
+        builds the job. Facing roughly the right way, it starts following at
+        once; otherwise it turns to face the path first, the way a line does.
+        """
+        if not self.p2p_pick or self._shot is None:
+            return
+        name = self.drive_target()
+        here = self.ball_px(name) if name else None
+        hom = self.lab.hom
+        if here is None or hom is None or not hom.ready:
+            self.p2p_click(pos)
+            return
+        target = self._view_to_frame(pos)
+        a, b = hom.to_cm([list(here), list(target)])
+        a, b = np.asarray(a, float)[:2], np.asarray(b, float)[:2]
+        length = float(np.linalg.norm(b - a))
+        if length < self.PURSUIT_MIN_CM:
+            self.say(f"pursuit: {length:.0f}cm is too short to steer — using "
+                     "the spin p2p", DIM)
+            self.p2p_click(pos)
+            return
+        self.p2p_pick = False
+        robot = self.lab.robots.get(name)
+        if callable(getattr(robot, "spin_raw", None)):
+            # The steering maths needs the ball's own zero to point where it
+            # faces NOW. Without a spin it points wherever it was last left.
+            # A zero-power spin and its stop re-zero it through the same tested
+            # stop_raw path a spin uses — and nothing moves.
+            robot.spin_raw(0)
+            self._pursuit_pending = {"pos": pos, "name": name, "at": time.time(),
+                                     "stopped": False}
+            self.say("pursuit p2p: zeroing the ball's heading, then following",
+                     DIM)
+            self._build()
+            return
+        self._pursuit_start(pos, name)
+
+    def pursuit_tick(self):
+        """Finish the re-zero a pursuit click started, then start the job."""
+        pend = self._pursuit_pending
+        if pend is None:
+            return
+        robot = self.lab.robots.get(pend["name"])
+        if robot is None:
+            self._pursuit_pending = None
+            return
+        now = time.time()
+        if not pend["stopped"] and now - pend["at"] >= 0.25:
+            robot.stop_raw()
+            self.lab.tracks.rezeroed(pend["name"])
+            pend["stopped"], pend["at"] = True, now
+            return
+        if pend["stopped"] and now - pend["at"] >= 0.3:
+            self._pursuit_pending = None
+            self._pursuit_start(pend["pos"], pend["name"])
+
+    def _pursuit_start(self, pos, name):
+        hom = self.lab.hom
+        here = self.ball_px(name)
+        if here is None:
+            self.say("pursuit p2p: lost the ball before starting", CORAL)
+            return
+        target = self._view_to_frame(pos)
+        a, b = hom.to_cm([list(here), list(target)])
+        a, b = np.asarray(a, float)[:2], np.asarray(b, float)[:2]
+        cm = self._resample(np.stack([a, b]), self.PATH_STEP_CM)
+        seg = np.linalg.norm(np.diff(cm, axis=0), axis=1)
+        s_at = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s_at[-1])
+        face = self._path_point(cm, s_at, min(self.lookahead_cm, total))
+        start_px, face_px = hom.to_px([list(cm[0]), list(face)])
+        start_px = tuple(float(v) for v in start_px)
+        face_px = tuple(float(v) for v in face_px)
+        facing = self.arena_heading(name)
+        bearing = math.degrees(math.atan2(face[0] - a[0], face[1] - a[1])) % 360.0
+        off_by = None if facing is None else abs(wrap180(bearing - facing))
+        self._pursuit_steering(name)
+        off, _ = self.saved_offset(name)
+        now = time.time()
+        got = {"kind": "line", "stage": "face_end", "line": (start_px, face_px),
+               "target": face_px, "phase": "aim", "at": now, "name": name,
+               "sent": None, "good": 0, "start_gap": None, "closest": None,
+               "offset": off, "ball_h": 0.0,
+               "path": {"kind": "pursuit", "cm": cm, "s": s_at,
+                        "total": total, "px": [start_px, tuple(target)],
+                        "s_now": None}}
+        self.p2p = got
+        self.path_stats = None
+        if off_by is not None and off_by <= self.PURSUIT_NO_SPIN_DEG:
+            robot = self.lab.robots.get(name)
+            self._p2p_aimed(got, robot, facing, now)
+            self.say(f"pursuit p2p: {total:.0f}cm, facing {off_by:.0f} degrees "
+                     "off — following without a spin", CHALK)
+        else:
+            self.say(f"pursuit p2p: {total:.0f}cm, "
+                     + ("no facing yet" if off_by is None else
+                        f"facing {off_by:.0f} degrees off")
+                     + " — turning to face it first", CHALK)
+        self._build()
+
+    def draw_modes(self, s):
+        """Top right of the view: what `r` and `o` have switched on."""
+        rows = []
+        if self.track_recorder.on:
+            rows.append((f"REC tracks  {self.track_recorder.rows} frames", CORAL))
+        if self.pursuit_p2p:
+            rows.append(("p2p: pursuit (o)", CYAN))
+        for k, (text, tone) in enumerate(rows):
+            img = self.fs.render(text, True, tone)
+            s.blit(img, (VIEW.right - img.get_width() - 12, VIEW.y + 10 + k * 16))
+
+    def _p2p_spin(self, robot, power):
+        """Refresh the spin at the push rate."""
+        now = time.perf_counter()
+        if now - self._drive_at < self.DRIVE_PUSH_S:
+            return
+        self._drive_at = now
+        try:
+            robot.spin_raw(power)
+        except Exception as e:
+            self.stop_p2p(f"{e}", CORAL)
+
+    def _p2p_send(self, robot, bearing, byte, always=False):
+        """Rate limited. `always` keeps sending even when nothing changed.
+
+        A Sphero's roll command EXPIRES after a couple of seconds and the ball
+        stops. During a turn in place the bearing does not change, so a
+        send-only-on-change rule sends once and then goes quiet — the ball
+        turns partway, the command lapses, and it sits there. That is the
+        freeze. So a leg refreshes its command at the push rate for as long as
+        it is running.
+        """
+        now = time.perf_counter()
+        last = (self.p2p or {}).get("sent")
+        same = (not always and last is not None
+                and abs(wrap180(bearing - last[0])) < self.DRIVE_TURN_DEADBAND
+                and last[1] == byte)
+        if same or now - self._drive_at < self.DRIVE_PUSH_S:
+            return
+        self._drive_at = now
+        self.p2p["sent"] = (bearing, byte)
+        # The heading the ball is now HOLDING, in its own frame. Line following
+        # needs it to relate that frame to the camera's.
+        self.p2p["ball_h"] = float(bearing) % 360.0
+        try:
+            robot.drive_raw(bearing, byte)
+        except Exception as e:
+            self.stop_p2p(f"{e}", CORAL)
 
     # -- the aim offset, measured and saved ------------------------------
 
@@ -1362,6 +3548,46 @@ class App:
             return
         self.say("wrote calib/homography.json", MINT)
 
+    def save_raw(self):
+        """The camera's own pixels, with nothing drawn on them, for `learn/`.
+
+        The synthetic footage the learned readers train on is only worth
+        anything if it looks like THIS camera, and a screenshot of the window
+        is scaled, overlaid and recompressed. So: the full-resolution frame as
+        read, the shutter it was read at, and what the reader made of it --
+        which says where the robots are without anybody clicking on them.
+        """
+        import json
+        from pathlib import Path
+
+        frame = self.grab.frame
+        if frame is None:
+            self.say("no frame yet to save", SUN)
+            return
+        frame = frame.copy()
+        out = Path("runs/raw")
+        out.mkdir(parents=True, exist_ok=True)
+        stem = time.strftime("raw_%m%d_%H%M%S")
+        rows = []
+        for r in self.lab.analyse_all(frame):
+            rows.append({"centre": r.get("centre"), "deg": r.get("deg"),
+                         "color": r.get("color"), "why": r.get("why"),
+                         "lights": [{k: l.get(k) for k in
+                                     ("x", "y", "area", "peak", "bgr", "hue",
+                                      "sat", "core_px")}
+                                    for l in r.get("group") or []]})
+        meta = {"shape": list(frame.shape), "shutter_us": self.dial.value,
+                "min_v": self.lab.min_v, "span_px": self.lab.span_px,
+                "clusters": rows}
+        try:
+            cv2.imwrite(str(out / f"{stem}.png"), frame)
+            (out / f"{stem}.json").write_text(
+                json.dumps(meta, indent=2, default=float) + "\n")
+        except Exception as e:
+            self.say(f"could not write {out / stem}: {e}", CORAL)
+            return
+        self.say(f"wrote {out / stem}.png — {len(rows)} clusters read", MINT)
+
     def toggle_all(self):
         """Label every cluster, or just read the one."""
         self.show_all = not self.show_all
@@ -1413,6 +3639,20 @@ class App:
                                        log=log))
             y += 26
 
+        def sl_pair(left, right):
+            """Two sliders on one row. The control column sets the window's
+            height, and every full-width row added to it comes out of the fleet
+            list and the readout below — so knobs that belong together share."""
+            nonlocal y
+            half = (w - 12) // 2
+            for col, spec in ((0, left), (1, right)):
+                if spec is None:
+                    continue
+                label, lo, hi, get, set_ = spec
+                self.sliders.append(Slider((x + col * (half + 12), y, half, 20),
+                                           label, lo, hi, get, set_))
+            y += 26
+
         # CAMERA
         # Header plus THREE info lines — source, frames, shutter. The count is
         # here and the lines are drawn in `draw`, so a line added there has to
@@ -1434,8 +3674,62 @@ class App:
             on=self.assigning is not None)
         btn((x + 118, y, 100, 26), "white", self.all_white,
             on=(self.lab.tag_mode == "manual"))
+        btn((x + 226, y, 96, 26), "north", self.start_north,
+            on=self.north_until is not None)
         if held:
-            btn((x + 226, y, 100, 26), "forget", self.forget_tracks, tone=CORAL)
+            # Its own place, clear of `north`. Two buttons sharing a rect is
+            # one you cannot see and one that cannot be clicked, and which is
+            # which depends on the order they were added — so the visible
+            # label and the thing that runs are different buttons.
+            btn((x + 330, y, 100, 26), "forget", self.forget_tracks, tone=CORAL)
+        y += 32
+        btn((x, y, 110, 26), "p2p", self.start_p2p,
+            on=(self.p2p is not None or self.p2p_pick))
+        if self.path_pick is not None:
+            btn((x + 118, y, 100, 26), "stop",
+                lambda: self.cancel_path("cancelled"), tone=CORAL)
+        elif self.orbit_pick is not None:
+            btn((x + 118, y, 100, 26), "stop",
+                lambda: self.cancel_orbit("cancelled"), tone=CORAL)
+        elif self.patrol_pick is not None:
+            btn((x + 118, y, 100, 26), "stop",
+                lambda: self.cancel_patrol("cancelled"), tone=CORAL)
+        elif self.p2p is not None or self.p2p_pick or self.line_pick is not None:
+            btn((x + 118, y, 100, 26), "stop",
+                lambda: self.stop_p2p("stopped"), tone=CORAL)
+        elif self.calib is not None:
+            btn((x + 118, y, 100, 26), "stop",
+                lambda: self.stop_calib("stopped"), tone=CORAL)
+        btn((x + 226, y, 130, 26), f"turn: {self.turn_mode}",
+            self.toggle_turn_mode)
+        busy = self.p2p is not None or self.line_pick is not None
+        btn((x + 364, y, 90, 26), "line", self.start_line,
+            on=(busy and ((self.p2p or {}).get("kind") == "line"
+                          or self.line_pick is not None)))
+        btn((x + 462, y, 74, 26), "calib", self.start_calib,
+            on=self.calib is not None)
+        y += 32
+        kind = ((self.path_pick or {}).get("kind")
+                or ((self.p2p or {}).get("path") or {}).get("kind"))
+        # One row for every drawn job. The panel has no row to spare: while
+        # points are being clicked, `done` takes the orbit direction's place.
+        btn((x, y, 70, 26), "poly", lambda: self.start_path("poly"),
+            on=kind == "poly")
+        btn((x + 78, y, 70, 26), "free", lambda: self.start_path("free"),
+            on=kind == "free")
+        btn((x + 156, y, 76, 26), "orbit", self.start_orbit,
+            on=(self.orbit_pick is not None or self.orbit_run is not None))
+        if self.path_pick is not None and self.path_pick["kind"] == "poly":
+            btn((x + 240, y, 50, 26), "done", self.finish_path, tone=MINT)
+        elif self.patrol_pick is not None:
+            btn((x + 240, y, 50, 26), "done", self.finish_patrol, tone=MINT)
+        else:
+            btn((x + 240, y, 50, 26), self.orbit_dir, self.toggle_orbit_dir)
+        btn((x + 298, y, 84, 26), "patrol", self.start_patrol,
+            on=(self.patrol_pick is not None or self.patrol_run is not None))
+        btn((x + 390, y, 110, 26),
+            "loop" if self.patrol_style == "loop" else "back+forth",
+            self.toggle_patrol_style)
         y += 34
         sl("focus", shutter.FOCUS_MIN, shutter.FOCUS_MAX,
            lambda: self.focus_dial.value, self.focus_dial.set)
@@ -1473,7 +3767,11 @@ class App:
             y += 32
         sl("light floor", 60, 254, lambda: self.lab.min_v,
            lambda v: setattr(self.lab, "min_v", int(v)))
-        sl("ball span", 10, 300, lambda: self.lab.span_px,
+        # "group within", not "ball span": the readout a few rows below
+        # reports a MEASURED light span, and two numbers called span sitting
+        # near each other — one a knob, one a measurement — is a reading of the
+        # panel that cannot be got right by looking at it.
+        sl("group within", 10, 300, lambda: self.lab.span_px,
            lambda v: setattr(self.lab, "span_px", int(v)))
 
         # WHAT THE BALL IS DRIVEN AT — set directly, in the units the ball
@@ -1535,8 +3833,19 @@ class App:
         # exactly how `taillight` ended up unreachable with three balls held.
         sl("bright", 0, 255, lambda: self.bright, self.set_bright)
         sl("taillight", 0, 255, lambda: self.tail, self.set_tail)
-        sl("drive", 0, 255, lambda: self.drive_byte,
-           lambda v: setattr(self, "drive_byte", int(v)))
+        # Only the knobs the chosen turn actually reads. A spin never looks at
+        # `turn lead`, and a heading turn never looks at `spin power`.
+        turn_knob = (("spin power", 0, 160, lambda: int(self.spin_power),
+                      lambda v: setattr(self, "spin_power", float(v)))
+                     if self.turn_mode in ("rate", "taper") else
+                     ("turn lead", 3, 90, lambda: int(self.turn_lead),
+                      lambda v: setattr(self, "turn_lead", float(v))))
+        sl_pair(("drive", 0, 255, lambda: self.drive_byte,
+                 lambda v: setattr(self, "drive_byte", int(v))), turn_knob)
+        sl_pair(("aim band", 2, 40, lambda: int(self.aim_band),
+                 lambda v: setattr(self, "aim_band", float(v))),
+                ("lookahead", 4, 40, lambda: int(self.lookahead_cm),
+                 lambda v: setattr(self, "lookahead_cm", float(v))))
         y += 6
 
         # The readout needs room whatever the fleet is doing, so the list is
@@ -1726,6 +4035,16 @@ class App:
                 self.lab.track(self.all_reading, step)
             self.last_tick = now_t
             self.drive_tick(max(min(step, 0.2), 1e-3))
+            self.north_tick()
+            self.agent.pump()
+            self.job_tick()
+            self.pursuit_tick()
+            self.p2p_tick()
+            self.calib_tick()
+            self.orbit_tick()
+            self.patrol_tick()
+            self.recorder.tick()
+            self.track_recorder.tick()
             self.log_reading()
         now = time.time()
         self.fps_count += 1
@@ -1761,6 +4080,18 @@ class App:
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
                     return self.close()
+                if e.type == pygame.KEYDOWN and self.agent.typing:
+                    self.agent.key(e, pygame)
+                    continue
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_t:
+                    self.agent.typing, self.agent.text = True, ""
+                    continue
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_r:
+                    self.toggle_track_recording()
+                    continue
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_o:
+                    self.toggle_pursuit()
+                    continue
                 if e.type == pygame.KEYDOWN:
                     if e.key == pygame.K_ESCAPE and self.assigning:
                         self.stop_assigning()
@@ -1768,11 +4099,52 @@ class App:
                         continue
                     if e.key in (pygame.K_ESCAPE, pygame.K_q):
                         return self.close()
+                    if e.key == pygame.K_SPACE and (
+                            self.p2p or self.p2p_pick
+                            or self.line_pick is not None):
+                        self.stop_p2p("stopped")
+                        continue
+                    if e.key == pygame.K_SPACE and self.patrol_pick is not None:
+                        self.cancel_patrol("cancelled")
+                        continue
+                    if (e.key == pygame.K_RETURN
+                            and self.patrol_pick is not None):
+                        self.finish_patrol()
+                        continue
+                    if (e.key == pygame.K_BACKSPACE and self.patrol_pick
+                            and self.patrol_pick["pts"]):
+                        self.patrol_pick["pts"].pop()
+                        continue
+                    if e.key == pygame.K_SPACE and self.orbit_pick is not None:
+                        self.cancel_orbit("cancelled")
+                        continue
+                    if e.key == pygame.K_SPACE and self.path_pick is not None:
+                        self.cancel_path("cancelled")
+                        continue
+                    if (e.key == pygame.K_RETURN and self.path_pick is not None
+                            and self.path_pick["kind"] == "poly"):
+                        self.finish_path()
+                        continue
+                    if (e.key == pygame.K_BACKSPACE and self.path_pick
+                            and self.path_pick["pts"]):
+                        self.path_pick["pts"].pop()
+                        continue
+                    if e.key == pygame.K_SPACE and self.calib is not None:
+                        self.stop_calib("stopped")
+                        continue
                     if e.key == pygame.K_SPACE:
                         self.paused = not self.paused
                         self.say("paused" if self.paused else "running")
                     if e.key == pygame.K_TAB:
                         self.cycle_drive()
+                    if e.key == pygame.K_n:
+                        self.start_north()
+                    if e.key == pygame.K_p:
+                        self.start_p2p()
+                    if e.key == pygame.K_l:
+                        self.start_line()
+                    if e.key == pygame.K_k:
+                        self.start_calib()
                     if e.key == pygame.K_g:
                         if e.mod & pygame.KMOD_SHIFT:
                             self.forget_aim()
@@ -1797,6 +4169,8 @@ class App:
                         self.toggle_all()
                     if e.key == pygame.K_f:
                         self.focus_off()
+                    if e.key == pygame.K_p:
+                        self.save_raw()
                     if e.key in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
                         # One notch of the shutter, either way. A slider is
                         # hard to nudge by one step and the useful range here
@@ -1812,6 +4186,24 @@ class App:
                     if self.assigning and VIEW.collidepoint(p):
                         self.assign_click(p)
                         continue
+                    if self.p2p_pick and VIEW.collidepoint(p):
+                        if self.pursuit_p2p:
+                            self.pursuit_click(p)
+                        else:
+                            self.p2p_click(p)
+                        continue
+                    if self.line_pick is not None and VIEW.collidepoint(p):
+                        self.line_click(p)
+                        continue
+                    if self.path_pick is not None and VIEW.collidepoint(p):
+                        self.path_press(p)
+                        continue
+                    if self.orbit_pick is not None and VIEW.collidepoint(p):
+                        self.orbit_click(p)
+                        continue
+                    if self.patrol_pick is not None and VIEW.collidepoint(p):
+                        self.patrol_click(p)
+                        continue
                     if not any(b.hit(p) for b in self.buttons):
                         for s in self.sliders:
                             if s.hit(p):
@@ -1820,9 +4212,13 @@ class App:
                     if self.list_rect.collidepoint(pygame.mouse.get_pos()):
                         self.scroll_list(-e.y)
                 if e.type == pygame.MOUSEBUTTONUP:
+                    if self.path_pick is not None and self.path_pick["drawing"]:
+                        self.path_release()
                     for s in self.sliders:
                         s.dragging = False
                 if e.type == pygame.MOUSEMOTION:
+                    if self.path_pick is not None and self.path_pick["drawing"]:
+                        self.path_drag(e.pos)
                     for s in self.sliders:
                         if s.dragging:
                             s.drag(e.pos)
@@ -1832,6 +4228,16 @@ class App:
             self.clock.tick(30)
 
     def close(self):
+        # A run still going when the window closes is exactly the one worth
+        # reading back.
+        try:
+            self.recorder.flush()
+        except Exception:
+            pass
+        try:
+            self.track_recorder.stop()
+        except Exception:
+            pass
         # Join before releasing. `VideoCapture.release()` while another thread
         # is inside `read()` is a segfault in OpenCV, not an exception — and it
         # lands on the way out, where it reads as "the app crashed on quit"
@@ -1848,12 +4254,51 @@ class App:
         s.fill(INK)
         s.blit(self.fb.render("taillight", True, CHALK), (14, 12))
         s.blit(self.f.render(
-            "arrows drive · tab ball · i assign · c corners · w write · m mask · a all · q",
+            "t ask model · n north · arrows drive · tab ball · i assign · c corners · m mask · q",
             True, GREY), (130, 16))
         self.draw_view(s)
+        self.draw_agent(s)
+        self.draw_modes(s)
         self.draw_log(s)
         self.draw_profile(s)
         self.draw_panel(s)
+
+    def draw_agent(self, s):
+        """The command bar and the model's transcript, over the bottom of the
+        camera view."""
+        agent = self.agent
+        if not (agent.typing or agent.busy or agent.log):
+            return
+        lines = []
+        for kind, text in agent.log[-7:]:
+            tone = {"you": CHALK, "call": CYAN, "say": MINT,
+                    "error": CORAL}.get(kind, DIM)
+            prefix = {"you": "> ", "call": "  ", "say": "", "error": "! "}.get(
+                kind, "")
+            for ln in _wrap(prefix + text, 118)[:3]:
+                lines.append((ln, tone))
+        lines = lines[-9:]
+        bar_h = 26
+        box_h = 8 + 15 * len(lines) + bar_h
+        box = pygame.Rect(VIEW.x + 8, VIEW.bottom - box_h - 34, VIEW.w - 16,
+                          box_h)
+        shade = pygame.Surface(box.size, pygame.SRCALPHA)
+        shade.fill((6, 12, 22, 215))
+        s.blit(shade, box.topleft)
+        y = box.y + 6
+        for ln, tone in lines:
+            s.blit(self.fs.render(ln, True, tone), (box.x + 10, y))
+            y += 15
+        if agent.typing:
+            prompt = "ask> " + agent.text + ("_" if int(time.time() * 2) % 2
+                                            else " ")
+            tone = SUN
+        elif agent.busy:
+            prompt, tone = "thinking… (t to type the next command when done)", DIM
+        else:
+            prompt, tone = "t to ask the model · esc closes the bar", DIM
+        s.blit(self.fb.render(prompt[-100:], True, tone),
+               (box.x + 10, box.bottom - bar_h + 4))
 
     def _blit_bgr(self, s, img):
         """Centre a BGR image in the view pane. Returns (origin, scale)."""
@@ -1970,8 +4415,17 @@ class App:
             if p is None:
                 continue
             px, py = int(p[0]), int(p[1])
-            tone = (CORAL if t.contended else SUN if t.lost else MINT)
+            tone = (CORAL if t.contended else
+                    CYAN if t.bridged else SUN if t.lost else MINT)
             pygame.draw.circle(s, tone, (px, py), 20, 1 if t.lost else 2)
+            # A bridged track still has a heading worth drawing — that is the
+            # whole point of bridging — but it is an ESTIMATE, so the arrow is
+            # dashed-thin and the ring stays open.
+            if t.bridged:
+                a = math.radians(t.heading)
+                tip = (px + math.cos(a) * 40, py + math.sin(a) * 40)
+                pygame.draw.line(s, tone, (px, py),
+                                 (int(tip[0]), int(tip[1])), 1)
             if not t.lost:
                 a = math.radians(t.heading)
                 tip = (px + math.cos(a) * 40, py + math.sin(a) * 40)
@@ -1980,11 +4434,15 @@ class App:
                 pygame.draw.circle(s, tone, (int(tip[0]), int(tip[1])), 4)
 
             rows = [self.fb.render(
-                t.name + ("  LOST" if t.lost else ""), True, tone)]
+                t.name + ("  ESTIMATED" if t.bridged else
+                          "  LOST" if t.lost else ""), True, tone)]
             if t.lost or t.why:
                 rows.append(self.fs.render(
                     fit(self.fs, t.why or "", 240)[0] if t.why else "",
                     True, DIM))
+            if t.bridged:
+                rows.append(self.fs.render(
+                    f"{t.heading:.0f}deg from its own yaw", True, DIM))
             if not t.lost:
                 rows.append(self.fs.render(
                     f"{t.heading:.0f}deg"
@@ -1997,6 +4455,98 @@ class App:
                 lx = px - 28 - widest
             for k, row in enumerate(rows):
                 s.blit(row, (max(VIEW.x + 4, lx), py - 18 + k * 15))
+
+    def draw_line(self, s, px_of):
+        """Start, end, the line between, and where it is steering right now."""
+        got = self.p2p
+        pts = None
+        if self.line_pick is not None:
+            pts = list(self.line_pick)
+        elif (got is not None and got.get("kind") == "line"
+              and got.get("path") is None):
+            pts = list(got["line"])
+        if pts is None:
+            return
+        drawn = [px_of(q) for q in pts]
+        drawn = [(int(q[0]), int(q[1])) for q in drawn if q is not None]
+        if len(drawn) == 2:
+            pygame.draw.line(s, CYAN, drawn[0], drawn[1], 2)
+        for q, label in zip(drawn, ("S", "E")):
+            pygame.draw.circle(s, CYAN, q, 11, 2)
+            s.blit(self.fb.render(label, True, CYAN), (q[0] + 14, q[1] - 10))
+        if got is not None and got.get("stage") == "follow" and got.get("lookahead") is not None:
+            t_px = self.lab.hom.to_px([list(got["lookahead"])])
+            t_px = np.asarray(t_px, float).ravel()[:2]
+            q = px_of(tuple(t_px))
+            if q is not None:
+                pygame.draw.circle(s, MINT, (int(q[0]), int(q[1])), 5)
+        if self.line_pick is not None:
+            s.blit(self.fb.render(
+                "click the START of the line" if not self.line_pick
+                else "now click the END", True, SUN),
+                (VIEW.x + 16, VIEW.y + 14))
+            s.blit(self.fs.render("l or space to cancel", True, DIM),
+                   (VIEW.x + 16, VIEW.y + 36))
+
+    def draw_p2p(self, s, px_of):
+        """The target, the leg to it, and how far there is to run."""
+        self.draw_line(s, px_of)
+        self.draw_path(s, px_of)
+        self.draw_orbit(s, px_of)
+        self.draw_patrol(s, px_of)
+        if self.p2p_pick:
+            s.blit(self.fb.render("click where it should go", True, SUN),
+                   (VIEW.x + 16, VIEW.y + 14))
+            s.blit(self.fs.render("p or space to cancel", True, DIM),
+                   (VIEW.x + 16, VIEW.y + 36))
+            return
+        got = self.p2p
+        if got is None:
+            return
+        at = px_of(got["target"])
+        if at is None:
+            return
+        tx, ty = int(at[0]), int(at[1])
+        aiming = got["phase"] == "aim"
+        tone = SUN if aiming else MINT
+
+        # A ring and a cross, rather than a dot: a dot on a dark floor at this
+        # scale is indistinguishable from a light.
+        pygame.draw.circle(s, tone, (tx, ty), 13, 2)
+        pygame.draw.line(s, tone, (tx - 20, ty), (tx + 20, ty), 1)
+        pygame.draw.line(s, tone, (tx, ty - 20), (tx, ty + 20), 1)
+
+        here = self.ball_px(got["name"])
+        geo = self.p2p_geometry()
+        if here is not None:
+            a = px_of(here)
+            if a is not None:
+                # The leg it intends to drive, so a wrong target is obvious
+                # from the line rather than from where the ball ends up.
+                pygame.draw.line(s, tone, (int(a[0]), int(a[1])), (tx, ty), 1)
+        spinning = aiming and bool(got.get("spin_dir"))
+        stage = {"to_start": "to start", "face_end": "facing end",
+                 "check": "checking steering", "follow": "following"}.get(
+                     got.get("stage"))
+        word = ("spinning" if spinning else "aiming") if aiming else "driving"
+        rows = [self.fb.render(f"{stage}: {word}" if stage else word,
+                               True, tone)]
+        if geo is not None:
+            bearing, gap = geo
+            rows.append(self.fs.render(
+                f"{gap:.0f}cm at {bearing:.0f}deg", True, DIM))
+            if aiming:
+                facing = self.arena_heading(got["name"])
+                if facing is not None:
+                    rows.append(self.fs.render(
+                        f"facing {facing:.0f}, {wrap180(facing - bearing):+.0f} "
+                        f"to turn", True, DIM))
+            else:
+                byte, _ = self.p2p_byte()
+                rows.append(self.fs.render(
+                    f"{self.P2P_CM_S:.0f}cm/s  byte {byte}", True, DIM))
+        for k, row in enumerate(rows):
+            s.blit(row, (tx + 24, ty - 18 + k * 15))
 
     def draw_labels(self, s, px_of, scale):
         """Which cluster vision thinks is which robot, drawn on each one.
@@ -2036,6 +4586,25 @@ class App:
             rad = max(10, int(span * scale * 0.8))
             pygame.draw.circle(s, tone, (px, py), rad, 1)
 
+            # ITS OWN ARROW. Every cluster here has been read independently and
+            # carries its own front and back; drawing only the primary
+            # reading's arrow was a drawing gap that looked exactly like the
+            # other balls not being read at all.
+            #
+            # From the two mapped ENDPOINTS rather than from the angle: a
+            # perspective map does not preserve angles, so rotating a bearing
+            # by whatever the matrix does at the image centre puts the arrow at
+            # an angle to its own lights everywhere else.
+            pf = px_of((c["front"]["x"], c["front"]["y"])) if c.get("front") else None
+            pb = px_of((c["back"]["x"], c["back"]["y"])) if c.get("back") else None
+            if pf is not None and pb is not None:
+                ang = math.atan2(pf[1] - pb[1], pf[0] - pb[0])
+                reach = max(rad * 1.6, 18.0)
+                tip = (px + math.cos(ang) * reach, py + math.sin(ang) * reach)
+                pygame.draw.line(s, tone, (px, py),
+                                 (int(tip[0]), int(tip[1])), 2)
+                pygame.draw.circle(s, tone, (int(tip[0]), int(tip[1])), 4)
+
             if c.get("color"):
                 pygame.draw.circle(
                     s, slot_rgb(self.lab.detector.colors, c["color"]),
@@ -2051,7 +4620,7 @@ class App:
             if c.get("conf_span") is not None:
                 worst = ("span" if c["conf_span"] <= c["conf_ends"] else "ends")
                 rows.append(self.fs.render(
-                    f"span {c['conf_span']:.2f} ({c['span_px']:.0f}px)  "
+                    f"light span {c['conf_span']:.2f} ({c['span_px']:.0f}px)  "
                     f"ends {c['conf_ends']:.2f}  <- {worst}", True,
                     SUN if min(c["conf_span"], c["conf_ends"]) < 0.6 else GREY))
             if c.get("xy_cm") is not None:
@@ -2105,6 +4674,14 @@ class App:
         if px_of is None:
             def px_of(p):
                 return (at[0] + p[0] * scale, at[1] + p[1] * scale)
+
+        # WHERE IT IS GOING, drawn before anything else so it is never
+        # hidden behind a label. A target you cannot see is a target you
+        # cannot check: the click goes through the same pixel mapping as the
+        # corner picking, and if that were wrong the ball would drive
+        # somewhere nobody asked for with nothing on screen to say so.
+        self.draw_p2p(s, px_of)
+        self.draw_calib(s, px_of)
 
         if self.picking is not None:
             pts = [px_of(q) for q in self.picking]
@@ -2435,7 +5012,7 @@ class App:
             rows.append(("conf", f"{r['conf']:.2f}", ""))
             if r.get("conf_span") is not None:
                 span = r.get("span_px") or 0.0
-                rows.append((" from span", f"{r['conf_span']:.2f}",
+                rows.append((" from light span", f"{r['conf_span']:.2f}",
                              f"{span:.0f}px of {SPAN_FOR_FULL_CONF:.0f}"))
                 how = ("tag" if r.get("by_tag") else
                        "blue" if r.get("by_colour") else "brightness")

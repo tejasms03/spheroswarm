@@ -854,7 +854,7 @@ class RunLog:
                "parts", "area", "peak", "clipped",
                "run_id", "run_source", "run_outcome",
                "path", "path_pts",
-               "style", "set_speed", "set_lookahead", "set_arrive",
+               "style", "set_speed", "set_lookahead", "set_arrive", "set_turn",
                "cmd_vx", "cmd_vy", "cmd_deg", "aim_offset_deg", "note")
 
     FLUSH_EVERY = 30
@@ -1825,6 +1825,7 @@ class BlobTest:
         self.armed = False          # is the controller allowed to drive?
         self.speed = 20             # cm/s, the slider the operator drives with
         self.lookahead = 15         # cm
+        self.turn_rate = SLEW_DEG_S  # deg/s the command may swing; see `slew`
         self.drive_note = ""
         self.target_cm = None
         self._stepped = 0.0
@@ -1900,6 +1901,9 @@ class BlobTest:
         # Run ids come from one counter for every robot, so two robots never
         # both write a run 1 into the same log.
         self._runs = 0
+        self._beacon = None
+        self.beacon_on = True
+        self._fresh_at = deque(maxlen=60)     # when frames were PROCESSED
         self.exposure_locked = False
         self.exp_took = None
 
@@ -2104,6 +2108,7 @@ class BlobTest:
         if bot is None:
             return
         bot["rgb"][int(i)] = int(np.clip(value, 0, 255))
+        bot.setdefault("base_rgb", list(bot["rgb"]))[int(i)] = bot["rgb"][int(i)]
         # The overlay follows the LED, so what is drawn is what the ball is
         # actually glowing rather than what the palette says it should be.
         bot["marker"] = tuple(bot["rgb"])
@@ -2385,7 +2390,13 @@ class BlobTest:
                            "rgb": rgb, "track": Track(),
                            "marker": tuple(rgb),
                            "zeroed": False, "identified": False,
-                           "drive": self.fresh_drive()}
+                           "drive": self.fresh_drive(),
+                           # The colour to return to. `rgb` is what the LED
+                           # shows right now, and a blinking ball is dimmed half
+                           # the time.
+                           "base_rgb": list(rgb),
+                           "code_bits": self.free_beacon_code(),
+                           "driving_at": None, "still_since": None}
         self._switch_to(code)
 
     def drive_all(self):
@@ -2638,6 +2649,7 @@ class BlobTest:
             frame, count = self.cam.latest()
             if frame is not None and count != self.seen:
                 self.frame, self.seen, fresh = frame, count, True
+                self._fresh_at.append(time.perf_counter())
         if self.frame is None:
             return
 
@@ -2706,6 +2718,7 @@ class BlobTest:
                     self.fleet.step(dt)
                 except Exception:
                     pass
+        self.step_beacon()
         self.drive_all()
         self.log_state()
 
@@ -2857,10 +2870,17 @@ class BlobTest:
                 ("max jump", 8, 400, lambda: self.track.max_jump, self.set_jump, False),
                 ("speed", 0, 60, lambda: self.speed, self.set_speed, False),
                 ("lookahead", 2, 60, lambda: self.lookahead, self.set_lookahead, False),
+                # Beside lookahead, because together they set how tight a
+                # corner is: lookahead is the bigger lever, and once it is
+                # short this becomes the next limit.
+                ("turn rate", 60, 900, lambda: self.turn_rate, self.set_turn_rate, False),
                 ("arrive", 2, 40, lambda: self.goal_tol, self.set_goal_tol, False)):
             self.sliders.append(
                 Slider((x, y, w, 18), label, lo, hi, get, set_, log=log))
-            y += 26
+            # 23, not 26: the turn-rate slider costs a row, and the rows it
+            # pushes off the bottom are the FRAME warnings -- "exposure on
+            # auto" among them, which is the first thing to check at the rig.
+            y += 23
         y += 6
         bw = (w - 12) // 3
         rows = ((("lock", lambda: self.exposure_mode(True), MINT),
@@ -2970,6 +2990,9 @@ class BlobTest:
 
     def set_lookahead(self, v):
         self.lookahead = int(v)
+
+    def set_turn_rate(self, v):
+        self.turn_rate = float(v)
 
     def apply_latency_advice(self):
         """Set lookahead and arrival from the measured lag at the current speed.
@@ -3598,6 +3621,7 @@ class BlobTest:
                            run_outcome=outcome, mode="end", note=note or "",
                            set_speed=int(self.speed),
                            set_lookahead=int(self.lookahead),
+                           set_turn=int(self.turn_rate),
                            set_arrive=int(self.goal_tol), style=self.style,
                            path=None if self.path is None else self.path.kind)
         self.armed = False
@@ -3895,7 +3919,7 @@ class BlobTest:
             return v
         dt = max(now - self._slew_at, 1e-3)
         step = (want - self._slew_deg + 180.0) % 360.0 - 180.0
-        limit = SLEW_DEG_S * dt
+        limit = float(self.turn_rate) * dt
         if abs(step) > limit:
             step = limit if step > 0 else -limit
         self._slew_deg = (self._slew_deg + step) % 360.0
@@ -4364,6 +4388,7 @@ class BlobTest:
             style=self.style,
             set_speed=int(self.speed),
             set_lookahead=int(self.lookahead),
+            set_turn=int(self.turn_rate),
             set_arrive=int(self.goal_tol),
             x_px=None if blob is None else float(blob["xy"][0]),
             y_px=None if blob is None else float(blob["xy"][1]),
@@ -4529,6 +4554,271 @@ class BlobTest:
                 break
         return out
 
+    BEACON_SETTLE_S = 1.5
+    """Seconds without a move command before a ball may count as still. Covers
+    the coast, which the accelerometer cannot be trusted to see the tail of."""
+    BEACON_SKIP_S = 0.15
+    """The least of each slot thrown away. The camera shows a brightness change
+    late, and the lag is counted in FRAMES: the change is only pushed on the
+    first tick after a slot starts, and only seen a frame after that. So the
+    real skip is two frame periods, and this is its floor -- see `beacon_skip`.
+    A fixed 0.15s let one slot bleed into the next at 6fps, turning SYRX's
+    1000 into MLYS's 1100."""
+    BEACON_CLEAR = 0.25
+    """Every slot must sit within this fraction of the swing from bright or from
+    dim. A slot halfway between is a slot caught mid-change, and forcing it to
+    a bit is how a clean code becomes someone else's."""
+    BEACON_MAX_DRIFT_CM = 2.0
+    """A track that moved further than this during a cycle is not read. It was
+    either not a still ball, or it jumped to a different one partway."""
+    BEACON_MIN_SWING = 0.35
+    """A track's brightness must swing by at least this fraction of its own
+    peak to be read as a code. A dim slot is 30% of full, so a real blink
+    swings 70%; noise on a steady ball must never be decoded as someone."""
+
+    def read_bits(self, means):
+        """Per-slot brightnesses as a code, or None when they do not say one.
+
+        Shared by the roll call and the resting blink, because both fail the
+        same way when read carelessly. Thresholded against the ball's OWN
+        range, never an absolute level: a ball far from the camera is dimmer
+        than a near one at the same drive, and an absolute cut would read
+        distance as data. And a slot sitting between bright and dim is a slot
+        caught mid-change, which is refused rather than forced to a bit.
+        """
+        if not means or any(m is None for m in means):
+            return None
+        lo, hi = min(means), max(means)
+        if hi <= 0 or hi - lo < self.BEACON_MIN_SWING * hi:
+            return None                   # steady: moving, or no signal in it
+        where = [(m - lo) / (hi - lo) for m in means]
+        if any(self.BEACON_CLEAR < f < 1.0 - self.BEACON_CLEAR for f in where):
+            return None
+        return tuple(1 if f > 0.5 else 0 for f in where)
+
+    def tracked_fps(self):
+        """Frames the bench actually PROCESSED per second, over the last ~2s.
+
+        Not the camera's rate. The camera can deliver 15 while tracking keeps up
+        with 12, and it is the second that the jump gate, the blink and the
+        controller live on. Measured over a window that ends NOW, so a stall
+        shows up rather than being averaged away.
+        """
+        t = [x for x in self._fresh_at if time.perf_counter() - x < 2.0]
+        if len(t) < 2:
+            return 0.0
+        return (len(t) - 1) / max(t[-1] - t[0], 1e-6)
+
+    def beacon_skip(self):
+        """Seconds to discard at the start of each slot: all but the last two frames.
+
+        The SETTLED TAIL of each slot, rather than a guess at the lag. The lag
+        is the whole pipeline -- the tick that pushes the change, the frames
+        already in flight, the camera's own buffering -- and in sim it came to
+        about 0.3s, more than the two frame periods first assumed; a USB camera
+        will have its own. The last frames of a slot are the furthest from the
+        change, so reading only those tolerates any lag up to the slot length
+        less two frames, without having to know what the lag is.
+        """
+        fps = float(getattr(self.cam, "fps", 0.0) or 0.0)
+        tail = 2.0 / max(fps, 5.0)
+        return max(self.BEACON_SKIP_S, self.ID_SLOT_S - tail)
+
+    def free_beacon_code(self):
+        used = {tuple(b["code_bits"]) for b in self.bots.values()
+                if b.get("code_bits")}
+        for bits in self.id_codes(2 ** self.ID_SLOTS):
+            if tuple(bits) not in used:
+                return list(bits)
+        return None
+
+    def step_beacon(self):
+        """Every resting ball blinks its code; every moving one holds steady.
+
+        The roll call, run continuously and only where it costs nothing. A
+        ball at rest is not being steered, so dimming it disturbs nothing, and
+        blinking it means its name is re-read every cycle for as long as it
+        sits there -- so it is never older than one cycle when it is next asked
+        to move, and a name swapped while two balls passed close is put right
+        within a cycle of them stopping. While moving, tracking carries the
+        name; blinking a moving ball would make its position jitter with its
+        brightness.
+
+        STILL is decided without the camera, which is the point: the camera
+        judges a ball by the blob carrying its name, and it is exactly the name
+        that is in doubt. A ball is still when nothing has told it to move for
+        `BEACON_SETTLE_S`, and its own accelerometer does not say otherwise.
+
+        Only with two or more robots. One robot can only be one ball, so a
+        lone ball never blinks and a single-robot run is untouched.
+        """
+        if self.reid is not None:
+            self._beacon = None          # the roll call owns every LED
+            return
+        if len(self.bots) < 2 or not self.beacon_on:
+            self._beacon = None
+            self.beacon_restore()
+            return
+        now = time.perf_counter()
+        period = self.ID_SLOT_S * self.ID_SLOTS
+        cycle, into = divmod(now, period)
+        slot = min(int(into // self.ID_SLOT_S), self.ID_SLOTS - 1)
+
+        driving = set(self.driving_codes())
+        for code, bot in self.bots.items():
+            if code in driving:
+                bot["driving_at"] = now
+            h = self.fleet.handles.get(code) if self.fleet else None
+            quiet = h.accel_quiet() if h is not None else None
+            settled = (bot.get("driving_at") is None
+                       or now - bot["driving_at"] > self.BEACON_SETTLE_S)
+            still = settled and quiet is not False
+            if still and bot.get("still_since") is None:
+                bot["still_since"] = now
+            elif not still:
+                bot["still_since"] = None
+
+        b = self._beacon
+        if b is None or b["cycle"] != cycle:
+            if b is not None:
+                self.decode_beacon(b)
+            b = self._beacon = {"cycle": cycle, "start": cycle * period,
+                                "seen": {}}
+
+        for code, bot in self.bots.items():
+            base = bot.setdefault("base_rgb", list(bot["rgb"]))
+            bits = bot.get("code_bits")
+            level = 1.0
+            if bot.get("still_since") is not None and bits:
+                level = 1.0 if bits[slot] else self.ID_DIM
+            want = [int(v * level) for v in base]
+            # Only on a change. Every write is radio airtime shared with the
+            # robots that are driving.
+            if want != list(bot["rgb"]):
+                bot["rgb"] = want
+                self.push_led(code)
+
+        # Gathered per TRACK OBJECT, never per name. A track follows one ball
+        # whatever it is called; a name can change owner partway through a
+        # cycle, and evidence gathered under a name then stitches half of one
+        # ball's code to half of another's -- which can spell a third robot's
+        # code exactly. That is not hypothetical: it was the first thing this
+        # did when a swap was made mid-cycle.
+        if into - slot * self.ID_SLOT_S >= self.beacon_skip():
+            for code, bot in self.bots.items():
+                blob = bot.get("blob")
+                if blob is None:
+                    continue
+                track = bot["track"]
+                entry = b["seen"].setdefault(id(track), {
+                    "track": track, "pts": [],
+                    "slots": [[] for _ in range(self.ID_SLOTS)]})
+                entry["slots"][slot].append(float(blob["peak"]))
+                entry["pts"].append(np.asarray(self.to_cm(blob["xy"]), dtype=float))
+
+    def beacon_restore(self):
+        """Every LED back to its colour, and nothing counted as blinking."""
+        for code, bot in self.bots.items():
+            base = bot.get("base_rgb")
+            if base is not None and list(bot["rgb"]) != list(base):
+                bot["rgb"] = list(base)
+                self.push_led(code)
+            bot["still_since"] = None
+
+    def decode_beacon(self, b):
+        """Read one finished cycle, and move the names the balls contradict.
+
+        Per TRACK: which robot a track belongs to is the question, so the
+        evidence is kept with the track and judged against whatever name holds
+        it NOW, which the answer is allowed to disagree with.
+
+        A code only counts from a robot that was still for the WHOLE cycle. A
+        ball that stopped halfway shows steady slots and then half its code,
+        and that half-pattern can equal someone else's code exactly.
+        """
+        owner = {tuple(bot["code_bits"]): c for c, bot in self.bots.items()
+                 if bot.get("code_bits")}
+        read = {}
+        for entry in b["seen"].values():
+            holder = next((c for c, bot in self.bots.items()
+                           if bot["track"] is entry["track"]), None)
+            if holder is None:
+                continue
+            pts = np.asarray(entry["pts"])
+            if len(pts) and float(np.max(np.ptp(pts, axis=0))) > self.BEACON_MAX_DRIFT_CM:
+                continue
+            bits = self.read_bits([float(np.mean(v)) if v else None
+                                   for v in entry["slots"]])
+            who = owner.get(bits) if bits is not None else None
+            if who is None:
+                continue
+            since = self.bots[who].get("still_since")
+            if since is None or since > b["start"]:
+                continue
+            read[holder] = who
+        # Two tracks claiming one robot: believe neither.
+        claims = list(read.values())
+        read = {h: w for h, w in read.items() if claims.count(w) == 1}
+        for holder, who in read.items():
+            if holder == who:
+                self.bots[who]["identified"] = True
+        moves = {h: w for h, w in read.items() if h != w}
+        if moves:
+            self.apply_beacon_moves(moves)
+
+    def apply_beacon_moves(self, moves):
+        """Put each read track under the robot it belongs to.
+
+        When one side of a swap was read and the other was not -- the other
+        ball is still moving, so it is not blinking -- the unread track goes
+        to the robot left without one. With exactly one of each that is the
+        swap it has to be, and it is done now rather than a cycle later
+        because the robot left holding the wrong track may be DRIVING, steered
+        on another ball's position. Its name is then marked unidentified: it
+        was inferred, not read. Anything more tangled than that is left alone
+        and handed to the roll call.
+        """
+        old = {c: (bot["track"], bot.get("blob")) for c, bot in self.bots.items()}
+        new = {who: old[holder] for holder, who in moves.items()}
+        gave, got = set(moves), set(moves.values())
+        orphans = [c for c in gave if c not in got]
+        spare = [c for c in got if c not in gave]
+        if len(orphans) != len(spare) or len(orphans) > 1:
+            self.say("names disagree with the blink but the fix is ambiguous "
+                     "— press i", SUN)
+            return
+        for o, sp in zip(orphans, spare):
+            new[o] = old[sp]
+        for code, (track, blob) in new.items():
+            self.bots[code]["track"], self.bots[code]["blob"] = track, blob
+            self.forget_motion(code)
+        for code in got:
+            self.bots[code]["identified"] = True
+        for code in orphans:
+            self.bots[code]["identified"] = False
+        if self.code in self.bots:
+            self.blob = self.bots[self.code].get("blob")
+        self.say("blink corrected " + ", ".join(
+            f"{holder}'s ball is {who}" for holder, who in moves.items()), MINT)
+
+    def forget_motion(self, code):
+        """Drop the speed history and trail recorded under a name that was wrong.
+
+        They were measured on the other ball. A stale history is worse than
+        none: the stall detector and the taper would read another ball's
+        motion as this one's.
+        """
+        if code == self.code:
+            state = {k: getattr(self, k) for k in ("history", "trail")}
+            self._clear_radius_px = None
+        else:
+            state = self.bots[code].get("drive") or {}
+            if state:
+                state["_clear_radius_px"] = None
+        for k in ("history", "trail"):
+            if k in state:
+                state[k].clear()
+
     def start_reid(self):
         """Blink every robot at once and read the names back off the blobs.
 
@@ -4561,7 +4851,8 @@ class BlobTest:
                      "code": dict(zip(self.bots, codes)),
                      "seen": {c: [[] for _ in range(self.ID_SLOTS)]
                               for c in self.bots},
-                     "base": {c: list(b["rgb"]) for c, b in self.bots.items()}}
+                     "base": {c: list(b.get("base_rgb", b["rgb"]))
+                              for c, b in self.bots.items()}}
         self.say(f"identifying {len(self.bots)} robots — "
                  f"{self.ID_SLOTS * self.ID_SLOT_S:.0f}s")
 
@@ -4587,6 +4878,12 @@ class BlobTest:
         # Sampled per TRACK, not per robot: which robot a track belongs to is
         # the question, so the answer must not be assumed while gathering the
         # evidence for it.
+        #
+        # Not in the first frames of a slot, which still show the last one --
+        # at a low frame rate that bleed turned 1000 into 1110 and the whole
+        # roll call came back unreadable. See `beacon_skip`.
+        if elapsed - slot * self.ID_SLOT_S < self.beacon_skip():
+            return
         for c, bot in self.bots.items():
             blob = bot.get("blob")
             if blob is not None:
@@ -4602,17 +4899,10 @@ class BlobTest:
 
         read = {}
         for c, slots in r["seen"].items():
-            means = [float(np.mean(v)) if v else None for v in slots]
-            if any(m is None for m in means):
-                continue
-            # Thresholded against this track's OWN range, never an absolute
-            # level. A ball far from the camera is dimmer than a near one at
-            # the same drive, so an absolute cut would read distance as data.
-            lo, hi = min(means), max(means)
-            if hi - lo < 1.0:
-                continue                    # never changed: no signal in it
-            mid = (lo + hi) / 2.0
-            read[c] = [1 if m > mid else 0 for m in means]
+            bits = self.read_bits([float(np.mean(v)) if v else None
+                                   for v in slots])
+            if bits is not None:
+                read[c] = list(bits)
 
         owner = {tuple(bits): c for c, bits in r["code"].items()}
         moved, lost = {}, []
@@ -5558,6 +5848,12 @@ class BlobTest:
         y += 8
 
         y = self.sect(self.screen, self.fs, "frame", x, y, w)
+        # Under 10 the blink reads slowly and the jump gate widens; the tone
+        # says so without anyone having to remember the number.
+        tracked = self.tracked_fps()
+        y = self.row(f"camera {self.cam.fps:4.1f} fps   tracking {tracked:4.1f} fps",
+                     x, y, MINT if tracked >= 10 else (SUN if tracked >= 6 else CORAL),
+                     self.fs)
         want_jump = self.jump_advice()
         if want_jump:
             loose = self.track.max_jump > want_jump * 2.5
@@ -5667,6 +5963,16 @@ class BlobTest:
             y = self.row(f"aim offset {h.heading_offset:5.1f}°   "
                          f"samples {st.get('samples', 0)}", x, y,
                          MINT if abs(h.heading_offset) < 1.0 else DIM, self.fs)
+            # What QUIET_G gets set from: read this at rest, rolling, and
+            # coasting, on this floor.
+            sig, quiet = h.accel_sigma(), h.accel_quiet()
+            bot = self.bots.get(self.code) or {}
+            y = self.row("imu " + ("no stream" if sig is None else
+                                   f"{'still' if quiet else 'moving'}  σ {sig:.3f} g")
+                         + ("   blinking" if bot.get("still_since") and
+                            len(self.bots) > 1 and self.beacon_on else ""),
+                         x, y, DIM if sig is None else (MINT if quiet else SUN),
+                         self.fs)
         y += 8
 
         y = self.sect(self.screen, self.fs, "found", x, y, w,
