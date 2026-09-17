@@ -1,0 +1,312 @@
+{
+ "name": "stress: 2 balls, seed 12",
+ "description": "Each ball works through its own list of 10 jobs, one after another with a 3 s pause, until 180 s. Same jobs every run.",
+ "arena_cm": [
+  138.8,
+  110.8
+ ],
+ "duration_s": 180,
+ "balls": [
+  {
+   "slot": "A",
+   "start": [
+    48.5,
+    25.4
+   ],
+   "facing_deg": 209
+  },
+  {
+   "slot": "B",
+   "start": [
+    113,
+    30.8
+   ],
+   "facing_deg": 5
+  }
+ ],
+ "jobs": [
+  {
+   "ball": "A",
+   "kind": "orbit",
+   "centre": [
+    71.6,
+    58.4
+   ],
+   "radius": 29,
+   "direction": "cw",
+   "seconds": 29
+  },
+  {
+   "ball": "A",
+   "kind": "line",
+   "from": [
+    70.9,
+    73.1
+   ],
+   "to": [
+    84.5,
+    57.6
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "patrol",
+   "points": [
+    [
+     118.6,
+     37.1
+    ],
+    [
+     50.1,
+     83.1
+    ],
+    [
+     58.3,
+     50.4
+    ]
+   ],
+   "rounds": 1
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    33,
+    48.3
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    46.9,
+    41
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "line",
+   "from": [
+    36.8,
+    63
+   ],
+   "to": [
+    81.1,
+    39.9
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "poly",
+   "points": [
+    [
+     54.2,
+     37.4
+    ],
+    [
+     59.5,
+     73.3
+    ],
+    [
+     36.9,
+     21.1
+    ]
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "poly",
+   "points": [
+    [
+     70.5,
+     30.6
+    ],
+    [
+     30,
+     70
+    ],
+    [
+     56.9,
+     30.5
+    ]
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "line",
+   "from": [
+    60.7,
+    80.4
+   ],
+   "to": [
+    26.9,
+    72.4
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "line",
+   "from": [
+    42.1,
+    49.5
+   ],
+   "to": [
+    25.8,
+    73.6
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "p2p",
+   "to": [
+    22.9,
+    62.2
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     64.7,
+     49.7
+    ],
+    [
+     38.5,
+     23.1
+    ],
+    [
+     72.9,
+     59.8
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "park",
+   "seconds": 9
+  },
+  {
+   "ball": "B",
+   "kind": "p2p",
+   "to": [
+    79.2,
+    75.9
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "p2p",
+   "to": [
+    114.2,
+    34.4
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "patrol",
+   "points": [
+    [
+     34.2,
+     82.9
+    ],
+    [
+     26.7,
+     38
+    ],
+    [
+     115.6,
+     36.9
+    ]
+   ],
+   "rounds": 1
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     49.9,
+     56.4
+    ],
+    [
+     58.9,
+     72.9
+    ],
+    [
+     32.1,
+     87.3
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     109,
+     88.6
+    ],
+    [
+     30.6,
+     53.3
+    ],
+    [
+     70.8,
+     34.8
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "patrol",
+   "points": [
+    [
+     45.8,
+     23.8
+    ],
+    [
+     55.7,
+     62.1
+    ],
+    [
+     102.1,
+     56.2
+    ]
+   ],
+   "rounds": 1
+  },
+  {
+   "ball": "B",
+   "kind": "p2p",
+   "to": [
+    44.8,
+    22.9
+   ]
+  }
+ ],
+ "job_order": "each ball works through its own jobs in order; the next starts 3 s after the previous finishes",
+ "expected_sim": {
+  "model": "path-timed traffic planner, realistic ball (0.37 s command delay, 0.1 s camera delay, 1 cm / 5 deg noise, 1.2% dropped frames, +-25% speed wander, stick-slip spins, 1.2x over-turn, heading drift) \u2014 5 noise seeds",
+  "normal_speed_12cm_s": {
+   "jobs_finished": "51/57 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 15.3,
+   "move_asides_per_run": 11.4,
+   "brake_pct_of_time": 1.3,
+   "no_progress_20s": 2,
+   "avg_run_s": 180
+  },
+  "slow_9cm_s_wide_margins": {
+   "jobs_finished": "29/38 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 18.7,
+   "move_asides_per_run": 13.6,
+   "brake_pct_of_time": 0.4,
+   "no_progress_20s": 6,
+   "avg_run_s": 180
+  }
+ }
+}

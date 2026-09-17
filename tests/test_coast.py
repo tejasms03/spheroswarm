@@ -711,6 +711,7 @@ def test_slew_limits_the_turn_but_never_the_speed():
 
     import coast_test as blob_test
     app = types.SimpleNamespace(_slew_at=None, _slew_deg=None,
+                                turn_rate=blob_test.SLEW_DEG_S,
                                 slew=blob_test.BlobTest.slew)
     v = np.array([20.0, 0.0])
     out = blob_test.BlobTest.slew(app, v)
@@ -1093,8 +1094,15 @@ def test_decoding_is_relative_to_each_track_not_an_absolute_level():
     import inspect
 
     from coast_test import BlobTest
-    src = inspect.getsource(BlobTest.finish_reid)
+    # The roll call and the resting blink read through one shared reader.
+    assert "read_bits" in inspect.getsource(BlobTest.finish_reid)
+    src = inspect.getsource(BlobTest.read_bits)
     assert "min(means)" in src and "max(means)" in src
+    # And it behaves that way: the same code, near and far, reads the same.
+    reader = BlobTest.__new__(BlobTest)
+    near = [245.0, 73.0, 73.0, 245.0]
+    far = [v * 0.4 for v in near]
+    assert reader.read_bits(near) == reader.read_bits(far) == (1, 0, 0, 1)
 
 
 def test_an_unclaimed_or_contested_code_is_left_unidentified():
@@ -2067,3 +2075,41 @@ def test_the_grid_follows_the_clicked_corners_not_the_calibration_quad():
         assert seen, "nothing was drawn"
     finally:
         app.close()
+
+
+# -- how fast the command may turn -----------------------------------------
+
+def _swing(rate, monkeypatch):
+    """Ask for a 90 degree turn 0.1s after the last command; say how far it got."""
+    import coast_test as F
+    app = F.BlobTest("sim", with_fleet=False)
+    try:
+        clock = [100.0]
+        monkeypatch.setattr(F.time, "perf_counter", lambda: clock[0])
+        app.turn_rate = rate
+        app.slew(np.array([20.0, 0.0]))            # heading 0
+        clock[0] += 0.1
+        v = app.slew(np.array([0.0, 20.0]))        # wants 90
+        return float(np.degrees(np.arctan2(v[1], v[0])))
+    finally:
+        app.close()
+
+
+def test_the_turn_rate_slider_is_what_limits_the_swing(monkeypatch):
+    """Together with lookahead it sets how tight a corner is: in sim a square's
+    corners went from 3.3cm cut to under 1cm with a shorter lookahead and a
+    faster turn. It is a knob so it can be set against the real ball's noise."""
+    assert _swing(220.0, monkeypatch) == pytest.approx(22.0, abs=0.5)
+    assert _swing(600.0, monkeypatch) == pytest.approx(60.0, abs=0.5)
+
+
+def test_the_turn_rate_is_a_slider_and_is_logged():
+    import coast_test as F
+    from coast_test import RunLog
+    app = F.BlobTest("sim", with_fleet=False)
+    try:
+        assert any(s.label == "turn rate" for s in app.sliders)
+        assert app.turn_rate == F.SLEW_DEG_S, "the default is unchanged"
+    finally:
+        app.close()
+    assert "set_turn" in RunLog.COLUMNS

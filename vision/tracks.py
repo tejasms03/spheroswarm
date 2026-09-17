@@ -82,6 +82,49 @@ MIN_TURN_GATE_DEG = 60.0
 # So a vote needs the motion to be going SOMEWHERE. Net displacement across a
 # window, against the path length walked to get there: real driving scores near
 # one, an oscillation scores near zero because it keeps coming back.
+# -- bridging a gap with the ball's own yaw --------------------------------
+#
+# The camera loses the heading often enough to matter: the lights merge into a
+# blob too round to have an axis, something passes over the ball, it reaches
+# the edge. While that lasts the tracker has no idea how far the ball has
+# turned, and on the way back it picks whichever end of the axis is nearer the
+# heading it last saw. Measured: a ball hidden for two thirds of a second and
+# turned more than about 110 degrees comes back silently 180 out.
+#
+# The ball knows. Its attitude sensor reports chassis yaw, and only the CHANGE
+# since the last good camera frame is used, so the sensor's absolute value and
+# its constant bias never enter into it.
+#
+# THE BAR IS 90 DEGREES, NOT ONE. The estimate is used only to choose which
+# end of the axis is the front; the camera's own angle is then taken as the
+# heading. So a drift of a degree or two a second has a minute of margin, and
+# nothing the sensor gets wrong accumulates into what is reported.
+BRIDGE_MAX_S = 3.0
+"""How long to carry a heading on the sensor alone. Generous against drift and
+still bounded: an unbridled bridge quietly becomes fiction, and a track that
+has been guessing for a minute should say it is lost."""
+
+# WHICH WAY IS POSITIVE, AND HOW MUCH. The sensor's yaw and the camera's image
+# degrees are two different frames: the sign may be opposite and the scale is
+# not guaranteed to be one. Assuming either turns a 90 degree turn into minus
+# 90 — which is the 180 error this exists to prevent. So it is LEARNED, from
+# frames where both are available, and bridging is refused until enough
+# rotation has been seen for the fit to mean anything.
+YAW_FIT_MIN_STEP = 2.0      # deg; attitude is quantised to 1, so smaller is noise
+YAW_FIT_MIN_TOTAL = 40.0    # deg of rotation before the fit is believed
+YAW_FIT_KEEP = 200          # paired steps remembered
+YAW_GAIN_LIMITS = (0.3, 3.0)
+YAW_JUMP_DEG = 30.0
+"""A sensor step bigger than this that the CAMERA did not also see is a
+re-zero, not a turn. A ball told to call its current orientation zero reports
+its yaw jumping by whatever the old angle was, while nothing physically moved —
+and fitted as a turn, that single step would swamp every real one. Judged
+against the camera rather than as a raw size, because a genuine fast spin also
+makes big steps, and those the camera DOES see."""
+"""A fit outside this is not a frame difference, it is a sensor that is not
+tracking the same rotation at all — and bridging on it would be worse than
+not bridging."""
+
 CONFIRM_MIN_PX = 25.0
 CONFIRM_STRAIGHT = 0.7
 CONFIRM_WINDOW_S = 0.6
@@ -131,6 +174,15 @@ class Track:
         self.flips_caught = 0
         self.travelling = False             # is the motion going somewhere?
         self._last_flip_at = None
+        # Bridging the camera with the ball's own yaw. See BRIDGE_MAX_S.
+        self.bridged = False                # is this heading an estimate?
+        self.yaw_gain = None                # image degrees per sensor degree
+        self.yaw_fit_total = 0.0            # rotation seen, for the fit
+        self._yaw_steps = deque(maxlen=YAW_FIT_KEEP)
+        self._anchor_heading = None
+        self._anchor_yaw = None
+        self._last_yaw = None
+        self._bridge_from = None
         self._trail = deque()               # (t, centre), recent history
         self._against = 0                   # consecutive disagreeing votes
 
@@ -192,6 +244,22 @@ class Tracks:
         self.by_name[name] = t
         return t, None
 
+    def rezeroed(self, name):
+        """This ball was just told to call its current orientation zero.
+
+        Its reported yaw is about to jump with nothing having moved. Forget the
+        anchors, so the next camera frame starts a fresh pairing instead of
+        measuring a turn across the jump. The learned GAIN is kept: re-zeroing
+        moves the sensor's origin, not how it scales.
+        """
+        t = self.by_name.get(name)
+        if t is None:
+            return
+        t._last_yaw = None
+        t._anchor_yaw = None
+        t._bridge_from = None
+        t.bridged = False
+
     def drop(self, name=None):
         if name is None:
             self.by_name.clear()
@@ -208,13 +276,20 @@ class Tracks:
 
     # -- carrying it ------------------------------------------------------
 
-    def update(self, clusters, dt, targets=None):
+    def update(self, clusters, dt, targets=None, yaws=None):
         """Associate every track with a cluster, or lose it out loud.
 
         `clusters` are this frame's readings — anything with a `centre` and a
         `group`. `targets` optionally maps a name to where that robot is
         currently being DRIVEN, in the same pixel frame; see `_vote`, which
-        much prefers that evidence to guessing from travel alone.
+        much prefers that evidence to guessing from travel alone. `yaws` maps
+        a name to that ball's own chassis yaw in degrees — any frame, any sign;
+        see `_learn_yaw`, which works out how it relates to the camera rather
+        than assuming.
+
+        Nothing here knows what a Sphero is. Both extras are plain numbers, so
+        a caller with a different robot, or none, passes nothing and loses
+        nothing.
         """
         dt = max(float(dt), 1e-3)
         self.t += dt
@@ -250,15 +325,55 @@ class Tracks:
             chosen[name] = (usable[i], d)
 
         for name, t in self.by_name.items():
+            yaw = (yaws or {}).get(name)
             got = chosen.get(name)
             if got is None:
-                self._miss(t, usable, gate)
+                self._miss(t, usable, gate, yaw)
                 continue
             cluster, d = got
-            self._hit(t, cluster, d, dt, (targets or {}).get(name))
+            self._hit(t, cluster, d, dt, (targets or {}).get(name), yaw)
         return list(self.by_name.values())
 
-    def _hit(self, t, cluster, d, dt, target=None):
+    # -- the ball's own yaw ----------------------------------------------
+
+    def _learn_yaw(self, t, yaw, camera_deg):
+        """How this ball's yaw relates to the camera's degrees.
+
+        Both turn when the ball turns, so the relationship falls out of
+        watching them together: fit the camera's change against the sensor's
+        over the frames where both are available. The sign comes out of the
+        fit, which is the point — guessing it is how a 90 degree turn becomes
+        minus 90, and that is a 180 error in the one place it must not happen.
+
+        A by-product worth having: if the two do not move together at all, the
+        fit lands outside `YAW_GAIN_LIMITS` and bridging is refused. So the
+        sensor is checked continuously, against the camera, for free — and a
+        ball whose attitude never tracks simply never gets bridged.
+        """
+        prev_y, prev_c = t._last_yaw, t._anchor_heading
+        t._last_yaw = yaw
+        if prev_y is None or prev_c is None:
+            return
+        dy = wrap180(yaw - prev_y)
+        dc = wrap180(camera_deg - prev_c)
+        if abs(dy) < YAW_FIT_MIN_STEP:
+            return                      # below the quantisation, it is noise
+        if abs(dy) > YAW_JUMP_DEG and abs(abs(dc) - abs(dy)) > 0.5 * abs(dy):
+            return                      # the sensor jumped, the ball did not
+        t._yaw_steps.append((dy, dc))
+        t.yaw_fit_total = sum(abs(a) for a, _ in t._yaw_steps)
+        if t.yaw_fit_total < YAW_FIT_MIN_TOTAL:
+            return
+        # Least squares through the origin: one number, and its sign.
+        num = sum(a * b for a, b in t._yaw_steps)
+        den = sum(a * a for a, _ in t._yaw_steps)
+        if den <= 1e-9:
+            return
+        gain = num / den
+        lo, hi = YAW_GAIN_LIMITS
+        t.yaw_gain = gain if lo <= abs(gain) <= hi else None
+
+    def _hit(self, t, cluster, d, dt, target=None, yaw=None):
         centre = _centre_of(cluster)
         axis = _axis_of(cluster)
         t.contended = False
@@ -283,6 +398,19 @@ class Tracks:
                 # plant cannot have produced.
                 t.why = (f"axis jumped {swing:.0f}deg in {dt*1000:.0f}ms — "
                          "holding the previous heading")
+
+        # The camera has answered, so this is where the bridge re-anchors:
+        # the estimate has already done its job by steering the end-choice
+        # above, and the heading now goes back to being a measurement.
+        t.bridged = False
+        t._bridge_from = None
+        if yaw is not None:
+            # `t.heading` is THIS frame's camera answer; `_anchor_heading` is
+            # last frame's. The fit needs both, and passing the anchor twice
+            # makes every camera step zero.
+            self._learn_yaw(t, yaw, t.heading)
+        t._anchor_heading = t.heading
+        t._anchor_yaw = yaw
 
         t.centre = tuple(float(v) for v in centre)
         self._vote(t, centre, target)
@@ -384,8 +512,23 @@ class Tracks:
         t._trail.clear()
         t.why = f"{because} — turned the heading round and carrying on"
 
-    def _miss(self, t, usable, gate):
-        """No cluster inside the gate, or the claim was contested."""
+    def _miss(self, t, usable, gate, yaw=None):
+        """No cluster inside the gate, or the claim was contested.
+
+        Before declaring it lost, see whether the ball can say how far it has
+        turned since the camera last saw it. That does not recover the
+        POSITION — nothing here can — but it keeps the heading pointing the
+        right way, so that when the lights come back the right end of the axis
+        is chosen. See BRIDGE_MAX_S.
+        """
+        if self._bridge(t, yaw):
+            near = min((math.dist(t.centre, _centre_of(c)) for c in usable),
+                       default=None)
+            t.lost = True
+            t.contended = near is not None and near <= gate
+            t.why = (f"camera lost it — heading carried by the ball's own yaw "
+                     f"for {self.t - t._bridge_from:.1f}s")
+            return
         near = min((math.dist(t.centre, _centre_of(c)) for c in usable),
                    default=None)
         t.lost = True
@@ -400,6 +543,33 @@ class Tracks:
         else:
             t.why = (f"nearest cluster is {near:.0f}px away, past the "
                      f"{gate:.0f}px gate — occluded, or it left the frame")
+
+    def _bridge(self, t, yaw):
+        """Carry the heading on the ball's own yaw. True if it did.
+
+        Refuses, and says nothing, whenever it would be guessing: no sensor,
+        no anchor, a relationship to the camera that has not been established,
+        or a gap gone on so long that drift has eaten the margin.
+        """
+        t.bridged = False
+        if (yaw is None or t._anchor_yaw is None or t.yaw_gain is None
+                or t._anchor_heading is None):
+            return False
+        if t._bridge_from is None:
+            t._bridge_from = self.t
+        elif self.t - t._bridge_from > BRIDGE_MAX_S:
+            return False                # drift has outlived its usefulness
+        turned = wrap180(yaw - t._anchor_yaw) * t.yaw_gain
+        # A turn the ball could not physically have made in the time since the
+        # anchor is a sensor that jumped — most likely a re-zero landing inside
+        # the gap. Bridging on it would carry a fiction back into the heading.
+        elapsed = max(self.t - (t._bridge_from or self.t), 0.0) + 0.1
+        if abs(turned) > MAX_TURN_DEG_PER_S * elapsed + YAW_JUMP_DEG:
+            t.bridged = False
+            return False
+        t.heading = (t._anchor_heading + turned) % 360.0
+        t.bridged = True
+        return True
 
 
 # -- reading a cluster, whatever shape the caller's dict is ----------------

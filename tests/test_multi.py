@@ -251,3 +251,199 @@ def test_a_background_message_names_its_robot(three):
     assert three.note == f"{other}: arrived — stopped"
     three.say("plain")
     assert three.note == "plain"
+
+
+# -- resting balls say who they are ------------------------------------------
+
+def _truly(app, code):
+    """Is `code`'s name on `code`'s ball? Asked of the simulator, not the bench."""
+    blob = app.bots[code].get("blob")
+    if blob is None:
+        return False
+    cm = np.asarray(app.to_cm(blob["xy"]), dtype=float)
+    return float(np.linalg.norm(cm - app.fleet.handles[code].pos)) < 3.0
+
+
+def _swap(app, a, b):
+    A, B = app.bots[a], app.bots[b]
+    A["track"], B["track"] = B["track"], A["track"]
+    A["blob"], B["blob"] = B["blob"], A["blob"]
+
+
+def _cycle(app, holder_means, owner_still_for=10.0, drift_cm=0.0):
+    """One finished beacon cycle, made by hand. `holder_means` maps a robot to
+    the four slot brightnesses its CURRENT track showed."""
+    start = 1000.0
+    for bot in app.bots.values():
+        bot["still_since"] = start - owner_still_for
+    seen = {}
+    for holder, means in holder_means.items():
+        track = app.bots[holder]["track"]
+        seen[id(track)] = {"track": track,
+                           "pts": [np.zeros(2), np.array([drift_cm, 0.0])],
+                           "slots": [[m] for m in means]}
+    return {"cycle": 0, "start": start, "seen": seen}
+
+
+def _bright(bits, lo=73.0, hi=245.0):
+    return [hi if b else lo for b in bits]
+
+
+def test_every_robot_gets_its_own_code():
+    app = F.BlobTest("sim", code="SYRX,VHGR,MLYS,SNFR")
+    try:
+        codes = [tuple(b["code_bits"]) for b in app.bots.values()]
+        assert len(set(codes)) == 4
+        assert all(0 < sum(c) < len(c) for c in codes), "steady is never a code"
+    finally:
+        app.close()
+
+
+def test_resting_balls_blink_and_their_names_come_right_without_a_roll_call(three):
+    """Acquisition hands out names by guess; resting balls fix them."""
+    assert _tick(three, 10.0, lambda: all(_truly(three, c) for c in three.bots)), \
+        {c: _truly(three, c) for c in three.bots}
+    dims = [b for b in three.bots.values() if b["rgb"] != b["base_rgb"]]
+    _tick(three, three.ID_SLOT_S * three.ID_SLOTS)
+    assert any(b["rgb"] != b["base_rgb"] for b in three.bots.values()) or dims, \
+        "nothing ever dimmed"
+
+
+def test_a_swap_at_rest_is_put_right_within_a_few_cycles(three):
+    _tick(three, 10.0, lambda: all(_truly(three, c) for c in three.bots))
+    a, b, _ = list(three.bots)
+    _swap(three, a, b)
+    assert not _truly(three, a)
+    assert _tick(three, 10.0, lambda: all(_truly(three, c) for c in three.bots))
+
+
+def test_a_driving_ball_holds_steady(three):
+    code = list(three.bots)[0]
+    _arm_toward(three, code)
+    _tick(three, 1.5)
+    bot = three.bots[code]
+    assert bot["still_since"] is None
+    assert bot["rgb"] == bot["base_rgb"], "a moving ball must not blink"
+    three.stop_all()
+
+
+def test_its_own_accelerometer_can_stop_a_ball_counting_as_still(three, monkeypatch):
+    """A bumped ball the bench never told to move."""
+    code = list(three.bots)[0]
+    monkeypatch.setattr(three.fleet.handles[code], "accel_quiet", lambda: False)
+    _tick(three, 1.0)
+    assert three.bots[code]["still_since"] is None
+    assert three.bots[code]["rgb"] == three.bots[code]["base_rgb"]
+
+
+def test_a_silent_accelerometer_does_not_veto(three, monkeypatch):
+    """No stream is "unknown", not "moving" -- or a ball with a dead sensor
+    could never identify itself."""
+    code = list(three.bots)[0]
+    monkeypatch.setattr(three.fleet.handles[code], "accel_quiet", lambda: None)
+    _tick(three, 1.0)
+    assert three.bots[code]["still_since"] is not None
+
+
+def test_one_robot_never_blinks():
+    """One robot can only be one ball. A single-robot run is untouched."""
+    app = F.BlobTest("sim", code="SYRX")
+    try:
+        _tick(app, 1.0)
+        assert app._beacon is None
+    finally:
+        app.close()
+
+
+# -- reading a cycle ---------------------------------------------------------
+
+def test_a_clean_contradiction_moves_the_names(three):
+    """Judged against the evidence given, not the simulator: the fixture's
+    names start as acquisition's guesses, so a made-up cycle is the truth here."""
+    a, b, _ = list(three.bots)
+    ta, tb = three.bots[a]["track"], three.bots[b]["track"]
+    three.decode_beacon(_cycle(three, {
+        a: _bright(three.bots[b]["code_bits"]),
+        b: _bright(three.bots[a]["code_bits"])}))
+    assert three.bots[b]["track"] is ta and three.bots[a]["track"] is tb
+
+
+def test_a_slot_caught_mid_change_is_not_read(three):
+    """The read that turned SYRX's 1000 into MLYS's 1100: slot 0 bleeding into
+    slot 1 at a low frame rate. Halfway is not a bit."""
+    a, b, c = list(three.bots)
+    three.bots[a]["code_bits"] = [1, 0, 0, 0]
+    three.bots[c]["code_bits"] = [1, 1, 0, 0]
+    before = {k: v["track"] for k, v in three.bots.items()}
+    three.decode_beacon(_cycle(three, {a: [202.0, 159.0, 73.0, 73.0]}))
+    assert {k: v["track"] for k, v in three.bots.items()} == before
+
+
+def test_a_code_from_a_ball_that_stopped_mid_cycle_is_not_read(three):
+    """Half a cycle of steady and half a code can spell another robot exactly."""
+    a, b, _ = list(three.bots)
+    before = three.bots[a]["track"]
+    three.decode_beacon(_cycle(three, {a: _bright(three.bots[b]["code_bits"])},
+                               owner_still_for=-1.0))
+    assert three.bots[a]["track"] is before
+
+
+def test_a_track_that_moved_during_the_cycle_is_not_read(three):
+    a, b, _ = list(three.bots)
+    before = three.bots[a]["track"]
+    three.decode_beacon(_cycle(three, {a: _bright(three.bots[b]["code_bits"])},
+                               drift_cm=5.0))
+    assert three.bots[a]["track"] is before
+
+
+def test_noise_on_a_steady_ball_is_never_a_code(three):
+    a, _, _ = list(three.bots)
+    before = three.bots[a]["track"]
+    three.decode_beacon(_cycle(three, {a: [245.0, 239.0, 244.0, 241.0]}))
+    assert three.bots[a]["track"] is before
+
+
+def test_one_side_of_a_swap_is_enough_when_the_other_is_moving(three):
+    """The unread ball is moving, so it is not blinking -- and the robot left
+    holding the wrong track may be driving on another ball's position. The
+    swap it must be is made now, and the inferred name marked unidentified."""
+    a, b, _ = list(three.bots)
+    ta, tb = three.bots[a]["track"], three.bots[b]["track"]
+    three.decode_beacon(_cycle(three, {a: _bright(three.bots[b]["code_bits"])}))
+    assert three.bots[b]["track"] is ta and three.bots[a]["track"] is tb
+    assert three.bots[b]["identified"] is True
+    assert three.bots[a]["identified"] is False
+
+
+def test_the_roll_call_restores_the_colour_not_a_dim_blink(three):
+    code = list(three.bots)[0]
+    bot = three.bots[code]
+    bot["rgb"] = [int(v * three.ID_DIM) for v in bot["base_rgb"]]
+    three.start_reid()
+    assert three.reid["base"][code] == bot["base_rgb"]
+
+
+def test_evidence_stays_with_the_track_when_a_name_moves(three, monkeypatch):
+    """The first bug this had. Evidence kept by NAME stitched half of one
+    ball's code to half of another's when a name moved mid-cycle -- and
+    SYRX's 1000 plus VHGR's 0100 read as MLYS's 1100. Kept by track, a ball's
+    readings stay that ball's whatever it is called."""
+    clock = [1000.0 * three.ID_SLOT_S * three.ID_SLOTS]
+    monkeypatch.setattr(F.time, "perf_counter", lambda: clock[0])
+    for bot in three.bots.values():
+        bot["driving_at"] = None
+    a, c, _ = list(three.bots)
+    for i, bot in enumerate(three.bots.values()):
+        bot["blob"] = dict(bot["blob"], peak=100.0 + i)
+    ta = three.bots[a]["track"]
+    mine = three.bots[a]["blob"]["peak"]
+
+    clock[0] += 0.45                           # late in slot 0
+    three.step_beacon()
+    _swap(three, a, c)                         # the name moves, the ball does not
+    clock[0] += 2 * three.ID_SLOT_S            # late in slot 2, same cycle
+    three.step_beacon()
+
+    entry = three._beacon["seen"][id(ta)]
+    peaks = [p for slot in entry["slots"] for p in slot]
+    assert len(peaks) == 2 and set(peaks) == {mine}, peaks
