@@ -1,0 +1,77 @@
+{
+ "name": "base: orbits",
+ "description": "A and B orbit two circles that touch in the middle, in opposite directions, 60 s.",
+ "arena_cm": [
+  138.8,
+  110.8
+ ],
+ "duration_s": 300,
+ "balls": [
+  {
+   "slot": "A",
+   "start": [
+    25,
+    55
+   ],
+   "facing_deg": 0,
+   "parked": false
+  },
+  {
+   "slot": "B",
+   "start": [
+    115,
+    55
+   ],
+   "facing_deg": 0,
+   "parked": false
+  }
+ ],
+ "jobs": [
+  {
+   "ball": "A",
+   "kind": "orbit",
+   "centre": [
+    50,
+    55
+   ],
+   "radius": 25,
+   "direction": "cw",
+   "seconds": 60
+  },
+  {
+   "ball": "B",
+   "kind": "orbit",
+   "centre": [
+    90,
+    55
+   ],
+   "radius": 25,
+   "direction": "ccw",
+   "seconds": 60
+  }
+ ],
+ "job_order": "each ball works through its own jobs in order; the next starts 3 s after the previous finishes",
+ "expected_sim": {
+  "model": "path-timed traffic planner, realistic ball (0.37 s command delay, 0.1 s camera delay, 1 cm / 5 deg noise, 1.2% dropped frames, +-25% speed wander, stick-slip spins, 1.2x over-turn, heading drift) \u2014 5 noise seeds",
+  "normal_speed_12cm_s": {
+   "jobs_finished": "10/10 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 15.9,
+   "move_asides_per_run": 2.6,
+   "brake_pct_of_time": 0.3,
+   "no_progress_20s": 0,
+   "avg_run_s": 65
+  },
+  "slow_9cm_s_wide_margins": {
+   "jobs_finished": "10/10 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 33.8,
+   "move_asides_per_run": 2,
+   "brake_pct_of_time": 0,
+   "no_progress_20s": 0,
+   "avg_run_s": 65
+  }
+ }
+}
