@@ -103,6 +103,12 @@ class SpheroRobot(RobotHandle):
         self._pending = None            # (heading, speed) awaiting a write
         self._pending_led = None
         self._pending_back = None
+        # Spinning in place on raw motor power, and re-zeroing where it points.
+        # See `spin_raw`. `_raw_active` is True from the first spin until a
+        # stop has actually been WRITTEN — not queued — because until then the
+        # ball has stabilisation off and a roll command cannot run.
+        self._pending_raw = None        # (left, right), "stop", or None
+        self._raw_active = False
         self._back_led_works = True
         self._last_sent = None          # (heading, speed) actually written
         self._last_write_at = 0.0
@@ -265,6 +271,107 @@ class SpheroRobot(RobotHandle):
         self._last_sent = None          # the frame changed under the deadband
         return True
 
+    def spin_raw(self, power):
+        """Turn on the spot at a motor POWER, not toward a heading.
+
+        `roll(heading, 0)` hands the ball a final angle and its own controller
+        slews there flat out, which overshoots and cannot be slowed from
+        outside. `spin()` in the library is no better: it is a loop of
+        `set_heading` calls, a heading ramp that busy-waits on the radio. This
+        is the one command that sets a rate — left motor one way, right the
+        other — and the caller decides when to stop.
+
+        `power` is -255..255 and its sign picks the direction. Which way a
+        positive power turns is a property of the drive and is not assumed
+        here; the caller learns it by watching.
+
+        Raw motors switch STABILISATION OFF, and `roll` does not work until it
+        is back on. `stop_raw` restores it — and re-zeroes where the ball now
+        points while doing so. See there for why those are one step. `stop`
+        does the same, and so does a reconnect.
+        """
+        p = int(np.clip(int(power), -255, 255))
+        with self._lock:
+            # A queued roll must not be written after this: with stabilisation
+            # off it cannot run, and if it arrived first it would leave the
+            # library holding a speed its own thread keeps re-sending.
+            self._pending = None
+            self._pending_raw = (p, -p)
+        self._wake.set()
+
+    def stop_raw(self):
+        """Stop turning, and STAY pointing where it stopped.
+
+        Three things in one, because doing any of them alone is wrong:
+
+        Motors off. Then ZERO HERE — `reset_aim`, which calls the current
+        orientation zero. Then stabilisation on.
+
+        The middle step is the one that matters. With stabilisation on, a
+        Sphero holds the heading of its last ROLL command. After a raw spin it
+        points somewhere new, and switching stabilisation straight back on can
+        swing it back to that old heading and undo the turn completely. Zeroing
+        first makes the held heading the current one, so there is nothing to
+        swing back to. It also means driving straight on afterwards is simply
+        `roll(0, speed)`: no stored offset, no frame to get the wrong way
+        round, nothing that goes stale.
+
+        Like `aim_zero`, this voids `heading_offset`, because the frame moved.
+        """
+        with self._lock:
+            self._pending_raw = "stop"
+        self._wake.set()
+
+    @property
+    def spinning(self):
+        return self._raw_active or self._pending_raw not in (None, "stop")
+
+    def _write_raw(self, raw):
+        """Write a spin or a stop, under the library's own write lock."""
+        api = self._api
+        lock = getattr(api, "_SpheroEduAPI__updating", None)
+        try:
+            if lock is not None:
+                lock.acquire()
+            if raw == "stop":
+                if not self._raw_active:
+                    return
+                # duration 0 sets the motors to zero and then OFF. It does not
+                # restore stabilisation: the library reads its own flag at the
+                # START of the call, and the spin already cleared it.
+                api.raw_motor(0, 0, 0)
+                # Zero HERE before stabilising, so the heading it then holds is
+                # the one it points at now. See `stop_raw`.
+                api.reset_aim()
+                # `reset_aim` brings stabilisation back through the toy, not
+                # through the API, so the API's own flag is still False. Left
+                # that way, the next `raw_motor` believes it is already off,
+                # does not switch it off, and the spin fights the stabiliser.
+                api.set_stabilization(True)
+                self._raw_active = False
+                self.heading_offset = 0.0
+                self._last_sent = None      # let the next roll actually go out
+                return
+            left, right = raw
+            if not self._raw_active:
+                # The library's background thread re-sends a roll every 0.8s
+                # while its stored speed is non-zero. Leave one there and it
+                # fights the spin, on a ball that cannot roll anyway.
+                try:
+                    setattr(api, "_SpheroEduAPI__speed", 0)
+                except Exception:
+                    pass
+            # duration None: set the motors and RETURN. Any other value makes
+            # the library sleep for it, on this thread, holding the radio.
+            api.raw_motor(int(left), int(right), None)
+            self._raw_active = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
     def set_led(self, rgb, blink=None):
         self.rgb = tuple(int(np.clip(c, 0, 255)) for c in rgb)
         self.blink = blink
@@ -290,7 +397,17 @@ class SpheroRobot(RobotHandle):
     def stop(self):
         self._desired = np.zeros(2)
         with self._lock:
-            self._pending = (self._last_sent[0] if self._last_sent else 0.0, 0)
+            spinning = (self._raw_active
+                        or self._pending_raw not in (None, "stop"))
+            # A stop that leaves raw motors running is not a stop.
+            if spinning:
+                self._pending_raw = "stop"
+            # After a spin the stop re-zeroes where the ball points, so the
+            # roll that holds it must be heading 0. Reusing the last roll's
+            # heading would ROTATE it back to where it was before the turn.
+            held = 0.0 if spinning else (
+                self._last_sent[0] if self._last_sent else 0.0)
+            self._pending = (held, 0)
         self._wake.set()
 
     def step(self, dt):
@@ -422,6 +539,8 @@ class SpheroRobot(RobotHandle):
         api, self._api = self._api, None
         self._fast = None
         self._link_up = False
+        # A reconnected ball comes up stabilised with its motors off.
+        self._raw_active = False
         if api is None:
             return
         try:
@@ -591,6 +710,76 @@ class SpheroRobot(RobotHandle):
         dh = abs((heading - last_h + 180.0) % 360.0 - 180.0)
         return dh > HEADING_DEADBAND or abs(byte - last_b) > SPEED_DEADBAND
 
+    def _drain_once(self):
+        """Take everything queued and write it, in the order the ball needs.
+
+        One iteration of `_run`'s work, pulled out so the ORDER of the writes
+        can be tested without a thread and a clock — which is the whole of
+        what can go wrong with a spin followed by a drive.
+        """
+        with self._lock:
+            cmd, led = self._pending, self._pending_led
+            back = self._pending_back
+            raw = self._pending_raw
+            self._pending = self._pending_led = None
+            self._pending_back = None
+            self._pending_raw = None
+
+        try:
+            if led is not None:
+                from spherov2.types import Color
+                self._api.set_main_led(Color(*led))
+            if back is not None:
+                # An int is the blue aiming light on every toy that has
+                # one; a triple is a BOLT's addressable back LED. The
+                # library branches on the type, so the type is the API.
+                #
+                # Guarded on its own, because everything else in this block
+                # tears the link down and reconnects when it throws — which
+                # is right for a drive command and absurd for an aiming
+                # light. A toy that cannot do this says so once and then
+                # stops being asked, exactly like the yaw source.
+                try:
+                    from spherov2.types import Color
+                    self._api.set_back_led(
+                        Color(*back) if isinstance(back, tuple) else int(back))
+                except Exception as e:
+                    self._back_led_works = False
+                    self.last_error = f"no taillight on this toy: {e}"
+                    log.info("%s: taillight unsupported, ignoring", self.code)
+            # LATEST WINS, as for every other write here. `spin_raw` clears
+            # the queued roll, so a roll still queued now was issued AFTER any
+            # spin in this batch — it is the newer intent, and it means stop
+            # spinning. The same holds for a roll arriving while a spin from an
+            # earlier batch is still running. Dropping the roll instead would
+            # leave a ball that was told to drive sitting and spinning.
+            if cmd is not None and (isinstance(raw, tuple) or
+                                    (raw is None and self._raw_active)):
+                raw = "stop"
+            # Order matters: a spin or its stop first, then the roll. Stopping
+            # re-zeroes and restores stabilisation, and a roll can only run
+            # after that.
+            if raw is not None:
+                self._write_raw(raw)
+            if (cmd is not None and not self._raw_active
+                    and self._should_write(cmd)):
+                self._write(*cmd)
+                self._last_sent = cmd
+                self._last_write_at = now()
+            # After the command, never before it: driving is what the loop
+            # is for, and a sensor read that delays it buys a heading
+            # estimate at the cost of the thing being estimated.
+            self._poll_yaw()
+        except Exception as e:
+            self.last_error = str(e)
+            if is_max_connections_error(e):
+                self.max_connections_hit = True
+                log.error("%s: %s", self.code, MAX_CONNECTIONS_HINT)
+            else:
+                log.warning("%s write failed, will reconnect: %s", self.code, e)
+            self._teardown()
+            self._last_sent = None
+
     def _run(self):
         backoff = BACKOFF_START
         while not self._stop_flag.is_set():
@@ -618,50 +807,6 @@ class SpheroRobot(RobotHandle):
             if self._stop_flag.is_set():
                 break
 
-            with self._lock:
-                cmd, led = self._pending, self._pending_led
-                back = self._pending_back
-                self._pending = self._pending_led = None
-                self._pending_back = None
-
-            try:
-                if led is not None:
-                    from spherov2.types import Color
-                    self._api.set_main_led(Color(*led))
-                if back is not None:
-                    # An int is the blue aiming light on every toy that has
-                    # one; a triple is a BOLT's addressable back LED. The
-                    # library branches on the type, so the type is the API.
-                    #
-                    # Guarded on its own, because everything else in this block
-                    # tears the link down and reconnects when it throws — which
-                    # is right for a drive command and absurd for an aiming
-                    # light. A toy that cannot do this says so once and then
-                    # stops being asked, exactly like the yaw source.
-                    try:
-                        from spherov2.types import Color
-                        self._api.set_back_led(
-                            Color(*back) if isinstance(back, tuple) else int(back))
-                    except Exception as e:
-                        self._back_led_works = False
-                        self.last_error = f"no taillight on this toy: {e}"
-                        log.info("%s: taillight unsupported, ignoring", self.code)
-                if cmd is not None and self._should_write(cmd):
-                    self._write(*cmd)
-                    self._last_sent = cmd
-                    self._last_write_at = now()
-                # After the command, never before it: driving is what the loop
-                # is for, and a sensor read that delays it buys a heading
-                # estimate at the cost of the thing being estimated.
-                self._poll_yaw()
-            except Exception as e:
-                self.last_error = str(e)
-                if is_max_connections_error(e):
-                    self.max_connections_hit = True
-                    log.error("%s: %s", self.code, MAX_CONNECTIONS_HINT)
-                else:
-                    log.warning("%s write failed, will reconnect: %s", self.code, e)
-                self._teardown()
-                self._last_sent = None
+            self._drain_once()
 
         self._teardown()

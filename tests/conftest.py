@@ -29,11 +29,27 @@ class FakeApi:
         self.back_leds = []
         self.closed = False
         self.lock = threading.Lock()
+        # One ordered log across every kind of write, so a test can say what
+        # happened FIRST — which is the whole question for a spin that has to
+        # stop, restore stabilisation and re-zero before a roll can run.
+        self.events = []
+        # TWO stabilisation states, because the library has two. `stabilized`
+        # is the ball; `_SpheroEduAPI__stabilization` is the API's own flag.
+        # `reset_aim` changes the first without the second, and `raw_motor`
+        # only switches stabilisation off if the SECOND says it is on — so a
+        # fake with one merged flag would pass the exact case the real library
+        # gets wrong: a spin that fights a stabiliser nobody switched off.
+        self.stabilized = True
+        self._SpheroEduAPI__stabilization = True
+        self.motors = (0, 0)
+        self.fought = False
 
     def set_heading(self, h):
         if self.fail_on_write:
             raise RuntimeError("simulated BLE write failure")
         with self.lock:
+            self.events.append(("heading", h, self._SpheroEduAPI__speed,
+                                self.stabilized))
             self.headings.append(h)
             # roll_start(heading, speed) — the stored speed goes with it.
             self.speeds.append(self._SpheroEduAPI__speed)
@@ -47,6 +63,40 @@ class FakeApi:
             self.speeds.append(s)
             self.commands.append((self.headings[-1] if self.headings else 0, s))
             self.speeds.append(s)
+
+    def raw_motor(self, left, right, duration):
+        """As the library does it: read the API flag at the START, switch
+        stabilisation off only if that flag says it is on, and on a numeric
+        duration turn the motors off — restoring stabilisation only if the flag
+        read at the start said so."""
+        if self.fail_on_write:
+            raise RuntimeError("simulated BLE write failure")
+        stabilize = self._SpheroEduAPI__stabilization
+        if stabilize:
+            self.set_stabilization(False)
+        with self.lock:
+            self.motors = (int(left), int(right))
+            if (left or right) and self.stabilized:
+                self.fought = True        # motors driven against the stabiliser
+            self.events.append(("raw", int(left), int(right), duration))
+            if duration is not None:
+                self.motors = (0, 0)
+                self.events.append(("raw_off",))
+        if duration is not None and stabilize:
+            self.set_stabilization(True)
+
+    def set_stabilization(self, on):
+        with self.lock:
+            self.stabilized = bool(on)
+            self._SpheroEduAPI__stabilization = bool(on)
+            self.events.append(("stab", bool(on)))
+
+    def reset_aim(self):
+        """Through the toy, not the API: the ball ends stabilised, the API's
+        flag is left exactly as it was."""
+        with self.lock:
+            self.stabilized = True
+            self.events.append(("zero",))
 
     def set_main_led(self, color):
         with self.lock:

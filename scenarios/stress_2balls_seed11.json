@@ -1,0 +1,291 @@
+{
+ "name": "stress: 2 balls, seed 11",
+ "description": "Each ball works through its own list of 10 jobs, one after another with a 3 s pause, until 180 s. Same jobs every run.",
+ "arena_cm": [
+  138.8,
+  110.8
+ ],
+ "duration_s": 180,
+ "balls": [
+  {
+   "slot": "A",
+   "start": [
+    70.5,
+    57.5
+   ],
+   "facing_deg": 219
+  },
+  {
+   "slot": "B",
+   "start": [
+    35.9,
+    32.6
+   ],
+   "facing_deg": 99
+  }
+ ],
+ "jobs": [
+  {
+   "ball": "A",
+   "kind": "line",
+   "from": [
+    57.2,
+    61.2
+   ],
+   "to": [
+    32.6,
+    62.3
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "poly",
+   "points": [
+    [
+     61.3,
+     79.8
+    ],
+    [
+     99.6,
+     74.4
+    ],
+    [
+     51.4,
+     64.1
+    ]
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    25.6,
+    72.5
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "park",
+   "seconds": 6
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    93.5,
+    44.6
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "poly",
+   "points": [
+    [
+     77,
+     79.9
+    ],
+    [
+     34.1,
+     80.2
+    ],
+    [
+     101,
+     47.2
+    ]
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    27.6,
+    79.6
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "poly",
+   "points": [
+    [
+     72,
+     39.1
+    ],
+    [
+     69.6,
+     72
+    ],
+    [
+     28.8,
+     65.6
+    ]
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "p2p",
+   "to": [
+    63.9,
+    64.9
+   ]
+  },
+  {
+   "ball": "A",
+   "kind": "park",
+   "seconds": 7
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     54.9,
+     23.4
+    ],
+    [
+     92.5,
+     49.7
+    ],
+    [
+     95,
+     41.3
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     54.4,
+     79.6
+    ],
+    [
+     35.8,
+     28.4
+    ],
+    [
+     82.3,
+     64.2
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "p2p",
+   "to": [
+    56.5,
+    46.7
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "park",
+   "seconds": 9
+  },
+  {
+   "ball": "B",
+   "kind": "orbit",
+   "centre": [
+    88.2,
+    56.9
+   ],
+   "radius": 27,
+   "direction": "cw",
+   "seconds": 23
+  },
+  {
+   "ball": "B",
+   "kind": "poly",
+   "points": [
+    [
+     20.8,
+     82.4
+    ],
+    [
+     49.8,
+     48.9
+    ],
+    [
+     32.2,
+     25.6
+    ]
+   ]
+  },
+  {
+   "ball": "B",
+   "kind": "orbit",
+   "centre": [
+    70,
+    49.5
+   ],
+   "radius": 28,
+   "direction": "ccw",
+   "seconds": 26
+  },
+  {
+   "ball": "B",
+   "kind": "patrol",
+   "points": [
+    [
+     115,
+     62.4
+    ],
+    [
+     79.6,
+     60.6
+    ],
+    [
+     68.1,
+     26.7
+    ]
+   ],
+   "rounds": 1
+  },
+  {
+   "ball": "B",
+   "kind": "orbit",
+   "centre": [
+    89.6,
+    58.1
+   ],
+   "radius": 29,
+   "direction": "cw",
+   "seconds": 21
+  },
+  {
+   "ball": "B",
+   "kind": "orbit",
+   "centre": [
+    63.6,
+    59.1
+   ],
+   "radius": 31,
+   "direction": "cw",
+   "seconds": 28
+  }
+ ],
+ "job_order": "each ball works through its own jobs in order; the next starts 3 s after the previous finishes",
+ "expected_sim": {
+  "model": "path-timed traffic planner, realistic ball (0.37 s command delay, 0.1 s camera delay, 1 cm / 5 deg noise, 1.2% dropped frames, +-25% speed wander, stick-slip spins, 1.2x over-turn, heading drift) \u2014 5 noise seeds",
+  "normal_speed_12cm_s": {
+   "jobs_finished": "57/66 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 13.1,
+   "move_asides_per_run": 9.6,
+   "brake_pct_of_time": 0.4,
+   "no_progress_20s": 0,
+   "avg_run_s": 180
+  },
+  "slow_9cm_s_wide_margins": {
+   "jobs_finished": "54/63 over 5 runs",
+   "contacts": 0,
+   "passes_under_12cm": 0,
+   "closest_cm": 19,
+   "move_asides_per_run": 9.6,
+   "brake_pct_of_time": 0.2,
+   "no_progress_20s": 2,
+   "avg_run_s": 180
+  }
+ }
+}
