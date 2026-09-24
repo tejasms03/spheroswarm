@@ -4408,3 +4408,43 @@ def test_track_recorder_writes_every_tracked_ball_each_frame(app, fleet,
     app.toggle_track_recording()
     app.close()                              # closing the bench closes the file
     assert not app.track_recorder.on
+
+
+def test_agent_tools_take_a_ball_and_select_it(app, fleet, no_calib):
+    for name, at in (("SK-A", (400.0, 300.0)), ("SK-B", (700.0, 420.0))):
+        ball = SpinBall(ble_name=name, color="red")
+        app.lab.robots[name] = ball
+        app.lab.tracks.assign(name, {"centre": at, "group": [
+            {"x": at[0], "y": at[1], "area": 9.0, "peak": 255.0},
+            {"x": at[0] + 8, "y": at[1], "area": 30.0, "peak": 255.0}]})
+    app.driving = "SK-A"
+    app.saved_offset = lambda n: (0.0, "test")
+    app._shot = ((0, 0), 1.0)
+
+    got = app.agent.dispatch("orbit", {"x": 70, "y": 55, "radius": 30,
+                                       "ball": "SK-B"})
+    assert got.get("ok") and got["ball"] == "SK-B"
+    assert app.driving == "SK-B" and app.orbit_run["name"] == "SK-B"
+    assert app.agent.dispatch("get_state", {})["ball"] == "SK-B"
+
+    got = app.agent.dispatch("goto", {"x": 100, "y": 80, "ball": "SK-A"})
+    assert got.get("ok") and app.p2p["name"] == "SK-A"
+    assert app.orbit_run is None, "the new job replaces the running one"
+
+    st = app.agent.dispatch("get_state", {})
+    assert st["selected"] == "SK-A" and st["status"] == "running"
+    assert st["job"] == "goto" and st["ball"] == "SK-A"
+    assert set(st["balls"]) == {"SK-A", "SK-B"}
+    assert st["balls"]["SK-B"]["position_cm"] and st["balls"]["SK-B"]["assigned"]
+
+    bad = app.agent.dispatch("goto", {"x": 50, "y": 50, "ball": "SK-Z"})
+    assert "error" in bad and "not connected" in bad["error"]
+    assert app.p2p is not None and app.p2p["name"] == "SK-A", "it kept going"
+
+    assert app.agent.dispatch("stop", {"ball": "SK-B"}).get("ok")
+    assert app.p2p is None and app.driving == "SK-B"
+    # Stopping one ball is not stopping the bench: SK-A's job is still SK-A's.
+    assert app.ball_slot("SK-A")["p2p"] is not None
+    prompt = app.agent.prompt(app.agent.dispatch)
+    assert "`ball`" in prompt and "run at the same time" in prompt
+    assert "NOTHING KEEPS THE BALLS APART" in prompt
