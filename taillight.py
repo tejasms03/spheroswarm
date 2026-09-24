@@ -778,6 +778,12 @@ class App:
         self.list_rect = pygame.Rect(0, 0, 0, 0)
         # Manual drive. `driving` is which ball the arrows move; `held` is the
         # bearing currently commanded, or None when nothing is pressed.
+        # One job slot per ball, so two to four of them can run at once. The
+        # slot for whichever ball is selected is the live one, sitting in the
+        # attributes it has always sat in — see `swap_to`.
+        self.runs = {}
+        self._live = None
+        self._driving = None
         self.driving = None
         self.held = None                # bearing being commanded, or None
         self.aim = 0.0                  # the bearing the arrows steer
@@ -834,6 +840,7 @@ class App:
         self.stop_p2p = self._stop_p2p_watched
         # A language model driving the same jobs: `t` opens the command bar.
         self.agent = BenchAgent(self)
+        self._agent_seen, self._agent_at = 0, 0.0
         # Every run, frame by frame, to runs/p2p when it ends. Reads only.
         self.recorder = RunRecorder(self)
         # Every tracked ball every frame, only while `r` has it switched on.
@@ -1076,6 +1083,103 @@ class App:
     # increases clockwise. Sent RAW, with no heading offset applied — the whole
     # point of driving by hand is to see what the ball's own zero actually
     # does, and a correction on the way out would hide exactly that.
+
+    # -- one job slot per ball -------------------------------------------
+    #
+    # Everything about running a job already knows which ball it belongs to:
+    # a run carries its own `name`, and the followers read the arena through
+    # that name. The only thing that was ever single-ball was WHERE that run
+    # was kept — one set of attributes on the app. So the fix is not to
+    # change any of the tick functions, which work, but to give each ball its
+    # own copy of those attributes and swap the right copy into place before
+    # ticking it. `tick` then runs the same, unchanged, once per ball.
+    #
+    # What swaps is a running job and nothing else. The sliders, the click
+    # modes, the camera and the calibration walk stay shared, because they
+    # belong to the bench and to the person at it, not to a ball.
+    RUN_SLOTS = ("p2p", "job", "orbit_run", "patrol_run", "_last_stop",
+                 "_pursuit_pending", "retries", "_drive_at",
+                 "path_stats", "line_stats")
+
+    @staticmethod
+    def blank_slot():
+        return {"p2p": None, "job": None, "orbit_run": None,
+                "patrol_run": None, "_last_stop": None,
+                "_pursuit_pending": None, "retries": 0, "_drive_at": 0.0,
+                "path_stats": None, "line_stats": None}
+
+    @property
+    def driving(self):
+        """Which ball is selected — and therefore whose job slot is live."""
+        return self._driving
+
+    @driving.setter
+    def driving(self, name):
+        # A property rather than a plain attribute so that every existing
+        # place that selects a ball — Tab, the ball list, the agent naming
+        # one — swaps its job in without having to know that slots exist.
+        #
+        # Claim the live attributes for the ball that owns them BEFORE the
+        # selection moves. A job can be started before anything has been
+        # selected by hand, and it lives in those attributes; without this
+        # the first swap would file it under nobody and lose it.
+        if self._live is None:
+            self._live = self.drive_target()
+        self._driving = name
+        self.swap_to(name)
+
+    def swap_to(self, name):
+        """Put `name`'s job in the attributes the tick functions read."""
+        if name is None or getattr(self, "runs", None) is None:
+            return              # nothing asked for, or still being built
+        if self._live is None:
+            self._live = self.drive_target() or name
+        if name == self._live:
+            return
+        if self._live is not None:
+            self.runs[self._live] = {k: getattr(self, k)
+                                     for k in self.RUN_SLOTS}
+        slot = self.runs.get(name) or self.blank_slot()
+        for k, v in slot.items():
+            setattr(self, k, v)
+        self._live = name
+
+    def ball_slot(self, name):
+        """One ball's job state, live copy included. Read only."""
+        if name == self._live:
+            return {k: getattr(self, k) for k in self.RUN_SLOTS}
+        return dict(self.runs.get(name) or self.blank_slot())
+
+    def busy_balls(self):
+        """Every ball with something running right now."""
+        out = []
+        for name in self.lab.robots:
+            s = self.ball_slot(name)
+            if (s["p2p"] is not None or s["job"] is not None
+                    or s["orbit_run"] is not None
+                    or s["patrol_run"] is not None):
+                out.append(name)
+        return out
+
+    def job_ticks(self):
+        """Every ball's job moved on by one frame.
+
+        The order inside one ball is the order it has always been. What is
+        new is only that it happens once per connected ball, each with its
+        own slot swapped in, so two to four balls run at the same time.
+        """
+        was = self._driving
+        try:
+            for name in list(self.lab.robots):
+                self.driving = name
+                self.job_tick()
+                self.pursuit_tick()
+                self.p2p_tick()
+                self.orbit_tick()
+                self.patrol_tick()
+        finally:
+            self._driving = was
+            self.swap_to(self.drive_target())
 
     def drive_target(self):
         """Which ball the arrows move. The first held, unless one was picked."""
@@ -3084,6 +3188,9 @@ class App:
 
     # -- recording every ball, and p2p as a path (built beside the rest) ---------
 
+    # How long the model's transcript stays over the floor after it finishes.
+    AGENT_HIDE_S = 25.0
+
     PURSUIT_NO_SPIN_DEG = 60.0
     """Within this of the facing, a pursuit p2p goes straight into following."""
     PURSUIT_MIN_CM = 10.0
@@ -4037,12 +4144,8 @@ class App:
             self.drive_tick(max(min(step, 0.2), 1e-3))
             self.north_tick()
             self.agent.pump()
-            self.job_tick()
-            self.pursuit_tick()
-            self.p2p_tick()
+            self.job_ticks()
             self.calib_tick()
-            self.orbit_tick()
-            self.patrol_tick()
             self.recorder.tick()
             self.track_recorder.tick()
             self.log_reading()
@@ -4269,21 +4372,33 @@ class App:
         agent = self.agent
         if not (agent.typing or agent.busy or agent.log):
             return
+        # The transcript used to sit over the bottom of the floor for the rest
+        # of the session, which is most of the arena on a 1080p view. It is
+        # only worth that room while it is being used: once the model has
+        # finished and a while has gone by, it shrinks to the last couple of
+        # lines and then gets out of the way altogether.
+        if len(agent.log) != self._agent_seen:
+            self._agent_seen, self._agent_at = len(agent.log), time.time()
+        live = agent.typing or agent.busy
+        idle = time.time() - self._agent_at
+        if not live and idle > self.AGENT_HIDE_S:
+            return
+        keep, alpha = (7, 215) if live else (2, 150)
         lines = []
-        for kind, text in agent.log[-7:]:
+        for kind, text in agent.log[-keep:]:
             tone = {"you": CHALK, "call": CYAN, "say": MINT,
                     "error": CORAL}.get(kind, DIM)
             prefix = {"you": "> ", "call": "  ", "say": "", "error": "! "}.get(
                 kind, "")
             for ln in _wrap(prefix + text, 118)[:3]:
                 lines.append((ln, tone))
-        lines = lines[-9:]
+        lines = lines[-9:] if live else lines[-2:]
         bar_h = 26
         box_h = 8 + 15 * len(lines) + bar_h
         box = pygame.Rect(VIEW.x + 8, VIEW.bottom - box_h - 34, VIEW.w - 16,
                           box_h)
         shade = pygame.Surface(box.size, pygame.SRCALPHA)
-        shade.fill((6, 12, 22, 215))
+        shade.fill((6, 12, 22, alpha))
         s.blit(shade, box.topleft)
         y = box.y + 6
         for ln, tone in lines:
@@ -4488,6 +4603,33 @@ class App:
             s.blit(self.fs.render("l or space to cancel", True, DIM),
                    (VIEW.x + 16, VIEW.y + 36))
 
+    def draw_plans(self, s, px_of):
+        """Every ball's plan, not just the selected one's.
+
+        The drawing reads the same attributes the followers do, so it shows
+        whichever ball is selected — which was right when only one could run.
+        With a job per ball it would hide three of four. So the same swap the
+        ticking uses is done here: each ball drawn from its own slot, and the
+        selected one drawn last so it sits on top of the others.
+        """
+        here = self.drive_target()
+        was = self._driving
+        # Picking a target is the person's mode, not a ball's, so its prompt
+        # is drawn once — with the selected ball — rather than once per ball
+        # on top of itself.
+        picking, self.p2p_pick = self.p2p_pick, False
+        try:
+            for name in list(self.lab.robots):
+                if name == here:
+                    continue
+                self.driving = name
+                self.draw_p2p(s, px_of)
+        finally:
+            self._driving = was
+            self.swap_to(here)
+            self.p2p_pick = picking
+        self.draw_p2p(s, px_of)
+
     def draw_p2p(self, s, px_of):
         """The target, the leg to it, and how far there is to run."""
         self.draw_line(s, px_of)
@@ -4680,7 +4822,7 @@ class App:
         # cannot check: the click goes through the same pixel mapping as the
         # corner picking, and if that were wrong the ball would drive
         # somewhere nobody asked for with nothing on screen to say so.
-        self.draw_p2p(s, px_of)
+        self.draw_plans(s, px_of)
         self.draw_calib(s, px_of)
 
         if self.picking is not None:
