@@ -19,6 +19,7 @@ import json
 import math
 import os
 import queue
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -38,22 +39,27 @@ _POINT = {"type": "array", "items": {"type": "number"}, "minItems": 2,
 
 TOOLS = [
     {"name": "get_state",
-     "description": "The ball being driven: position (cm), which way it faces, "
-                    "whether the camera sees it, what job is running, retries, "
-                    "and the arena size.",
+     "description": "Every connected ball: position (cm), which way it faces, "
+                    "whether the camera sees it, whether it is calibrated, "
+                    "which one is selected, what job is running, retries, and "
+                    "the arena size.",
      "parameters": {"type": "object", "properties": {}}},
     {"name": "goto",
      "description": "Drive the ball to a point: it turns on the spot to face "
                     "it, then drives straight there. Replaces any running job.",
      "parameters": {"type": "object", "properties": {
-         "x": {"type": "number"}, "y": {"type": "number"}},
+         "x": {"type": "number"}, "y": {"type": "number"},
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit for the one already selected"},},
          "required": ["x", "y"]}},
     {"name": "follow_line",
      "description": "Drive to the line's start, face its end, then follow the "
                     "straight line to the end. Replaces any running job.",
      "parameters": {"type": "object", "properties": {
          "x1": {"type": "number"}, "y1": {"type": "number"},
-         "x2": {"type": "number"}, "y2": {"type": "number"}},
+         "x2": {"type": "number"}, "y2": {"type": "number"},
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit for the one already selected"},},
          "required": ["x1", "y1", "x2", "y2"]}},
     {"name": "follow_path",
      "description": "Drive to the first point, then follow the route through "
@@ -63,7 +69,9 @@ TOOLS = [
                     "curve). Replaces any running job.",
      "parameters": {"type": "object", "properties": {
          "points": {"type": "array", "items": _POINT, "minItems": 2},
-         "smooth": {"type": "boolean"}},
+         "smooth": {"type": "boolean"},
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit for the one already selected"},},
          "required": ["points"]}},
     {"name": "orbit",
      "description": "Circle a centre point at a radius, until stopped. "
@@ -73,7 +81,9 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "x": {"type": "number"}, "y": {"type": "number"},
          "radius": {"type": "number"},
-         "direction": {"type": "string", "enum": ["cw", "ccw"]}},
+         "direction": {"type": "string", "enum": ["cw", "ccw"]},
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit for the one already selected"},},
          "required": ["x", "y", "radius"]}},
     {"name": "patrol",
      "description": "Patrol points until stopped. style 'loop' goes round "
@@ -82,18 +92,25 @@ TOOLS = [
                     "Replaces any running job.",
      "parameters": {"type": "object", "properties": {
          "points": {"type": "array", "items": _POINT, "minItems": 2},
-         "style": {"type": "string", "enum": ["loop", "back_and_forth"]}},
+         "style": {"type": "string", "enum": ["loop", "back_and_forth"]},
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit for the one already selected"},},
          "required": ["points"]}},
     {"name": "stop",
-     "description": "Stop the ball and end whatever job is running.",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "wait",
-     "description": "Wait for a goto, follow_line or follow_path to finish, up "
-                    "to timeout_s (default 30, max 90). Returns status 'done', "
-                    "'running' (still going when the timeout ran out), or "
-                    "'stopped'. Orbits and patrols never finish — do not wait "
-                    "on them.",
+     "description": "Stop a job. Name a ball to stop that one; omit the ball "
+                    "to stop every ball that is running.",
      "parameters": {"type": "object", "properties": {
+         "ball": {"type": "string", "description": "which ball, e.g. "
+                  "SK-914A; omit to stop them all"},}}},
+    {"name": "wait",
+     "description": "Wait for one ball's goto, follow_line or follow_path to "
+                    "finish, up to timeout_s (default 30, max 90). Returns "
+                    "status 'done', 'running' (still going when the timeout "
+                    "ran out), or 'stopped'. Orbits and patrols never finish "
+                    "— do not wait on them.",
+     "parameters": {"type": "object", "properties": {
+         "ball": {"type": "string", "description": "which ball to wait for, "
+                  "e.g. SK-914A; omit for the one already selected"},
          "timeout_s": {"type": "number"}}}},
 ]
 
@@ -190,8 +207,9 @@ class BenchAgent:
     def prompt(self, call):
         st = call("get_state", {})
         return "\n".join([
-            "You drive one Sphero ball on a flat arena, seen by an overhead "
-            "camera, using the tools.",
+            "You drive Sphero balls on a flat arena, seen by an overhead "
+            "camera, using the tools. Each ball has its own job and they run "
+            "at the same time.",
             "Coordinates are centimetres: x to the RIGHT, y DOWN the screen, "
             f"(0,0) the top-left corner, arena {st.get('arena_cm')}.",
             f"Keep points at least {EDGE_CM:.0f}cm inside the arena.",
@@ -200,7 +218,17 @@ class BenchAgent:
             "",
             "Rules:",
             "- Use the tools; do not describe what you would do.",
-            "- One job runs at a time; a new motion tool replaces the current.",
+            "- Every motion tool takes a `ball`. Give it whenever the user "
+            "names a ball; leave it out to use the selected one.",
+            "- Each ball has its own job and they run at the same time. "
+            "Starting a job on one ball does NOT disturb another. To set "
+            "several balls going together, call the motion tools one after "
+            "another with a different `ball` each time and do not wait in "
+            "between. A ball's own next job needs that ball finished first "
+            "(wait on it), or stopped if it is an orbit or patrol.",
+            "- NOTHING KEEPS THE BALLS APART. They will drive through each "
+            "other if their paths cross. Choose jobs that stay clear of one "
+            "another, and say so if the user asks for paths that cross.",
             "- orbit and patrol run until stop. goto, follow_line and "
             "follow_path finish: call wait if the user wants to know it got "
             "there, or before starting the next step of a sequence.",
@@ -242,9 +270,13 @@ class BenchAgent:
         except (TypeError, ValueError):
             return {"error": "timeout_s must be a number"}
         limit = max(0.0, min(WAIT_MAX_S, limit))
+        ball = args.get("ball")
         end = time.time() + limit
         while True:
-            st = self.call_on_main("status", {})
+            # Several balls run at once, so waiting means waiting on ONE of
+            # them — named, or the selected one.
+            st = self.call_on_main("status",
+                                   {} if ball is None else {"ball": ball})
             if st.get("status") != "running" or time.time() >= end:
                 return st
             time.sleep(poll)
@@ -264,8 +296,16 @@ class BenchAgent:
         except TypeError as e:
             return {"error": f"bad arguments for {name}: {e}"}
 
-    def _ready(self):
+    def _ready(self, ball=None):
+        """The ball a tool will act on. Naming one selects it first, the same
+        as pressing Tab, because a job always belongs to the selected ball."""
         app = self.app
+        if ball is not None:
+            want = str(ball)
+            if want not in app.lab.robots:
+                return None, (f"{want} is not connected; connected: "
+                              + (", ".join(sorted(app.lab.robots)) or "none"))
+            app.driving = want
         name = app.drive_target()
         if name is None:
             return None, "no ball is connected"
@@ -349,8 +389,9 @@ class BenchAgent:
         st = {"arena_cm": ([round(float(hom.width), 1),
                             round(float(hom.height), 1)]
                            if hom is not None and hom.ready else None),
-              "ball": name,
-              "connected": sorted(app.lab.robots)}
+              "selected": name,
+              "connected": sorted(app.lab.robots),
+              "balls": {n: self._ball_state(n) for n in sorted(app.lab.robots)}}
         if name is not None and name in app.lab.tracks.by_name:
             px = app.ball_px(name)
             if px is not None and hom is not None and hom.ready:
@@ -370,43 +411,93 @@ class BenchAgent:
         st.update(self.t_status())
         return st
 
-    def t_status(self, **_):
+    def _ball_state(self, name):
+        """One ball, as the model sees it. Read only."""
         app = self.app
-        if app.orbit_run is not None:
-            r = app.orbit_run
-            return {"status": "running", "job": "orbit",
+        hom = app.lab.hom
+        out = {"assigned": name in app.lab.tracks.by_name}
+        if not out["assigned"]:
+            out["note"] = "not assigned on camera"
+            return out
+        px = app.ball_px(name)
+        if px is not None and hom is not None and hom.ready:
+            p = np.asarray(hom.to_cm([list(px)]), float).ravel()[:2]
+            out["position_cm"] = [round(float(p[0]), 1), round(float(p[1]), 1)]
+        facing = app.arena_heading(name)
+        out["facing_deg"] = None if facing is None else round(float(facing))
+        out["seen"] = bool(app.ball_fresh(name))
+        try:
+            out["calibrated"] = ball_calib.load(name, hom.M)[0] is not None
+        except Exception:
+            out["calibrated"] = False
+        # Its own job, because they run at the same time and a fleet-wide
+        # "what is happening" has to name a ball for each answer.
+        st = self.t_status(ball=name)
+        out["status"] = st.get("status")
+        if st.get("job"):
+            out["job"] = st["job"]
+        return out
+
+    def t_status(self, ball=None, **_):
+        """What one ball is doing. The selected one unless another is named.
+
+        Read out of that ball's own job slot rather than the live attributes,
+        because several balls run at once and the live ones belong to
+        whichever is selected.
+        """
+        app = self.app
+        name = str(ball) if ball is not None else app.drive_target()
+        if name is None:
+            return {"status": "idle", "retries": 0}
+        s = app.ball_slot(name)
+        if s["orbit_run"] is not None:
+            r = s["orbit_run"]
+            return {"status": "running", "job": "orbit", "ball": r["name"],
                     "detail": f"radius {r['radius']:.0f}cm {r['dir']}, "
                               f"{r['laps']} laps done — runs until stop",
-                    "retries": app.retries}
-        if app.patrol_run is not None:
-            r = app.patrol_run
-            return {"status": "running", "job": "patrol",
+                    "retries": s["retries"]}
+        if s["patrol_run"] is not None:
+            r = s["patrol_run"]
+            return {"status": "running", "job": "patrol", "ball": r["name"],
                     "detail": f"{r['style']}, {r['rounds']} done — runs until "
-                              "stop", "retries": app.retries}
-        got = app.p2p
+                              "stop", "retries": s["retries"]}
+        got = s["p2p"]
         if got is not None:
             job = ("follow_path" if got.get("path") is not None else
                    "follow_line" if got.get("kind") == "line" else "goto")
-            return {"status": "running", "job": job,
+            return {"status": "running", "job": job, "ball": got.get("name"),
                     "stage": got.get("stage") or got.get("phase"),
-                    "retries": app.retries}
-        if app.job is not None:
+                    "retries": s["retries"]}
+        if s["job"] is not None:
             return {"status": "running", "job": "retrying",
-                    "detail": (app._last_stop or ("", None))[0][:100],
-                    "retries": app.retries}
-        last = (app._last_stop or ("", None))[0]
+                    "detail": (s["_last_stop"] or ("", None))[0][:100],
+                    "retries": s["retries"]}
+        last = (s["_last_stop"] or ("", None))[0]
         if not last:
-            return {"status": "idle", "retries": app.retries}
+            return {"status": "idle", "retries": s["retries"]}
         stopped = last in app.USER_STOPS
         return {"status": "stopped" if stopped else "done",
-                "result": last[:160], "retries": app.retries}
+                "result": last[:160], "retries": s["retries"]}
 
-    def t_stop(self):
-        self._clear()
-        return {"ok": True, "stopped": True}
+    def t_stop(self, ball=None):
+        """Stop one named ball, or every ball that is running."""
+        app = self.app
+        if ball is not None and str(ball) in app.lab.robots:
+            app.driving = str(ball)
+            self._clear()
+            return {"ok": True, "stopped": [str(ball)]}
+        busy = app.busy_balls() or ([app.drive_target()]
+                                    if app.drive_target() else [])
+        was = app.driving
+        for name in busy:
+            app.driving = name
+            self._clear()
+        if was is not None:
+            app.driving = was
+        return {"ok": True, "stopped": busy}
 
-    def t_goto(self, x, y):
-        name, why = self._ready()
+    def t_goto(self, x, y, ball=None):
+        name, why = self._ready(ball)
         if why:
             return {"error": why}
         try:
@@ -426,8 +517,8 @@ class BenchAgent:
             return self._refused("goto")
         return self._started("goto", ball=name, to=[x, y])
 
-    def t_follow_line(self, x1, y1, x2, y2):
-        name, why = self._ready()
+    def t_follow_line(self, x1, y1, x2, y2, ball=None):
+        name, why = self._ready(ball)
         if why:
             return {"error": why}
         try:
@@ -451,8 +542,8 @@ class BenchAgent:
         return self._started("follow_line", ball=name,
                              length_cm=round(math.dist(a, b), 1))
 
-    def t_follow_path(self, points, smooth=False):
-        name, why = self._ready()
+    def t_follow_path(self, points, smooth=False, ball=None):
+        name, why = self._ready(ball)
         if why:
             return {"error": why}
         try:
@@ -486,8 +577,8 @@ class BenchAgent:
                              length_cm=round(app.p2p["path"]["total"], 1),
                              smooth=bool(smooth))
 
-    def t_orbit(self, x, y, radius, direction="ccw"):
-        name, why = self._ready()
+    def t_orbit(self, x, y, radius, direction="ccw", ball=None):
+        name, why = self._ready(ball)
         if why:
             return {"error": why}
         try:
@@ -512,8 +603,8 @@ class BenchAgent:
             return self._refused("orbit")
         return self._started("orbit", ball=name, until="stop is called")
 
-    def t_patrol(self, points, style="loop"):
-        name, why = self._ready()
+    def t_patrol(self, points, style="loop", ball=None):
+        name, why = self._ready(ball)
         if why:
             return {"error": why}
         if style not in ("loop", "back_and_forth"):
@@ -548,10 +639,40 @@ class BenchAgent:
 
     # -- the command bar ---------------------------------------------------------------
 
+    @staticmethod
+    def clipboard():
+        """Whatever is on the system clipboard, as one line.
+
+        SDL's own clipboard goes through `pygame.scrap`, which needs the
+        display initialised in a particular order and quietly returns nothing
+        on macOS often enough not to rely on. `pbpaste` is the platform's own
+        answer and is always there.
+        """
+        for argv in (["pbpaste"], ["xclip", "-selection", "clipboard", "-o"],
+                     ["xsel", "--clipboard", "--output"]):
+            try:
+                got = subprocess.run(argv, capture_output=True, timeout=2)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if got.returncode == 0:
+                text = got.stdout.decode("utf-8", "replace")
+                # A pasted command is one line: newlines would otherwise read
+                # as Return and send it half typed.
+                return " ".join(text.split())
+        return ""
+
     def key(self, e, pygame):
         """A key while the bar is open. Returns True if it was consumed."""
         if e.key == pygame.K_ESCAPE:
             self.typing, self.text = False, ""
+            return True
+        # Paste. cmd-V on a Mac, ctrl-V everywhere else.
+        if e.key == pygame.K_v and (e.mod & (pygame.KMOD_META
+                                             | pygame.KMOD_CTRL)):
+            self.text += self.clipboard()
+            return True
+        if e.key == pygame.K_u and (e.mod & pygame.KMOD_CTRL):
+            self.text = ""            # the shell's own "clear the line"
             return True
         if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
             command = self.text.strip()
